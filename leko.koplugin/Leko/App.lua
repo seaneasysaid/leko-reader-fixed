@@ -1,0 +1,231 @@
+local InfoMessage = require("ui/widget/infomessage")
+local UIManager = require("ui/uimanager")
+
+local AsyncMaintenance = require("Leko/AsyncMaintenance")
+local BookInfoView = require("Leko/BookInfoView")
+local BookshelfView = require("Leko/BookshelfView")
+local MainMenuView = require("Leko/MainMenuView")
+local ReaderView = require("Leko/ReaderView")
+local ReadingCoordinator = require("Leko/ReadingCoordinator")
+local Storage = require("Leko/Storage")
+
+local App = {
+    bookshelf = nil,
+    reader = nil,
+    reading_coordinator = nil,
+}
+
+local function tocUpdater()
+    local ok, updater = pcall(require, "Leko/AsyncTocUpdate")
+    return ok and updater or nil
+end
+
+function App:_ensureReadingCoordinator()
+    if self.reading_coordinator then return self.reading_coordinator end
+    self.reading_coordinator = ReadingCoordinator:new{
+        create_reader = function(book, reader_options) return self:_createReader(book, reader_options) end,
+        on_reader_created = function(reader) self.reader = reader end,
+        on_toc_updated = function(book)
+            self:refreshBookshelf(nil, book, { toc_changed = true })
+        end,
+    }
+    return self.reading_coordinator
+end
+
+function App:init()
+    Storage:init()
+    Storage:seedDemoBook()
+    Storage:cleanupTrials()
+    Storage:releaseSourceSettings()
+    self:_ensureReadingCoordinator()
+    -- Maintenance uses the same global process budget and is always preemptible.
+    UIManager:scheduleIn(90, function() AsyncMaintenance:start() end)
+    return self
+end
+
+function App:refreshBookshelf(no_repaint, updated, change)
+    if not self.bookshelf then return end
+    if updated and change and change.cover_changed and self.bookshelf.updateBook then
+        self.bookshelf:updateBook(updated, no_repaint, change)
+    else
+        self.bookshelf:refresh(no_repaint)
+    end
+end
+
+function App:showBookshelf()
+    if self.bookshelf and UIManager.isWidgetShown and UIManager:isWidgetShown(self.bookshelf) then
+        self.bookshelf:refresh()
+        return
+    end
+    local shelf = BookshelfView:new{
+        onOpenBook = function(book_id) return self:openBook(book_id) end,
+        onOpenMainMenu = function() self:showMainMenu() end,
+        onShowBookInfo = function(book_id) self:showBookInfo(book_id) end,
+        onCheckUpdatesRequested = function(view) return self:startBookshelfUpdate(view, true) end,
+        onCancelUpdatesRequested = function(view) return self:cancelBookshelfUpdate(view) end,
+    }
+    self.bookshelf = shelf
+    UIManager:show(self.bookshelf, "full")
+end
+
+function App:startBookshelfUpdate(view, force)
+    view = view or self.bookshelf
+    if not view then return nil, "书架尚未打开" end
+    local updater = tocUpdater()
+    if not updater then return nil, "目录检查模块不可用" end
+    return updater:start{
+        force = force == true,
+        on_state = function(state, text, current, total)
+            if self.bookshelf == view and view.setUpdateState then
+                view:setUpdateState(state, text, current, total)
+            end
+        end,
+        on_book = function(updated)
+            self:refreshBookshelf(nil, updated, { toc_changed = true })
+        end,
+        on_done = function()
+            if self.bookshelf == view then view:refresh() end
+        end,
+    }
+end
+
+function App:cancelBookshelfUpdate(view)
+    if view and view.setUpdateState then view:setUpdateState("cancelled", "已取消检查更新", 0, 0) end
+    local updater = tocUpdater()
+    return updater and updater:cancel() or false
+end
+
+function App:showMainMenu()
+    UIManager:show(MainMenuView:new{
+        onReadBook = function(book, options) return self:openBookObject(book, options) end,
+        onChanged = function() self:refreshBookshelf() end,
+    }, "full")
+end
+
+function App:showBookInfo(book_id)
+    local book, err = Storage:loadBook(book_id)
+    if not book then
+        UIManager:show(InfoMessage:new{ text = "无法读取书籍信息：\n" .. tostring(err) })
+        return
+    end
+    return self:showBookInfoObject(book)
+end
+
+function App:showBookInfoObject(book, reader)
+    UIManager:show(BookInfoView:new{
+        book = book,
+        onRead = function(selected, read_options)
+            if reader then return nil, "阅读器已打开" end
+            return self:openBookObject(selected, read_options)
+        end,
+        onChapterSelected = function(selected, chapter_index)
+            if reader then
+                reader:jumpToChapter(chapter_index)
+            else
+                selected.position = { chapter = chapter_index, paragraph = 1, char = 1 }
+                Storage:saveBookProgress(selected)
+                return self:openBookObject(selected, { chapter_index = chapter_index })
+            end
+        end,
+        allow_delete = reader == nil,
+        onBookAdded = function(added)
+            if reader then
+                reader.book = added
+                reader:rebuild("ui")
+            end
+            self:refreshBookshelf()
+        end,
+        onBookUpdated = function(updated, change)
+            if reader then
+                reader.book = updated
+                if change and change.source_changed then
+                    reader.history = {}
+                    reader:loadPage(updated.position or { chapter = 1, paragraph = 1, char = 1 }, "ui")
+                else
+                    reader:rebuild("ui")
+                end
+            end
+            self:refreshBookshelf(nil, updated, change)
+        end,
+        onBookRemoved = function(removed)
+            if reader then
+                reader.book = removed
+                reader:rebuild("ui")
+            end
+            self:refreshBookshelf()
+        end,
+        onBookDeleted = function() self:refreshBookshelf() end,
+    }, "full")
+end
+
+function App:openBook(book_id)
+    local book, err = Storage:loadBook(book_id)
+    if not book then
+        UIManager:show(InfoMessage:new{ text = "无法打开书籍：\n" .. tostring(err) })
+        return
+    end
+    return self:openBookObject(book)
+end
+
+function App:_createReader(book, reader_options)
+    local coordinator = self:_ensureReadingCoordinator()
+    reader_options = reader_options or {}
+    return ReaderView:new{
+        book = book,
+        onPrepareChapter = function(reader, position, refresh_type, options)
+            return coordinator:prepareChapter(reader, position, refresh_type, options)
+        end,
+        onRefreshToc = function(reader, options)
+            return coordinator:refreshToc(reader, options)
+        end,
+        onBeforeReaderClose = function(closing_book)
+            -- Reveal an explicit return route before doing shelf bookkeeping.
+            if reader_options.return_view then return end
+            if self.bookshelf and self.bookshelf.updateBook then
+                self.bookshelf:updateBook(closing_book, true)
+            else
+                self:refreshBookshelf(true)
+            end
+        end,
+        onReaderClosed = function()
+            self.reader = nil
+            coordinator.active_reader = nil
+            local return_view = reader_options.return_view
+            if return_view and (not UIManager.isWidgetShown or not UIManager:isWidgetShown(return_view)) then
+                UIManager:show(return_view, "full")
+                if UIManager.setDirty then UIManager:setDirty(return_view, "full") end
+            end
+            local function afterReturnPaint()
+                if return_view and type(return_view.onReaderReturned) == "function" then
+                    pcall(return_view.onReaderReturned, return_view)
+                end
+                if return_view and Storage:isInLibrary(book.id) then
+                    UIManager:scheduleIn(0.35, function() self:refreshBookshelf(true) end)
+                end
+            end
+            if type(UIManager.nextTick) == "function" then UIManager:nextTick(afterReturnPaint)
+            else UIManager:scheduleIn(0, afterReturnPaint) end
+        end,
+        onBookAdded = function()
+            self:refreshBookshelf()
+        end,
+        onShowBookInfo = function(selected, active_reader)
+            self:showBookInfoObject(selected, active_reader)
+        end,
+    }
+end
+
+function App:openBookObject(book, options)
+    options = options or {}
+    local coordinator = self:_ensureReadingCoordinator()
+    local task, err = coordinator:open(book, options)
+    -- Callers that own a foreground handoff (BookInfoView/SearchView) render
+    -- the returned error themselves.  Keep the direct App entry self-contained
+    -- without showing a duplicate dialog before the caller can inspect it.
+    if not task and err and type(options.on_failure) ~= "function" then
+        UIManager:show(InfoMessage:new{ text = "无法开始阅读：\n" .. tostring(err) })
+    end
+    return task, err
+end
+
+return App

@@ -1,0 +1,12 @@
+/dist/
+/build/
+/third_party/
+*.zip
+*.log
+*.jsonl
+*.evidence
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
