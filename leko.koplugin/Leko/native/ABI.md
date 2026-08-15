@@ -1,6 +1,6 @@
 # QuickJS native bridge ABI
 
-This shared library is the production QuickJS bridge for the 0.15.37 package.
+This shared library is the production QuickJS bridge for the 0.15.38 package.
 
 - Engine: official QuickJS `2026-06-04` source.
 - Bridge ABI: `2`, bridge version `2.0.0`.

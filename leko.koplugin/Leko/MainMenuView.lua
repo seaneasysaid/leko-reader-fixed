@@ -10,6 +10,7 @@ local UIManager = require("ui/uimanager")
 local ErrorGuard = require("Leko/ErrorGuard")
 local AsyncSourceCatalog = require("Leko/AsyncSourceCatalog")
 local AsyncSourceImport = require("Leko/AsyncSourceImport")
+local AsyncStorageStats = require("Leko/AsyncStorageStats")
 local Importer = require("Leko/Importer")
 local SearchView = require("Leko/SearchView")
 local SearchSettings = require("Leko/SearchSettings")
@@ -115,41 +116,68 @@ local SourceHubView = Menu:extend{
 }
 
 function SourceHubView:init()
-    local stats = Storage:getSourceStats()
-    local backup_count = #Storage:listSourceBackups()
+    local cached_storage = Storage:getCachedStorageStats()
     Storage:releaseSourceSettings()
     self.title = "书源"
     self.title_bar_left_icon = "home"
     self.onLeftButtonTap = function() self:onReturn() end
     self.item_table = {
-        { text = "管理书源", mandatory = string.format("可使用 %d · 暂不支持 %d", stats.supported or 0, stats.unsupported or 0), action = "manage" },
+        { text = "管理书源", mandatory = cached_storage and string.format("可使用 %d · 暂不支持 %d",
+            cached_storage.source_supported or 0, cached_storage.source_unsupported or 0)
+            or "正在统计…", action = "manage" },
         { text = "用手机导入", mandatory = "推荐 · 手机扫码", action = "mobile" },
         { text = "从文件导入", mandatory = "书源文件", action = "local" },
         { text = "通过网址导入", mandatory = "网络地址", action = "url" },
-        { text = "从备份恢复", mandatory = tostring(backup_count) .. " 份备份", action = "backups", separator = true },
+        { text = "从备份恢复", mandatory = cached_storage
+            and (tostring(cached_storage.backup_count or 0) .. " 份备份") or "正在统计…", action = "backups", separator = true },
         { text = "把欢迎书放回书架", mandatory = "不影响已有书源", action = "welcome" },
     }
     self.onMenuSelect = function(menu, item) menu:handleAction(item.action) end
     self.close_callback = function() UIManager:close(self, "full") end
     Menu.init(self)
+    UIManager:nextTick(function()
+        if self._closed then return end
+        AsyncStorageStats:start(function(ok, storage_stats)
+            if ok and storage_stats and not self._closed then self:_updateBackupCount(storage_stats) end
+        end)
+    end)
 end
 
-function SourceHubView:_refreshSourceStats()
-    local stats = Storage:getSourceStats()
+function SourceHubView:_updateBackupCount(storage_stats)
     for _, item in ipairs(self.item_table or {}) do
         if item.action == "manage" then
-            item.mandatory = string.format("可使用 %d · 暂不支持 %d", stats.supported or 0, stats.unsupported or 0)
+            item.mandatory = string.format("可使用 %d · 暂不支持 %d",
+                storage_stats.source_supported or 0, storage_stats.source_unsupported or 0)
         elseif item.action == "backups" then
-            item.mandatory = tostring(#Storage:listSourceBackups()) .. " 份备份"
+            item.mandatory = tostring(storage_stats.backup_count or 0) .. " 份备份"
         end
     end
     if self.updateItems then self:updateItems() end
 end
 
+function SourceHubView:_refreshSourceStats(force_storage)
+    local cached_storage = Storage:getCachedStorageStats()
+    for _, item in ipairs(self.item_table or {}) do
+        if item.action == "manage" then
+            item.mandatory = cached_storage and string.format("可使用 %d · 暂不支持 %d",
+                cached_storage.source_supported or 0, cached_storage.source_unsupported or 0)
+                or "正在统计…"
+        elseif item.action == "backups" then
+            item.mandatory = cached_storage
+                and (tostring(cached_storage.backup_count or 0) .. " 份备份") or "正在统计…"
+        end
+    end
+    if self.updateItems then self:updateItems() end
+    AsyncStorageStats:start(function(ok, storage_stats)
+        if ok and storage_stats and not self._closed then self:_updateBackupCount(storage_stats) end
+    end, force_storage == true)
+end
+
 function SourceHubView:showBackups()
     UIManager:show(SourceBackupView:new{
         on_changed = function()
-            self:_refreshSourceStats()
+            Storage:clearCachedStorageStats()
+            self:_refreshSourceStats(true)
             if self.onChanged then self.onChanged() end
         end,
     }, "full")
@@ -180,7 +208,8 @@ function SourceHubView:_addWelcomeGuide()
                 UIManager:show(InfoMessage:new{ text = "书源列表更新失败：\n" .. tostring(err) })
                 return
             end
-            self:_refreshSourceStats()
+            Storage:clearCachedStorageStats()
+            self:_refreshSourceStats(true)
             UIManager:show(Notification:new{
                 text = "《欢迎来到 Leko》已放回书架；其他书源保持不变",
             })
@@ -240,7 +269,8 @@ function SourceHubView:_startSourceImport(spec)
     }, function(ok, err, completed_worker, payload)
         if self._source_import_worker == completed_worker then self._source_import_worker = nil end
         progress:close()
-        self:_refreshSourceStats()
+        Storage:clearCachedStorageStats()
+        self:_refreshSourceStats(true)
         if not ok then
             showSourceImportResult(nil, err, self.onChanged)
             return
@@ -261,7 +291,8 @@ function SourceHubView:openMobileSourceImport()
     NetworkMgr:runWhenConnected(function()
         local view, err = MobileSourceImportView.open{
             on_changed = function()
-                self:_refreshSourceStats()
+                Storage:clearCachedStorageStats()
+                self:_refreshSourceStats(true)
                 if self.onChanged then self.onChanged() end
             end,
         }
@@ -305,7 +336,8 @@ function SourceHubView:_handleAction(action)
     if action == "manage" then
         UIManager:show(SourceView:new{
             on_changed = function()
-                self:_refreshSourceStats()
+                Storage:clearCachedStorageStats()
+                self:_refreshSourceStats(true)
                 if self.onChanged then self.onChanged() end
             end,
         }, "full")
@@ -329,6 +361,7 @@ function SourceHubView:handleAction(action)
 end
 
 function SourceHubView:onReturn()
+    self._closed = true
     UIManager:close(self, "full")
     return true
 end
@@ -344,7 +377,7 @@ local MainMenuView = Menu:extend{
 }
 
 function MainMenuView:init()
-    local source_count = Storage:getSourceCount()
+    local cached_storage = Storage:getCachedStorageStats()
     Storage:releaseSourceSettings()
     self.title = "Leko " .. BUILD
     self.title_bar_left_icon = "home"
@@ -354,25 +387,44 @@ function MainMenuView:init()
         { text = "搜索设置", mandatory = "每条书源最多 " .. tostring(SearchSettings:getLimit()) .. " 个结果 ›", action = "search_settings" },
         { text = "导出设置", mandatory = Storage:getExportDirectoryLabel() .. " ›", action = "export_settings" },
         { text = "导入本地书籍", mandatory = "TXT ›", action = "imports" },
-        { text = "书源", mandatory = tostring(source_count) .. " 个 ›", action = "sources" },
-        { text = "存储与缓存", mandatory = Storage:formatBytes(Storage:getStorageStats().cache), action = "storage", separator = true },
+        { text = "书源", mandatory = cached_storage
+            and (tostring(cached_storage.source_count or 0) .. " 个 ›") or "正在统计…", action = "sources" },
+        { text = "存储与缓存", mandatory = cached_storage
+            and Storage:formatBytes(cached_storage.cache) or "正在统计…", action = "storage", separator = true },
         { text = "新手帮助", mandatory = "第一次使用先看这里 ›", action = "help" },
         { text = "关于 Leko", mandatory = BUILD, action = "about" },
     }
     self.onMenuSelect = function(menu, item) menu:handleAction(item.action) end
     self.close_callback = function() UIManager:close(self, "full") end
     Menu.init(self)
+    UIManager:nextTick(function()
+        if self._closed then return end
+        AsyncStorageStats:start(function(ok, stats)
+            if ok and stats and not self._closed then self:_updateStorageRow(stats) end
+        end)
+    end)
 end
 
-function MainMenuView:refreshSourceCount()
-    local count = Storage:getSourceCount()
+function MainMenuView:_updateStorageRow(stats)
     for _, item in ipairs(self.item_table or {}) do
         if item.action == "sources" then
-            item.mandatory = tostring(count) .. " 个 ›"
-            break
+            item.mandatory = tostring(stats.source_count or 0) .. " 个 ›"
+        elseif item.action == "storage" then
+            item.mandatory = Storage:formatBytes(stats.cache)
         end
     end
     if self.updateItems then self:updateItems() end
+end
+
+function MainMenuView:refreshSourceCount()
+    Storage:clearCachedStorageStats()
+    for _, item in ipairs(self.item_table or {}) do
+        if item.action == "sources" then item.mandatory = "正在统计…"; break end
+    end
+    if self.updateItems then self:updateItems() end
+    AsyncStorageStats:start(function(ok, stats)
+        if ok and stats and not self._closed then self:_updateStorageRow(stats) end
+    end, true)
 end
 
 function MainMenuView:_updateExportDirectoryRow()
@@ -543,6 +595,7 @@ function MainMenuView:handleAction(action)
 end
 
 function MainMenuView:onReturn()
+    self._closed = true
     UIManager:close(self, "full")
     return true
 end

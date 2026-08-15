@@ -861,6 +861,19 @@ local function pathSize(path)
     return total
 end
 
+local function directoryBreakdown(path)
+    local result, total = {}, 0
+    if lfs.attributes(path, "mode") ~= "directory" then return result, total end
+    for entry in lfs.dir(path) do
+        if entry ~= "." and entry ~= ".." then
+            local size = pathSize(Util.joinPath(path, entry))
+            result[entry] = size
+            total = total + size
+        end
+    end
+    return result, total
+end
+
 function Storage:getPathSize(path)
     return pathSize(path)
 end
@@ -874,17 +887,80 @@ function Storage:formatBytes(bytes)
 end
 
 function Storage:getStorageStats()
-    local temp_cache = self:getPathSize(self:getCacheDir())
+    local cache_kinds, temp_cache = directoryBreakdown(self:getCacheDir())
     local books = self:getPathSize(self:getBooksDir())
     local covers = self:getPathSize(self:getCoversDir())
     local sources = self:getPathSize(self:getSourcesDir())
+    local source_stats = self:getSourceStats()
     return {
         cache = temp_cache,
+        cache_search = tonumber(cache_kinds.search or 0) or 0,
+        cache_bookinfo = tonumber(cache_kinds.bookinfo or 0) or 0,
+        cache_toc = tonumber(cache_kinds.toc or 0) or 0,
+        cache_images = tonumber(cache_kinds.images or 0) or 0,
+        cache_tmp = tonumber(cache_kinds.tmp or 0) or 0,
+        cache_http = tonumber(cache_kinds.http or 0) or 0,
         books = books,
         covers = covers,
         sources = sources,
+        backup_count = #self:listSourceBackups(),
+        source_count = source_stats.total or 0,
+        source_enabled = source_stats.enabled or 0,
+        source_supported = source_stats.supported or 0,
+        source_unsupported = source_stats.unsupported or 0,
         total = temp_cache + books + covers + sources,
+        updated_at = os.time(),
     }
+end
+
+local STORAGE_STATS_FIELDS = {
+    "cache", "cache_search", "cache_bookinfo", "cache_toc", "cache_images",
+    "cache_tmp", "cache_http", "books", "covers", "sources", "backup_count",
+    "source_count", "source_enabled", "source_supported", "source_unsupported", "total",
+}
+
+local function normalizedStorageStats(stats)
+    if type(stats) ~= "table" then return nil end
+    local result = { updated_at = tonumber(stats.updated_at or os.time()) or os.time() }
+    for _, field in ipairs(STORAGE_STATS_FIELDS) do
+        local value = tonumber(stats[field] or 0)
+        if not value or value < 0 then return nil end
+        result[field] = math.floor(value)
+    end
+    return result
+end
+
+function Storage:getCachedStorageStats()
+    if self._storage_stats_cache then return self._storage_stats_cache end
+    local cached = normalizedStorageStats(self:getSettings():readSetting("storage_stats_cache"))
+    self._storage_stats_cache = cached
+    return cached
+end
+
+function Storage:saveCachedStorageStats(stats)
+    local normalized = normalizedStorageStats(stats)
+    if not normalized then return false, "invalid storage stats" end
+    local previous = self:getCachedStorageStats()
+    local changed = not previous
+    if not changed then
+        for _, field in ipairs(STORAGE_STATS_FIELDS) do
+            if previous[field] ~= normalized[field] then changed = true; break end
+        end
+    end
+    self._storage_stats_cache = normalized
+    if changed then
+        local settings = self:getSettings()
+        settings:saveSetting("storage_stats_cache", normalized)
+        settings:flush()
+    end
+    return true
+end
+
+function Storage:clearCachedStorageStats()
+    self._storage_stats_cache = nil
+    local settings = self:getSettings()
+    settings:delSetting("storage_stats_cache")
+    settings:flush()
 end
 
 function Storage:backupImportedSources(raw, original_name)
@@ -1512,19 +1588,35 @@ function Storage:listSources()
 end
 
 function Storage:getSourceCount()
-    local summaries = self:listSourceSummaries()
-    return #(summaries or {})
+    if not self:isSourceCatalogReady() then return 0 end
+    local overrides = self:listSourceOverrides()
+    local count = 0
+    for _, source in ipairs(self._source_catalog_cache.sources or {}) do
+        local override = overrides[tostring(source.id or "")]
+        if type(override) ~= "table" or override.deleted ~= true then count = count + 1 end
+    end
+    return count
 end
 
 function Storage:getSourceStats()
     local stats = { total = 0, enabled = 0, supported = 0, unsupported = 0, capabilities = {} }
-    for _, source in ipairs(self:listSourceSummaries() or {}) do
-        stats.total = stats.total + 1
-        if source.enabled ~= false then stats.enabled = stats.enabled + 1 end
-        if source.searchable ~= false and source.supported ~= false then stats.supported = stats.supported + 1
-        else stats.unsupported = stats.unsupported + 1 end
-        local capability = source.capability_profile or "基础规则"
-        stats.capabilities[capability] = (stats.capabilities[capability] or 0) + 1
+    if not self:isSourceCatalogReady() then return stats end
+    local overrides = self:listSourceOverrides()
+    for _, source in ipairs(self._source_catalog_cache.sources or {}) do
+        local override = overrides[tostring(source.id or "")]
+        if type(override) ~= "table" or override.deleted ~= true then
+            stats.total = stats.total + 1
+            local enabled = type(override) == "table" and override.enabled or nil
+            if enabled == nil then enabled = source.enabled ~= false end
+            if enabled == true then stats.enabled = stats.enabled + 1 end
+            if source.searchable ~= false and source.supported ~= false then
+                stats.supported = stats.supported + 1
+            else
+                stats.unsupported = stats.unsupported + 1
+            end
+            local capability = source.capability_profile or "基础规则"
+            stats.capabilities[capability] = (stats.capabilities[capability] or 0) + 1
+        end
     end
     return stats
 end

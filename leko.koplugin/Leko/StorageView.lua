@@ -3,6 +3,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local Menu = require("ui/widget/menu")
 local Notification = require("ui/widget/notification")
 local UIManager = require("ui/uimanager")
+local AsyncStorageStats = require("Leko/AsyncStorageStats")
 local BookService = require("Leko/BookService")
 local CoverService = require("Leko/CoverService")
 local Diagnostics = require("Leko/Diagnostics")
@@ -21,36 +22,47 @@ local StorageView = Menu:extend{
     modal = false,
 }
 
-function StorageView:buildItems()
-    local stats = Storage:getStorageStats()
+local function sizeLabel(stats, field)
+    return stats and Storage:formatBytes(stats[field] or 0) or "正在统计…"
+end
+
+function StorageView:buildItems(stats)
+    stats = stats or Storage:getCachedStorageStats()
     return {
-        { text = "存储占用", mandatory = Storage:formatBytes(stats.total), action = "stats" },
+        { text = "存储占用", mandatory = sizeLabel(stats, "total"), action = "stats" },
         { text = "查看内存占用", mandatory = "当前使用情况", action = "memory" },
         { text = "封面加载状态", mandatory = "查看下载和缓存情况", action = "cover_diag" },
         { text = "最近一次错误", mandatory = "查看出错原因", action = "last_error", separator = true },
-        { text = "清理搜索缓存", mandatory = Storage:formatBytes(Storage:getPathSize(Storage:getCacheDir("search"))), action = "clear_search" },
-        { text = "清理详情与目录缓存", mandatory = Storage:formatBytes(
-            Storage:getPathSize(Storage:getCacheDir("bookinfo")) + Storage:getPathSize(Storage:getCacheDir("toc"))
-        ), action = "clear_metadata" },
-        { text = "清理图片缓存", mandatory = Storage:formatBytes(Storage:getPathSize(Storage:getCacheDir("images"))), action = "clear_images" },
-        { text = "清理临时下载", mandatory = Storage:formatBytes(Storage:getPathSize(Storage:getCacheDir("tmp"))), action = "clear_tmp" },
-        { text = "清理全部临时缓存", mandatory = Storage:formatBytes(stats.cache), action = "clear_all", separator = true },
-        { text = "已下载章节", mandatory = Storage:formatBytes(stats.books), dim = true },
-        { text = "书源备份", mandatory = tostring(#Storage:listSourceBackups())
-            .. " 份 · " .. Storage:formatBytes(stats.sources) .. " ›", action = "source_backups" },
+        { text = "清理搜索缓存", mandatory = sizeLabel(stats, "cache_search"), action = "clear_search" },
+        { text = "清理详情与目录缓存", mandatory = stats and Storage:formatBytes(
+            (stats.cache_bookinfo or 0) + (stats.cache_toc or 0)
+        ) or "正在统计…", action = "clear_metadata" },
+        { text = "清理图片缓存", mandatory = sizeLabel(stats, "cache_images"), action = "clear_images" },
+        { text = "清理临时下载", mandatory = sizeLabel(stats, "cache_tmp"), action = "clear_tmp" },
+        { text = "清理全部临时缓存", mandatory = sizeLabel(stats, "cache"), action = "clear_all", separator = true },
+        { text = "已下载章节", mandatory = sizeLabel(stats, "books"), dim = true },
+        { text = "书源备份", mandatory = stats and (tostring(stats.backup_count or 0)
+            .. " 份 · " .. Storage:formatBytes(stats.sources) .. " ›") or "正在统计…", action = "source_backups" },
     }
 end
 
-function StorageView:refresh()
-    self.item_table = self:buildItems()
+function StorageView:_applyStats(stats)
+    self.item_table = self:buildItems(stats)
     self:updateItems()
+end
+
+function StorageView:refresh(force)
+    self:_applyStats(Storage:getCachedStorageStats())
+    AsyncStorageStats:start(function(ok, stats)
+        if ok and stats and not self._closed then self:_applyStats(stats) end
+    end, force == true)
 end
 
 function StorageView:init()
     self.title = "Leko · 存储与缓存"
     self.title_bar_left_icon = "home"
     self.onLeftButtonTap = function() self:onReturn() end
-    self.item_table = self:buildItems()
+    self.item_table = self:buildItems(Storage:getCachedStorageStats())
     self.onMenuSelect = function(menu, item)
         return UI.defer(menu, "storage_" .. tostring(item.action), function()
         if item.action == "memory" then
@@ -86,7 +98,12 @@ function StorageView:init()
             return
         end
         if item.action == "stats" then
-            local stats = Storage:getStorageStats()
+            local stats = Storage:getCachedStorageStats()
+            if not stats then
+                UIManager:show(InfoMessage:new{ text = "正在后台统计存储占用，请稍后再试。" })
+                self:refresh(true)
+                return
+            end
             UIManager:show(InfoMessage:new{
                 text = "数据目录：\n" .. Storage.root_dir
                     .. "\n\n已下载章节：" .. Storage:formatBytes(stats.books)
@@ -101,7 +118,8 @@ function StorageView:init()
         if item.action == "source_backups" then
             UIManager:show(SourceBackupView:new{
                 on_changed = function()
-                    menu:refresh()
+                    Storage:clearCachedStorageStats()
+                    menu:refresh(true)
                     if menu.on_sources_changed then pcall(menu.on_sources_changed) end
                 end,
             }, "full")
@@ -130,17 +148,22 @@ function StorageView:init()
                         Storage:clearCache(kind)
                     end
                 end
+                Storage:clearCachedStorageStats()
                 UIManager:show(Notification:new{ text = "缓存已清理" })
-                menu:refresh()
+                menu:refresh(true)
             end,
         })
         end)
     end
     self.close_callback = function() UIManager:close(self, "full") end
     Menu.init(self)
+    UIManager:nextTick(function()
+        if not self._closed then self:refresh(false) end
+    end)
 end
 
 function StorageView:onReturn()
+    self._closed = true
     UIManager:close(self, "full")
     return true
 end
