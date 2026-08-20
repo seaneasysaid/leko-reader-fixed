@@ -213,7 +213,11 @@ function BookMutationCoordinator:exportBook(format, options)
             if type(options.on_success) == "function" then pcall(options.on_success, updated, payload) end
             task:complete(progress)
             UIManager:show(InfoMessage:new{
-                text = "导出成功\n\n保存位置：\n" .. tostring(payload and payload.export_path or "未知路径"),
+                text = "导出成功"
+                    .. (payload and payload.export_warning
+                        and "\n\n提示：" .. tostring(payload.export_warning)
+                        or "")
+                    .. "\n\n保存位置：\n" .. tostring(payload and payload.export_path or "未知路径"),
             })
         end,
     }

@@ -223,7 +223,7 @@ local function execute(job)
             -- Export is uncommon and relatively large; keep its writer and ZIP
             -- tables out of every ordinary foreground child.
             local BookExporter = require("Leko/BookExporter")
-            local path, export_err = BookExporter:export(book, job.export_format, function(current, total, stage)
+            local path, export_err, export_meta = BookExporter:export(book, job.export_format, function(current, total, stage)
                 writeProgress(job.progress_path, current, total, stage)
             end)
             if not path then error(tostring(export_err or "书籍导出失败")) end
@@ -231,6 +231,7 @@ local function execute(job)
             payload.book_id = book.id
             payload.export_path = path
             payload.export_format = job.export_format
+            payload.export_warning = export_meta and export_meta.cover_warning or nil
             payload.load_toc = false
         else
             error("未知书籍后台任务")

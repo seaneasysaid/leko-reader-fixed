@@ -166,6 +166,23 @@ function ImagePipeline:validateFile(path, policy, width, height)
     return true, prepared.info
 end
 
+-- Encode only an already bounded RenderImage/BlitBuffer. Callers own the
+-- image lifetime and must release it with freeImage after this returns.
+function ImagePipeline:encodeImage(image, path, format, quality)
+    if not image or type(image.writeToFile) ~= "function" then
+        return nil, "KOReader 不支持封面格式转换"
+    end
+    local ok, written = pcall(image.writeToFile, image, path, format or "png", quality or 90, false)
+    if not ok or written == false then
+        return nil, "KOReader 封面格式转换失败"
+    end
+    local body, read_err = Util.readFile(path, true)
+    if type(body) ~= "string" or body == "" then
+        return nil, read_err or "封面格式转换后文件为空"
+    end
+    return body
+end
+
 function ImagePipeline:freeImage(image) freeImage(image) end
 
 return ImagePipeline
