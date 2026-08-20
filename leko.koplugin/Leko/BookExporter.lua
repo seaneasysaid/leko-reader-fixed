@@ -81,23 +81,148 @@ local function requireContent(book, index)
     return Util.normalizeText(content)
 end
 
-local function exportCover(book)
-    local path = book and book.cover_path
-    if not path or lfs.attributes(path, "mode") ~= "file" then return nil end
+local COVER_RENDER_WIDTH = 1200
+local COVER_RENDER_HEIGHT = 1800
+local COVER_MEDIA_TYPES = {
+    jpg = "image/jpeg", png = "image/png", gif = "image/gif",
+    webp = "image/webp", svg = "image/svg+xml", tiff = "image/tiff",
+}
+
+local function readBinary(path)
     local data = Util.readFile and Util.readFile(path, true)
-    if not data then
-        local file = io.open(path, "rb")
-        if file then data = file:read("*a"); file:close() end
+    if type(data) == "string" and data ~= "" then return data end
+    local file = io.open(path, "rb")
+    if not file then return nil end
+    data = file:read("*a")
+    file:close()
+    return data
+end
+
+local function coverDescriptor(book)
+    if not book then return nil end
+    local value = book.selected_cover_url or book.cover or book.content_cover
+    if value == nil or tostring(value) == "" then return nil end
+    return tostring(value)
+end
+
+local function coverResult(book)
+    return {
+        id = book and book.id,
+        title = book and book.title,
+        cover = coverDescriptor(book),
+        source_id = book and book.source_id,
+        source_name = book and book.source_name,
+        book_url = book and (book.cover_book_url or book.book_url),
+        variables = book and book.cover_variables,
+    }
+end
+
+local function exportCover(book, format, scratch_path)
+    local path = book and book.cover_path
+    if not path or lfs.attributes(path, "mode") ~= "file" then
+        return nil, "未找到可用封面文件（封面可能尚未持久化或已被删除）"
     end
-    if type(data) ~= "string" or data == "" then return nil end
-    if data:sub(1, 3) == "\255\216\255" then
-        return { data = data, extension = "jpg", media_type = "image/jpeg" }
-    elseif data:sub(1, 8) == "\137PNG\13\10\26\10" then
-        return { data = data, extension = "png", media_type = "image/png" }
-    elseif data:sub(1, 6) == "GIF87a" or data:sub(1, 6) == "GIF89a" then
-        return { data = data, extension = "gif", media_type = "image/gif" }
+    local data = readBinary(path)
+    if type(data) ~= "string" or data == "" then
+        return nil, "封面文件无法读取"
     end
-    return nil
+
+    local pipeline_ok, ImagePipeline = pcall(require, "Leko/ImagePipeline")
+    if not pipeline_ok or type(ImagePipeline.prepare) ~= "function" then
+        return nil, "封面验证管线不可用：" .. tostring(ImagePipeline or "未知错误")
+    end
+    local policy = ImagePipeline.saved_policy or {
+        max_bytes = 8 * 1024 * 1024,
+        max_pixels = 12000000,
+        max_side = 6000,
+        require_dimensions = true,
+        require_complete_jpeg = true,
+    }
+    local prepared, prepare_err = ImagePipeline:prepare(data, nil, {
+        policy = policy,
+        decode = false,
+    })
+    if not prepared then return nil, "封面验证失败：" .. tostring(prepare_err or "图片无效") end
+
+    local source_format = tostring(prepared.info and prepared.info.format or prepared.ext or ""):lower()
+    local raw_allowed = (format == "epub" and (source_format == "jpg" or source_format == "png"
+        or source_format == "gif" or source_format == "svg"))
+        or (format == "mobi" and (source_format == "jpg" or source_format == "png"))
+    if raw_allowed then
+        return {
+            data = prepared.body,
+            extension = source_format,
+            media_type = COVER_MEDIA_TYPES[source_format],
+            source_format = source_format,
+        }
+    end
+
+    -- WebP/TIFF and non-MOBI formats are decoded only after header validation,
+    -- fitted to a bounded bitmap, encoded through KOReader's BlitBuffer API,
+    -- and freed immediately. EPUB receives a portable PNG; MOBI receives the
+    -- same stable JPEG/PNG set required by old Kindle readers.
+    if type(ImagePipeline.freeImage) ~= "function" or type(ImagePipeline.encodeImage) ~= "function" then
+        return nil, "封面格式需要 KOReader 图像转换能力"
+    end
+    local decoded, decode_err = ImagePipeline:prepare(data, nil, {
+        policy = policy,
+        width = COVER_RENDER_WIDTH,
+        height = COVER_RENDER_HEIGHT,
+        keep_image = true,
+    })
+    if not decoded or not decoded.image then
+        return nil, "封面转换失败：" .. tostring(decode_err or "KOReader 无法解码该图片")
+    end
+    local output_path = tostring(scratch_path or path) .. ".cover-convert.png.tmp"
+    os.remove(output_path)
+    local encoded, encode_err = ImagePipeline:encodeImage(decoded.image, output_path, "png", 90)
+    ImagePipeline:freeImage(decoded.image)
+    os.remove(output_path)
+    if not encoded then return nil, "封面转换失败：" .. tostring(encode_err or "无法写出 PNG") end
+
+    local verified, verify_err = ImagePipeline:prepare(encoded, "image/png", {
+        policy = policy,
+        decode = false,
+    })
+    if not verified then return nil, "封面转换结果验证失败：" .. tostring(verify_err or "PNG 无效") end
+    return {
+        data = verified.body,
+        extension = "png",
+        media_type = "image/png",
+        source_format = source_format,
+    }
+end
+
+local function reloadBookForExport(book)
+    if type(Storage.loadBook) ~= "function" then return book end
+    local ok, latest, err = pcall(Storage.loadBook, Storage, book.id, { load_toc = true })
+    if not ok then return nil, tostring(latest) end
+    if type(latest) ~= "table" then return nil, tostring(err or "无法读取最新书籍状态") end
+    -- A legacy host may return a summary without TOC even when requested. Keep
+    -- the already verified chapter list for export, but never copy old cover
+    -- fields back over the freshly loaded disk state.
+    if type(latest.chapters) ~= "table" or #latest.chapters == 0 then latest.chapters = book.chapters end
+    return latest
+end
+
+local function persistCachedCoverForExport(book)
+    if type(Storage.loadBook) ~= "function" then return book, nil end
+    local service_ok, BookService = pcall(require, "Leko/BookService")
+    if not service_ok or type(BookService) ~= "table" then
+        return book, "封面持久化服务不可用"
+    end
+
+    local existing, existing_err = BookService:getValidCoverPath(book)
+    if not existing then
+        local result = coverResult(book)
+        local path, _, materialize_err = BookService:materializeCachedCover(book, result)
+        if not path then
+            return book, tostring(materialize_err or existing_err or "详情页封面缓存不可用")
+        end
+    end
+    local latest, reload_err = reloadBookForExport(book)
+    if not latest then return book, "封面已写入但重新读取失败：" .. tostring(reload_err) end
+    return latest, nil
 end
 
 local function stripParagraphIndent(line)
@@ -259,7 +384,7 @@ function ZipWriter:finish()
         .. le32(self.offset - central_offset) .. le32(central_offset) .. le16(0))
 end
 
-local function exportEpub(book, path, progress)
+local function exportEpub(book, path, progress, cover)
     return atomicStream(path, function(file)
         local zip = ZipWriter:new(file)
         zip:add("mimetype", "application/epub+zip")
@@ -268,7 +393,6 @@ local function exportEpub(book, path, progress)
             .. '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
             .. '</rootfiles></container>')
         local manifest, spine, nav, ncx = {}, {}, {}, {}
-        local cover = exportCover(book)
         if cover then
             manifest[#manifest + 1] = '<item id="cover-image" href="cover.' .. cover.extension
                 .. '" media-type="' .. cover.media_type .. '" properties="cover-image"/>'
@@ -592,7 +716,7 @@ local function buildMobiLayout(book, has_cover, progress)
     return prefix, guide, cover_html, toc, suffix, ncx
 end
 
-local function exportMobi(book, path, progress)
+local function exportMobi(book, path, progress, cover)
     local records_path = path .. ".records.tmp"
     os.remove(records_path)
     local records, open_err = io.open(records_path, "wb")
@@ -608,7 +732,6 @@ local function exportMobi(book, path, progress)
             writeChecked(records, chunk); lengths[#lengths + 1] = #chunk
         end
     end
-    local cover = exportCover(book)
     local ncx_entries
     local ok, failure = xpcall(function()
         local prefix, guide, cover_html, toc, suffix, built_ncx = buildMobiLayout(book, cover ~= nil, progress)
@@ -678,21 +801,38 @@ end
 
 function BookExporter:export(book, format, progress)
     if type(book) ~= "table" or not book.id then return nil, "书籍信息不完整" end
-    local complete, cached, total = self:isComplete(book)
-    if not complete then return nil, "请先完成全书缓存（" .. tostring(cached) .. "/" .. tostring(total) .. "）" end
     format = tostring(format or "epub"):lower()
     if format ~= "txt" and format ~= "epub" and format ~= "mobi" then return nil, "不支持的导出格式" end
+
+    local latest, reload_err = reloadBookForExport(book)
+    if not latest then return nil, "无法读取最新书籍状态：" .. tostring(reload_err or "未知错误") end
+    book = latest
+    local complete, cached, total = self:isComplete(book)
+    if not complete then return nil, "请先完成全书缓存（" .. tostring(cached) .. "/" .. tostring(total) .. "）" end
     local directory = Storage:getExportDir()
     local filename = safeFilename(book.title) .. "." .. format
     local path = Util.joinPath(directory, filename)
     local progress_total = format == "mobi" and 2 * total or total
     reportProgress(progress, 0, progress_total, "正在准备导出")
+
+    local cover, cover_warning
+    if format ~= "txt" then
+        book, cover_warning = persistCachedCoverForExport(book)
+        local exported_cover, export_cover_warning = exportCover(book, format, path)
+        cover = exported_cover
+        if export_cover_warning then
+            cover_warning = cover_warning and (tostring(cover_warning) .. "；" .. tostring(export_cover_warning))
+                or export_cover_warning
+        end
+    end
+
     local result, err
     if format == "txt" then result, err = exportTxt(book, path, progress)
-    elseif format == "epub" then result, err = exportEpub(book, path, progress)
-    else result, err = exportMobi(book, path, progress) end
+    elseif format == "epub" then result, err = exportEpub(book, path, progress, cover)
+    else result, err = exportMobi(book, path, progress, cover) end
     if result then reportProgress(progress, progress_total, progress_total, "正在完成文件写入") end
-    return result, err
+    local metadata = cover_warning and { cover_warning = tostring(cover_warning) } or nil
+    return result, err, metadata
 end
 
 return BookExporter

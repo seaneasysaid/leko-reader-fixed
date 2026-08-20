@@ -188,7 +188,8 @@ local function expandReplacement(template, match)
     template = template:gsub("\\(%d+)", function(index)
         return match.captures[tonumber(index)] or ""
     end)
-    return template:gsub("\1", "$")
+    local result = template:gsub("\1", "$")
+    return result
 end
 
 function Regex:replace(subject, pattern, replacement, flags, limit)

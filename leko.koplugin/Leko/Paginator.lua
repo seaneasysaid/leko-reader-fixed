@@ -10,6 +10,41 @@ local Paginator = {}
 local INDENT = "\u{3000}\u{3000}"
 local IDEOGRAPHIC_SPACE = "\u{3000}"
 local NO_BREAK_SPACE = "\u{00A0}"
+local SYSTEM_FONT = "cfont"
+local SYSTEM_FONT_DISPLAY_NAME = "系统默认（简体中文优先）"
+
+local function resolveReaderFace(style, font_field, index_field, display_field, size)
+    local path = tostring(style[font_field] or SYSTEM_FONT)
+    local index = tonumber(style[index_field])
+    local ok, face
+    if index == nil then
+        ok, face = pcall(Font.getFace, Font, path, size)
+    else
+        ok, face = pcall(Font.getFace, Font, path, size, index)
+    end
+    if ok and face then return face end
+
+    if path ~= SYSTEM_FONT then
+        -- Keep Font.faces intact: KOReader owns that cache and clearing it can
+        -- invalidate faces still used by the current page. Only repair this
+        -- reader style, then let ReaderView show one friendly notification.
+        style[font_field] = SYSTEM_FONT
+        style[index_field] = nil
+        style[display_field] = SYSTEM_FONT_DISPLAY_NAME
+        local paired_field = font_field == "body_font" and "title_font" or "body_font"
+        local paired_index = paired_field == "body_font" and "body_font_index" or "title_font_index"
+        local paired_display = paired_field == "body_font" and "body_font_display_name" or "title_font_display_name"
+        if tostring(style[paired_field] or "") == path then
+            style[paired_field] = SYSTEM_FONT
+            style[paired_index] = nil
+            style[paired_display] = SYSTEM_FONT_DISPLAY_NAME
+        end
+        style._font_fallback_pending = true
+        local fallback_ok, fallback = pcall(Font.getFace, Font, SYSTEM_FONT, size)
+        if fallback_ok and fallback then return fallback end
+    end
+    error("系统默认字体无法加载")
+end
 
 -- Legado's HTML formatter keeps paragraph indentation in parsed content.
 -- Normalize that presentation whitespace here so the reader setting remains
@@ -37,12 +72,15 @@ local function leadingIndentChars(value)
 end
 
 local function bodyMetrics(style)
-    local face = Font:getFace(style.body_font or "cfont", style.body_font_size or 27)
+    local face = resolveReaderFace(style, "body_font", "body_font_index",
+        "body_font_display_name", style.body_font_size or 27)
     local probe = TextBoxWidget:new{
         text = "测",
         face = face,
         width = math.max(20, Screen:getWidth() - 20),
         line_height = style.line_spacing or 0.28,
+        lang = "zh-CN",
+        bold = false,
         for_measurement_only = true,
     }
     return face, probe.line_height_px
@@ -142,12 +180,14 @@ function Paginator:_advanceToValid(book, position)
     return nil, "已到书籍末尾"
 end
 
-local function makeMeasureWidget(text, face, width, line_spacing, alignment)
+local function makeMeasureWidget(text, face, width, line_spacing, alignment, bold)
     return TextBoxWidget:new{
         text = text,
         face = face,
         width = width,
         line_height = line_spacing,
+        lang = "zh-CN",
+        bold = bold == true,
         alignment = alignment or "left",
         alignment_strict = true,
         for_measurement_only = true,
@@ -183,8 +223,11 @@ function Paginator:makePage(book, requested_position, style)
     local remaining_height = geometry.content_height
 
     if at_chapter_start then
-        local title_face = Font:getFace(style.title_font or style.body_font or "cfont", style.title_font_size or 34)
-        local title_measure = makeMeasureWidget(model.title, title_face, geometry.content_width, 0.18, "left")
+        local title_face = resolveReaderFace(style, "title_font", "title_font_index",
+            "title_font_display_name", style.title_font_size or 34)
+        local title_bold = style.title_bold ~= false
+        local title_measure = makeMeasureWidget(model.title, title_face, geometry.content_width,
+            0.18, "left", title_bold)
         local title_height = measuredHeight(title_measure)
         local top_gap, bottom_gap
         if (tonumber(style.layout_version or 2) or 2) >= 2 then
@@ -212,7 +255,8 @@ function Paginator:makePage(book, requested_position, style)
                 top_gap = top_gap,
                 bottom_gap = bottom_gap,
                 face = title_face,
-                bold = style.title_bold ~= false,
+                bold = title_bold,
+                line_height = 0.18,
                 alignment = "left",
             })
             page.used_height = page.used_height + total

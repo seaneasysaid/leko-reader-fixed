@@ -20,6 +20,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local Screen = Device.screen
 
 local BookService = require("Leko/BookService")
+local FontSelectionView = require("Leko/FontSelectionView")
 local Paginator = require("Leko/Paginator")
 local Storage = require("Leko/Storage")
 local TocView = require("Leko/TocView")
@@ -89,7 +90,16 @@ function ReaderView:init()
     local position = Util.positionCopy(self.book.position)
     local page, err = Paginator:makePage(self.book, position, self.style)
     if not page then page = self:errorPage(position, err) end
+    self:consumeFontFallbackNotice()
     self:setPage(page, "full")
+end
+
+function ReaderView:consumeFontFallbackNotice()
+    if not self.style or not self.style._font_fallback_pending then return false end
+    self.style._font_fallback_pending = nil
+    Storage:saveReaderStyle(self.style)
+    UIManager:show(Notification:new{ text = "原字体不可用，已恢复系统默认字体" })
+    return true
 end
 
 function ReaderView:errorPage(position, err)
@@ -209,7 +219,8 @@ function ReaderView:buildReadingPage(page)
                         bold = element.bold,
                         width = geometry.content_width,
                         height = element.height,
-                        line_height = 0.18,
+                        line_height = element.line_height or 0.18,
+                        lang = "zh-CN",
                         alignment = "left",
                         alignment_strict = true,
                     },
@@ -224,7 +235,14 @@ function ReaderView:buildReadingPage(page)
                 HorizontalSpan:new{ width = geometry.left },
                 LeftContainer:new{
                     dimen = Geom:new{ w = geometry.content_width, h = element.height },
-                    TextWidget:new{ text = element.text, face = geometry.body_face, padding = 0 },
+                    TextWidget:new{
+                        text = element.text,
+                        face = geometry.body_face,
+                        padding = 0,
+                        line_height = self.style.line_spacing or 0.28,
+                        lang = "zh-CN",
+                        bold = false,
+                    },
                 },
             })
         end
@@ -502,15 +520,32 @@ end
 
 function ReaderView:applyStyleChange(callback)
     callback(self.style)
-    Storage:saveReaderStyle(self.style)
     self.history = {}
+    BookService:clearBookCache(self.book.id)
     local page, err = Paginator:makePage(self.book, self.page.start_position, self.style)
+    self:consumeFontFallbackNotice()
+    Storage:saveReaderStyle(self.style)
     if not page then UIManager:show(Notification:new{ text = tostring(err) }); return end
     self.page = page
     self.menu_visible = true
     BookService:savePosition(self.book, page.start_position, true)
     self:rebuild("full")
     self:refreshLayoutMenu()
+end
+
+function ReaderView:applyFontSelection(selection)
+    if type(selection) ~= "table" then return end
+    self:applyStyleChange(function(style)
+        local path = selection.font_path or "cfont"
+        local index = selection.face_index
+        local display = selection.display_name or FontSelectionView.SYSTEM_DISPLAY_NAME
+        style.body_font = path
+        style.body_font_index = index
+        style.body_font_display_name = display
+        style.title_font = path
+        style.title_font_index = index
+        style.title_font_display_name = display
+    end)
 end
 
 -- ButtonDialog materializes button labels when it is constructed. Rebuild the
@@ -572,10 +607,20 @@ function ReaderView:makeLayoutMenuButtons()
         self._layout_dialog = nil
     end
 
+    local function chooseFont()
+        self:showFontSelection()
+    end
+
     return {
         {
+            { text = "字体", callback = chooseFont },
             { text = "字号：" .. choiceLabel(font_values, font_labels, self.style.body_font_size), callback = function() apply(function(s)
                 s.body_font_size = cycle(font_values, s.body_font_size or 27)
+            end) end },
+        },
+        {
+            { text = self.style.indent == false and "首行缩进：关" or "首行缩进：开", callback = function() apply(function(s)
+                s.indent = not (s.indent ~= false)
             end) end },
             { text = "行距：" .. choiceLabel(line_values, line_labels, self.style.line_spacing), callback = function() apply(function(s)
                 s.line_spacing = cycle(line_values, s.line_spacing or 0.28)
@@ -591,20 +636,30 @@ function ReaderView:makeLayoutMenuButtons()
             end) end },
         },
         {
-            { text = self.style.indent == false and "开启首行缩进" or "关闭首行缩进", callback = function() apply(function(s)
-                s.indent = not (s.indent ~= false)
-            end) end },
-            { text = self.style.show_header and "隐藏页眉" or "显示页眉", callback = function() apply(function(s)
+            { text = self.style.show_header and "页眉：显示" or "页眉：隐藏", callback = function() apply(function(s)
                 s.show_header = not s.show_header
             end) end },
-        },
-        {
-            { text = self.style.show_footer and "隐藏页脚" or "显示页脚", callback = function() apply(function(s)
+            { text = self.style.show_footer and "页脚：显示" or "页脚：隐藏", callback = function() apply(function(s)
                 s.show_footer = not s.show_footer
             end) end },
         },
         { { text = "关闭", callback = close } },
     }
+end
+
+function ReaderView:showFontSelection()
+    local dialog = self._layout_dialog
+    if dialog then UIManager:close(dialog) end
+    self._layout_dialog = nil
+    return UI.showLater(self, "font_selection", function()
+        return FontSelectionView:new{
+            style = self.style,
+            on_selected = function(selection) self:applyFontSelection(selection) end,
+            on_return = function()
+                if not self._closing then self:showLayoutMenu() end
+            end,
+        }
+    end, "full")
 end
 
 function ReaderView:showLayoutMenu()

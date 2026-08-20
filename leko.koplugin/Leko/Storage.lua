@@ -1144,8 +1144,12 @@ end
 function Storage:getDefaultReaderStyle()
     return {
         body_font = "cfont",
+        body_font_index = nil,
+        body_font_display_name = "系统默认（简体中文优先）",
         body_font_size = 27,
         title_font = "cfont",
+        title_font_index = nil,
+        title_font_display_name = "系统默认（简体中文优先）",
         title_font_size = 34,
         title_bold = true,
         -- These values are legacy-compatible style fields. Paginator derives
