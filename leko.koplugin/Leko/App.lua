@@ -1,12 +1,6 @@
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 
-local AsyncMaintenance = require("Leko/AsyncMaintenance")
-local BookInfoView = require("Leko/BookInfoView")
-local BookshelfView = require("Leko/BookshelfView")
-local MainMenuView = require("Leko/MainMenuView")
-local ReaderView = require("Leko/ReaderView")
-local ReadingCoordinator = require("Leko/ReadingCoordinator")
 local Storage = require("Leko/Storage")
 
 local App = {
@@ -22,6 +16,10 @@ end
 
 function App:_ensureReadingCoordinator()
     if self.reading_coordinator then return self.reading_coordinator end
+    -- Keep plugin discovery and the file-manager menu independent from the
+    -- reader/source stack.  ReadingCoordinator pulls BookService and the
+    -- Legado/PCRE path, which is only needed after a book is opened.
+    local ReadingCoordinator = require("Leko/ReadingCoordinator")
     self.reading_coordinator = ReadingCoordinator:new{
         create_reader = function(book, reader_options) return self:_createReader(book, reader_options) end,
         on_reader_created = function(reader) self.reader = reader end,
@@ -37,8 +35,8 @@ function App:init()
     Storage:seedDemoBook()
     Storage:cleanupTrials()
     Storage:releaseSourceSettings()
-    self:_ensureReadingCoordinator()
     -- Maintenance uses the same global process budget and is always preemptible.
+    local AsyncMaintenance = require("Leko/AsyncMaintenance")
     UIManager:scheduleIn(90, function() AsyncMaintenance:start() end)
     return self
 end
@@ -57,6 +55,7 @@ function App:showBookshelf()
         self.bookshelf:refresh()
         return
     end
+    local BookshelfView = require("Leko/BookshelfView")
     local shelf = BookshelfView:new{
         onOpenBook = function(book_id) return self:openBook(book_id) end,
         onOpenMainMenu = function() self:showMainMenu() end,
@@ -96,6 +95,7 @@ function App:cancelBookshelfUpdate(view)
 end
 
 function App:showMainMenu()
+    local MainMenuView = require("Leko/MainMenuView")
     UIManager:show(MainMenuView:new{
         onReadBook = function(book, options) return self:openBookObject(book, options) end,
         onChanged = function() self:refreshBookshelf() end,
@@ -112,6 +112,7 @@ function App:showBookInfo(book_id)
 end
 
 function App:showBookInfoObject(book, reader)
+    local BookInfoView = require("Leko/BookInfoView")
     UIManager:show(BookInfoView:new{
         book = book,
         onRead = function(selected, read_options)
@@ -169,6 +170,7 @@ end
 
 function App:_createReader(book, reader_options)
     local coordinator = self:_ensureReadingCoordinator()
+    local ReaderView = require("Leko/ReaderView")
     reader_options = reader_options or {}
     return ReaderView:new{
         book = book,

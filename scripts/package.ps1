@@ -58,9 +58,46 @@ try {
     }
 }
 
+# Validate the archive that will be handed to the user.  A valid ZIP can still
+# be installed into a partially overwritten plugin directory, so fail here if
+# the archive itself is missing any loader-critical file or contains malformed
+# paths.  This keeps packaging failures separate from device-side copy failures.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
+try {
+    $entries = @($archive.Entries)
+    $duplicateNames = @($entries | Group-Object FullName | Where-Object { $_.Count -gt 1 })
+    if ($duplicateNames.Count -gt 0) {
+        throw 'Package contains duplicate ZIP entry names.'
+    }
+    $invalidNames = @($entries | Where-Object {
+        $_.FullName -notmatch '^leko\.koplugin/' -or $_.FullName -match '(^|/)\.\.?(/|$)'
+    })
+    if ($invalidNames.Count -gt 0) {
+        throw 'Package contains an invalid ZIP entry path.'
+    }
+    foreach ($required in @(
+        'leko.koplugin/main.lua',
+        'leko.koplugin/_meta.lua',
+        'leko.koplugin/Leko/App.lua',
+        'leko.koplugin/Leko/MemoryGuard.lua',
+        'leko.koplugin/Leko/ProcessBudget.lua',
+        'leko.koplugin/Leko/Version.lua'
+    )) {
+        $entry = $archive.GetEntry($required)
+        if ($null -eq $entry -or $entry.Length -le 0) {
+            throw "Package is missing or has an empty required file: $required"
+        }
+    }
+} finally {
+    $archive.Dispose()
+}
+
 $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 [pscustomobject]@{
     package = $zipPath
     size_bytes = (Get-Item -LiteralPath $zipPath).Length
+    verified = $true
     sha256 = $hash
 } | ConvertTo-Json

@@ -7,6 +7,17 @@ local Util = require("Leko/Util")
 
 local Paginator = {}
 
+-- Only the horizontal reading margins are user-facing layout settings. These
+-- vertical gaps belong to the reader chrome: keep the header/footer close to
+-- the edges regardless of legacy margin_top/margin_bottom fields in a saved
+-- style.
+local READER_CHROME_TOP_GAP = 14
+local READER_CHROME_BOTTOM_GAP = 12
+-- When the header is hidden, keep the body away from the physical top edge.
+-- This preserves the 0.15.39-sized reading inset without making the visible
+-- header's own outer gap as large as the legacy user margin.
+local READER_BODY_TOP_GAP = 24
+
 local INDENT = "\u{3000}\u{3000}"
 local IDEOGRAPHIC_SPACE = "\u{3000}"
 local NO_BREAK_SPACE = "\u{00A0}"
@@ -101,8 +112,8 @@ function Paginator:getGeometry(style)
     local screen_height = Screen:getHeight()
     local left = Screen:scaleBySize(style.margin_left or 28)
     local right = Screen:scaleBySize(style.margin_right or 28)
-    local top = Screen:scaleBySize(style.margin_top or 24)
-    local bottom = Screen:scaleBySize(style.margin_bottom or 20)
+    local top = Screen:scaleBySize(READER_CHROME_TOP_GAP)
+    local bottom = Screen:scaleBySize(READER_CHROME_BOTTOM_GAP)
     local content_width = math.max(Screen:scaleBySize(120), screen_width - left - right)
 
     local body_face, body_line_height = bodyMetrics(style)
@@ -113,7 +124,8 @@ function Paginator:getGeometry(style)
     -- a compact optional status footer so the text area behaves like a reader.
     local footer_height = style.show_footer and (chrome_height + Screen:scaleBySize(5)) or 0
     local control_height = 0
-    local content_height = screen_height - top - bottom - header_height - footer_height
+    local body_top = style.show_header and top or Screen:scaleBySize(READER_BODY_TOP_GAP)
+    local content_height = screen_height - body_top - bottom - header_height - footer_height
 
     return {
         screen_width = screen_width,
@@ -121,6 +133,7 @@ function Paginator:getGeometry(style)
         left = left,
         right = right,
         top = top,
+        body_top = body_top,
         bottom = bottom,
         content_width = content_width,
         content_height = math.max(body_line_height, content_height),
@@ -209,6 +222,10 @@ function Paginator:makePage(book, requested_position, style)
     local page = {
         start_position = Util.positionCopy(position),
         next_position = nil,
+        -- ReaderView's footer uses the same model that pagination just loaded.
+        -- Keeping this one current-chapter reference avoids a second lookup on
+        -- every ordinary page turn without creating a page cache.
+        chapter_model = model,
         elements = {},
         chapter_index = position.chapter,
         chapter_title = model.title,
@@ -238,8 +255,8 @@ function Paginator:makePage(book, requested_position, style)
             -- remains left aligned with the body; only its Y position moves.
             local body_y = math.floor(geometry.screen_height * 0.36)
             local title_y = math.floor((body_y - title_height) / 2)
-            top_gap = math.max(0, title_y - geometry.top)
-            bottom_gap = math.max(0, body_y - geometry.top - top_gap - title_height)
+            top_gap = math.max(0, title_y - geometry.body_top)
+            bottom_gap = math.max(0, body_y - geometry.body_top - top_gap - title_height)
         else
             top_gap = Screen:scaleBySize(style.title_margin_top or 44)
             bottom_gap = Screen:scaleBySize(style.title_margin_bottom or 54)

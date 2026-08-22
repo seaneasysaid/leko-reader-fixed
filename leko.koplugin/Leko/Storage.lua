@@ -1160,14 +1160,24 @@ function Storage:getDefaultReaderStyle()
         layout_version = READER_LAYOUT_VERSION,
         margin_left = 28,
         margin_right = 28,
-        margin_top = 24,
-        margin_bottom = 20,
+        -- Legacy fields retained for settings compatibility. Paginator owns
+        -- the vertical chrome gaps; only margin_left/margin_right are used as
+        -- user-facing reading margins.
+        margin_top = 14,
+        margin_bottom = 12,
         line_spacing = 0.28,
         paragraph_spacing = 10,
         indent = true,
         show_header = true,
         show_footer = true,
         chapter_new_page = true,
+        -- The visual page transition is optional. ReaderView does not add a
+        -- separate full-surface clearing pass after a page transition.
+        page_transition_enabled = true,
+        -- Cross-chapter cleanup is deliberately opt-in: it uses several
+        -- scoped UI submissions and is slower than the ordinary page swipe.
+        -- Keep the key name for compatibility with existing .44 settings.
+        chapter_clean_wave_enabled = false,
     }
 end
 
@@ -1176,8 +1186,8 @@ function Storage:getReaderStyle()
     local style = self:getDefaultReaderStyle()
     for key, value in pairs(saved) do style[key] = value end
     -- 0.15.19 persisted the old fixed 44/54 chapter-opening gaps. Migrate
-    -- only those layout fields; never touch the user's font, body margins,
-    -- line spacing or indentation preference.
+    -- only those title fields; never touch the user's font, horizontal
+    -- reading margins, line spacing or indentation preference.
     if (tonumber(saved.layout_version or 0) or 0) < READER_LAYOUT_VERSION then
         style.title_margin_top = self:getDefaultReaderStyle().title_margin_top
         style.title_margin_bottom = self:getDefaultReaderStyle().title_margin_bottom

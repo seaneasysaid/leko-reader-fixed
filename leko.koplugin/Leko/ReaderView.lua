@@ -13,19 +13,45 @@ local LeftContainer = require("ui/widget/container/leftcontainer")
 local Notification = require("ui/widget/notification")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local ProgressWidget = require("ui/widget/progresswidget")
+local RightContainer = require("ui/widget/container/rightcontainer")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
+local logger = require("logger")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local Screen = Device.screen
 
 local BookService = require("Leko/BookService")
 local FontSelectionView = require("Leko/FontSelectionView")
 local Paginator = require("Leko/Paginator")
+local ReaderFooter = require("Leko/ReaderFooter")
 local Storage = require("Leko/Storage")
 local TocView = require("Leko/TocView")
 local UI = require("Leko/UI")
 local Util = require("Leko/Util")
+
+-- Keep the semantic direction constants available even when an older or
+-- mixed plugin directory cannot load the optional transition coordinator.
+-- The real module is loaded only when a ReaderView is created.
+local SwipeRefresh = { FORWARD = "forward", BACKWARD = "backward" }
+local swipe_refresh_module
+local swipe_refresh_load_error
+
+local function loadSwipeRefresh()
+    if swipe_refresh_module ~= nil then
+        return swipe_refresh_module ~= false and swipe_refresh_module or nil,
+            swipe_refresh_load_error
+    end
+    local ok, module = pcall(require, "Leko/SwipeRefresh")
+    if not ok or type(module) ~= "table" or type(module.new) ~= "function" then
+        swipe_refresh_load_error = tostring(ok and "transition coordinator API is invalid" or module)
+        swipe_refresh_module = false
+        return nil, swipe_refresh_load_error
+    end
+    swipe_refresh_module = module
+    SwipeRefresh = module
+    return module
+end
 
 local ReaderView = InputContainer:extend{
     covers_fullscreen = true,
@@ -44,7 +70,28 @@ function ReaderView:init()
     self._layout_dialog = nil
     self._closing = false
     self.prefetch_state = nil
+    self._prefetch_footer_signature = nil
+    self._prefetch_footer_rendered_signature = nil
+    self._prefetch_footer_refresh_pending = false
+    self.page_generation = 0
+    self._pending_rebuild = nil
+    self.swipe_animation_enabled = self.style.page_transition_enabled ~= false
+    self.chapter_clean_wave_enabled = self.style.chapter_clean_wave_enabled ~= false
     self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
+    local swipe_module, swipe_error = loadSwipeRefresh()
+    if swipe_module then
+        local constructed, coordinator = pcall(swipe_module.new, swipe_module, {
+            screen = Screen,
+            ui_manager = UIManager,
+        })
+        if constructed and type(coordinator) == "table" then
+            self.swipe_refresh = coordinator
+        else
+            self.swipe_refresh = nil
+            swipe_error = tostring(coordinator or "transition coordinator initialization failed")
+        end
+    end
+    self._swipe_refresh_load_error = swipe_error
     self.ges_events = self.ges_events or {}
     self.key_events = self.key_events or {}
 
@@ -92,6 +139,19 @@ function ReaderView:init()
     if not page then page = self:errorPage(position, err) end
     self:consumeFontFallbackNotice()
     self:setPage(page, "full")
+    if self._swipe_refresh_load_error then
+        local message = "动画效果模块加载失败，已回退普通刷新。请完全退出并重新打开 KOReader 后，重新复制完整的 leko.koplugin 文件夹。"
+        logger.warn("Leko transition coordinator disabled:", self._swipe_refresh_load_error)
+        if type(UIManager.nextTick) == "function" then
+            UIManager:nextTick(function()
+                if not self._closing then
+                    UIManager:show(Notification:new{ text = message })
+                end
+            end)
+        else
+            UIManager:show(Notification:new{ text = message })
+        end
+    end
 end
 
 function ReaderView:consumeFontFallbackNotice()
@@ -127,71 +187,146 @@ end
 function ReaderView:buildFooterStatus(page, geometry)
     local total_chapters = #(self.book.chapters or {})
     local state = self.prefetch_state
-    local text = string.format("第 %d / %d 章", page.chapter_index or 1, total_chapters)
-    local percentage = 0
-    local show_bar = false
-
-    if state and tonumber(state.total or 0) > 0 then
-        local cached = math.max(0, math.min(state.total, tonumber(state.cached or 0) or 0))
-        percentage = cached / state.total
-        show_bar = true
-        if state.status == "downloading" or state.status == "waiting" then
-            text = text .. string.format("  ·  邻章缓存 %d/%d", cached, state.total)
-        elseif state.status == "partial" then
-            text = text .. string.format("  ·  邻章已缓存 %d/%d", cached, state.total)
-        else
-            text = text .. string.format("  ·  前后邻章已缓存 %d/%d", cached, state.total)
-        end
-    elseif state and state.status == "end" then
-        text = text .. "  ·  无需缓存邻章"
-        percentage = 1
-        show_bar = true
+    -- A page rebuild already contains the current cache indicator.  Remember
+    -- that signature so a queued prefetch notification can coalesce with the
+    -- page turn instead of rebuilding the whole reading page a second time.
+    self._prefetch_footer_rendered_signature = ReaderFooter:prefetchSignature(state)
+    local chapter_index = tonumber(page.chapter_index or 1) or 1
+    local chapter_percentage = 0
+    -- Paginator already loaded the current chapter to create this page. Keep
+    -- that reference on the page so an ordinary (non-animated) page turn does
+    -- not perform another cache/disk lookup just to draw the footer.
+    local model = page.chapter_model or BookService:loadChapterModel(self.book, chapter_index)
+    if model then
+        local position = page.next_position or page.start_position
+        chapter_percentage = ReaderFooter:percentage(model, position, chapter_index, page.at_end)
+    elseif page.at_end then
+        chapter_percentage = 1
     end
 
-    local group = HorizontalGroup:new{ align = "center" }
-    local bar_width = math.max(Screen:scaleBySize(54), math.floor(geometry.content_width * 0.22))
-    local text_width = geometry.content_width - (show_bar and (bar_width + Screen:scaleBySize(10)) or 0)
-    table.insert(group, TextWidget:new{
-        text = text,
-        face = geometry.chrome_face,
-        padding = 0,
-        max_width = math.max(Screen:scaleBySize(120), text_width),
-    })
-    if show_bar then
-        table.insert(group, HorizontalSpan:new{ width = Screen:scaleBySize(10) })
-        table.insert(group, ProgressWidget:new{
-            width = bar_width,
-            height = math.max(3, Screen:scaleBySize(5)),
+    local left_text = string.format("第 %d / %d 章", chapter_index, total_chapters)
+    local right_text = string.format("本章 %d%%", math.floor(chapter_percentage * 100 + 0.5))
+    local cache = ReaderFooter:prefetchLabel(state)
+    -- Keep the status line inside the same horizontal reading margins as the
+    -- body. This avoids text touching the panel edges on small Kindle screens.
+    local width = math.max(1, geometry.content_width or (geometry.screen_width
+        - geometry.left - geometry.right))
+    local height = geometry.footer_height
+    local left_width = math.floor(width * 0.34)
+    local right_width = math.floor(width * 0.24)
+    local middle_width = math.max(1, width - left_width - right_width)
+
+    local left = LeftContainer:new{
+        dimen = Geom:new{ w = left_width, h = height },
+        TextWidget:new{
+            text = left_text,
+            face = geometry.chrome_face,
             padding = 0,
-            margin = 0,
-            fillcolor = Blitbuffer.COLOR_BLACK,
-            percentage = percentage,
-        })
-    end
-    return CenterContainer:new{
-        dimen = Geom:new{ w = geometry.screen_width, h = geometry.footer_height },
-        group,
+            max_width = left_width,
+        },
     }
+    local right = RightContainer:new{
+        dimen = Geom:new{ w = right_width, h = height },
+        TextWidget:new{
+            text = right_text,
+            face = geometry.chrome_face,
+            padding = 0,
+            max_width = right_width,
+        },
+    }
+
+    local middle_content
+    if cache then
+        -- Keep the 0.15.39 visual scale: the bar was 22% of the usable
+        -- reading width. Computing 28% of the already narrowed middle column
+        -- made it only about 12% of the page and nearly invisible on Kindle 7.
+        local cache_bar_width = math.max(Screen:scaleBySize(54), math.floor(width * 0.22))
+        middle_content = HorizontalGroup:new{
+            align = "center",
+            TextWidget:new{
+                text = cache.text,
+                face = geometry.chrome_face,
+                padding = 0,
+            },
+            HorizontalSpan:new{ width = Screen:scaleBySize(5) },
+            ProgressWidget:new{
+                width = cache_bar_width,
+                height = math.max(3, Screen:scaleBySize(5)),
+                padding = 0,
+                margin = 0,
+                fillcolor = Blitbuffer.COLOR_BLACK,
+                percentage = cache.percentage,
+            },
+        }
+    else
+        middle_content = TextWidget:new{ text = "", face = geometry.chrome_face, padding = 0 }
+    end
+
+    local footer = HorizontalGroup:new{
+        left,
+        CenterContainer:new{
+            dimen = Geom:new{ w = middle_width, h = height },
+            middle_content,
+        },
+        right,
+    }
+    return CenterContainer:new{
+        dimen = Geom:new{ w = geometry.screen_width, h = height },
+        footer,
+    }
+end
+
+function ReaderView:_footerRegion()
+    if not self.page or not self.page.geometry then return nil end
+    local geometry = self.page.geometry
+    return Geom:new{
+        x = 0,
+        y = geometry.screen_height - geometry.footer_height,
+        w = geometry.screen_width,
+        h = geometry.footer_height,
+    }
+end
+
+function ReaderView:_schedulePrefetchFooterRefresh()
+    if self._prefetch_footer_refresh_pending then return true end
+    self._prefetch_footer_refresh_pending = true
+    local callback = function()
+        self._prefetch_footer_refresh_pending = false
+        if self._closing or self.menu_visible or not self.page or not self.style.show_footer then return end
+        if self._prefetch_footer_signature == self._prefetch_footer_rendered_signature then
+            return
+        end
+        local region = self:_footerRegion()
+        if not region then return end
+        if self:isSwipeAnimationEnabled() and self.swipe_refresh
+                and self.swipe_refresh:isRunning() then
+            self._pending_rebuild = { refresh_type = "fast", refresh_region = region }
+            return
+        end
+        self:rebuild("fast", region)
+    end
+    if type(UIManager.nextTick) == "function" then
+        UIManager:nextTick(callback)
+    else
+        UIManager:scheduleIn(0.05, callback)
+    end
+    return true
 end
 
 function ReaderView:onPrefetchProgress(state)
     self.prefetch_state = state
     if self._closing or self.menu_visible or not self.page or not self.style.show_footer then return end
     if UIManager.isWidgetShown and not UIManager:isWidgetShown(self) then return end
-    local geometry = self.page.geometry
-    local footer_region = Geom:new{
-        x = 0,
-        y = geometry.screen_height - geometry.bottom - geometry.footer_height,
-        w = geometry.screen_width,
-        h = geometry.footer_height + geometry.bottom,
-    }
-    self:rebuild("fast", footer_region)
+    local signature = ReaderFooter:prefetchSignature(state)
+    if signature == self._prefetch_footer_signature then return end
+    self._prefetch_footer_signature = signature
+    self:_schedulePrefetchFooterRefresh()
 end
 
 function ReaderView:buildReadingPage(page)
     local geometry = page.geometry
     local group = VerticalGroup:new{ align = "left" }
-    table.insert(group, UI.vspace(geometry.top))
+    table.insert(group, UI.vspace(geometry.body_top or geometry.top))
 
     if page.show_header then
         table.insert(group, CenterContainer:new{
@@ -251,10 +386,10 @@ function ReaderView:buildReadingPage(page)
     local remaining = geometry.content_height - page.used_height
     if remaining > 0 then table.insert(group, UI.vspace(remaining)) end
 
-    -- Keep the reading margin above the status line, so the chapter indicator
-    -- itself is flush with the physical bottom edge.
-    table.insert(group, UI.vspace(geometry.bottom))
+    -- Keep the reading margin above the status line, matching the original
+    -- 0.15.39 reading geometry; the footer remains flush with the bottom edge.
     if self.style.show_footer then
+        table.insert(group, UI.vspace(geometry.bottom))
         table.insert(group, self:buildFooterStatus(page, geometry))
     elseif geometry.footer_height > 0 then
         table.insert(group, UI.vspace(geometry.footer_height))
@@ -303,6 +438,18 @@ function ReaderView:buildMenuOverlay()
 end
 
 function ReaderView:rebuild(refresh_type, refresh_region)
+    -- The ordinary path must remain independent of transition state. This is
+    -- especially important immediately after the user turns animation off:
+    -- a stale visual coordinator flag must not turn a direct rebuild into a
+    -- pending repaint.
+    if self:isSwipeAnimationEnabled() and self.swipe_refresh
+            and self.swipe_refresh:isRunning() then
+        self._pending_rebuild = {
+            refresh_type = refresh_type or "ui",
+            refresh_region = refresh_region,
+        }
+        return false
+    end
     local page_widget = self:buildReadingPage(self.page)
     if self.menu_visible then
         local top, bottom = self:buildMenuOverlay()
@@ -317,14 +464,104 @@ function ReaderView:rebuild(refresh_type, refresh_region)
         self[1] = page_widget
     end
     UIManager:setDirty(self, refresh_type or "ui", refresh_region or self.dimen)
+    return true
 end
 
-function ReaderView:setPage(page, refresh_type)
+-- The transition callback means that Screen.bb now owns the submitted pixels;
+-- it is not a physical E Ink waveform-complete notification.
+function ReaderView:_finishSwipeSubmission()
+    if self._closing or not self.page then return end
+    local page_widget = self:buildReadingPage(self.page)
+    if self.menu_visible then
+        local top, bottom = self:buildMenuOverlay()
+        self[1] = OverlapGroup:new{
+            dimen = self.dimen:copy(),
+            allow_mirroring = false,
+            page_widget,
+            top,
+            bottom,
+        }
+    else
+        self[1] = page_widget
+    end
+    local pending = self._pending_rebuild
+    self._pending_rebuild = nil
+    if pending then
+        UIManager:setDirty(self, pending.refresh_type or "ui", pending.refresh_region or self.dimen)
+    end
+end
+
+function ReaderView:_settleSwipeRefresh()
+    return self.swipe_refresh and self.swipe_refresh:settle() or false
+end
+
+function ReaderView:_cancelSwipeRefresh()
+    return self.swipe_refresh and self.swipe_refresh:cancel() or false
+end
+
+function ReaderView:isSwipeAnimationEnabled()
+    return self.swipe_animation_enabled ~= false
+end
+
+function ReaderView:setSwipeAnimationEnabled(enabled)
+    enabled = enabled == true
+    self.swipe_animation_enabled = enabled
+    self.style.page_transition_enabled = enabled
+    Storage:saveReaderStyle(self.style)
+    if not enabled and self.swipe_refresh and self.swipe_refresh:isRunning() then
+        -- Disabling animation must not wait for the physical waveform.  Drop
+        -- the visual transition and repaint the current logical page through
+        -- the ordinary ReaderView path.
+        self:_cancelSwipeRefresh()
+        self._pending_rebuild = nil
+        if self.page then self:rebuild("partial") end
+    end
+    if not self:_refreshLayoutToggle("page_animation_toggle",
+            enabled and "动画效果：开" or "动画效果：关") then
+        self:refreshLayoutMenu()
+    end
+    return enabled
+end
+
+function ReaderView:isChapterCleanWaveEnabled()
+    return self.chapter_clean_wave_enabled ~= false
+end
+
+function ReaderView:setChapterCleanWaveEnabled(enabled)
+    enabled = enabled == true
+    self.chapter_clean_wave_enabled = enabled
+    self.style.chapter_clean_wave_enabled = enabled
+    Storage:saveReaderStyle(self.style)
+    if not enabled and self.swipe_refresh
+            and type(self.swipe_refresh.isWaveRunning) == "function"
+            and self.swipe_refresh:isWaveRunning() then
+        self:_cancelSwipeRefresh()
+        if self.page then self:rebuild("partial") end
+    end
+    if not self:_refreshLayoutToggle("chapter_wave_toggle",
+            enabled and "跨章净屏动画：开" or "跨章净屏动画：关") then
+        self:refreshLayoutMenu()
+    end
+    return enabled
+end
+
+function ReaderView:_nextPageGeneration()
+    self.page_generation = (self.page_generation or 0) + 1
+    return self.page_generation
+end
+
+function ReaderView:isPageGenerationCurrent(generation)
+    return generation == nil or generation == self.page_generation
+end
+
+function ReaderView:setPage(page, refresh_type, direction, generation)
+    if generation and not self:isPageGenerationCurrent(generation) then return false end
     local previous_chapter = self.page and self.page.chapter_index
+    local chapter_changed = previous_chapter ~= nil and previous_chapter ~= page.chapter_index
+    if not direction then self:_cancelSwipeRefresh() end
     self.page = page
     self.pages_since_save = (self.pages_since_save or 0) + 1
     local now_time = os.time()
-    local chapter_changed = previous_chapter ~= nil and previous_chapter ~= page.chapter_index
     local flush_position = chapter_changed or now_time - (self.last_progress_flush_at or 0) >= 60
     BookService:savePosition(self.book, page.start_position, flush_position)
     if flush_position then
@@ -336,21 +573,56 @@ function ReaderView:setPage(page, refresh_type)
             tostring(page.start_position.char or 1),
         }, ":")
     end
-    self:rebuild(refresh_type or "partial")
+    if direction and self:isSwipeAnimationEnabled() and self.swipe_refresh then
+        self.menu_visible = false
+        local target_widget = self:buildReadingPage(page)
+        local begin_ok, started, begin_err = pcall(self.swipe_refresh.begin,
+            self.swipe_refresh,
+            target_widget,
+            direction,
+            function() self:_finishSwipeSubmission() end,
+            {
+                chapter_changed = chapter_changed,
+                page_animation_enabled = self:isSwipeAnimationEnabled(),
+                chapter_clean_wave_enabled = self:isChapterCleanWaveEnabled(),
+            })
+        if not begin_ok then
+            begin_err = tostring(started)
+            started = nil
+            logger.warn("Leko transition backend failed; disabling it for this reader:", begin_err)
+            pcall(self.swipe_refresh.cancel, self.swipe_refresh)
+            self.swipe_refresh = nil
+        end
+        if not started then
+            self:rebuild(refresh_type or "partial")
+        end
+    else
+        if direction and self:isSwipeAnimationEnabled()
+                and self.swipe_refresh and self.swipe_refresh:isRunning() then
+            self:_cancelSwipeRefresh()
+        end
+        -- This is the 0.15.44/0.15.39 direct path.  No-animation turns do
+        -- not consult, schedule or settle the transition coordinator.
+        self:rebuild(refresh_type or "partial")
+    end
     BookService:requestPrefetch(self.book, page.chapter_index, BookService.prefetch_window)
-end
-
-function ReaderView:applyPreparedPosition(position, refresh_type)
-    local page, err = Paginator:makePage(self.book, position, self.style)
-    if not page then return nil, tostring(err or "章节分页失败") end
-    self.menu_visible = false
-    self:setPage(page, refresh_type)
     return true
 end
 
-function ReaderView:loadPage(position, refresh_type)
+function ReaderView:applyPreparedPosition(position, refresh_type, direction, generation)
+    if generation and not self:isPageGenerationCurrent(generation) then return true end
+    local page, err = Paginator:makePage(self.book, position, self.style)
+    if not page then return nil, tostring(err or "章节分页失败") end
+    self.menu_visible = false
+    return self:setPage(page, refresh_type, direction, generation)
+end
+
+function ReaderView:loadPage(position, refresh_type, direction, generation)
+    generation = generation or self:_nextPageGeneration()
+    if not self:isPageGenerationCurrent(generation) then return true end
     local target_chapter = self.book.chapters and self.book.chapters[position.chapter]
     if not target_chapter then
+        self:_settleSwipeRefresh()
         UIManager:show(Notification:new{ text = "章节不存在" })
         return nil, "章节不存在"
     end
@@ -358,20 +630,32 @@ function ReaderView:loadPage(position, refresh_type)
     local needs_download = not on_disk and target_chapter.url
     if needs_download then
         if type(self.onPrepareChapter) ~= "function" then
+            self:_settleSwipeRefresh()
             UIManager:show(Notification:new{ text = "这一章尚未下载，现在无法读取" })
             return nil, "异步章节读取器不可用"
         end
-        local task, err = self.onPrepareChapter(self, position, refresh_type)
-        if not task and err then UIManager:show(Notification:new{ text = tostring(err) }) end
+        local task, err = self.onPrepareChapter(self, position, refresh_type, {
+            direction = direction,
+            generation = generation,
+        })
+        if not task and err then
+            self:_settleSwipeRefresh()
+            UIManager:show(Notification:new{ text = tostring(err) })
+        end
         return task
     end
-    local ok, err = self:applyPreparedPosition(position, refresh_type)
-    if not ok then UIManager:show(Notification:new{ text = tostring(err) }) end
+    local ok, err = self:applyPreparedPosition(position, refresh_type, direction, generation)
+    if not ok then
+        self:_settleSwipeRefresh()
+        UIManager:show(Notification:new{ text = tostring(err) })
+    end
     return ok, err
 end
 
 function ReaderView:applyTocUpdate(updated_book, change)
     if type(updated_book) ~= "table" then return nil, "目录更新结果无效" end
+    self:_settleSwipeRefresh()
+    self:_nextPageGeneration()
     local previous = self.book
     local page = self.page
     local current_chapter = page and page.chapter_index
@@ -402,12 +686,15 @@ end
 
 function ReaderView:reloadCurrentChapter()
     if self._closing or type(self.onPrepareChapter) ~= "function" or not self.page then return true end
+    self:_settleSwipeRefresh()
+    local generation = self:_nextPageGeneration()
     local position = Util.positionCopy(self.page.start_position)
     local task, err = self.onPrepareChapter(self, position, "full", {
         force_network = true,
+        generation = generation,
         present = function(reader, updated_book, target_position, refresh_type)
             BookService:clearBookCache(updated_book.id)
-            return reader:applyPreparedPosition(target_position, refresh_type)
+            return reader:applyPreparedPosition(target_position, refresh_type, nil, generation)
         end,
     })
     if not task and err then UIManager:show(Notification:new{ text = tostring(err) }) end
@@ -416,6 +703,7 @@ end
 
 function ReaderView:nextPage()
     if self.page.at_end then
+        self:_settleSwipeRefresh()
         if type(self.onRefreshToc) == "function" then
             local task, err = self.onRefreshToc(self, {})
             if not task and err then UIManager:show(Notification:new{ text = tostring(err) }) end
@@ -425,55 +713,72 @@ function ReaderView:nextPage()
         return true
     end
     table.insert(self.history, Util.positionCopy(self.page.start_position))
-    self:loadPage(self.page.next_position, "partial")
+    local generation = self:_nextPageGeneration()
+    self:loadPage(self.page.next_position, "partial", SwipeRefresh.FORWARD, generation)
     return true
 end
 
-function ReaderView:_showPreviousPage(target_position, refresh_type)
+function ReaderView:_showPreviousPage(target_position, refresh_type, generation)
     local page, err = Paginator:findPreviousPage(self.book, target_position, self.style)
     if not page then return nil, tostring(err or "已经是第一页") end
     self.menu_visible = false
-    self:setPage(page, refresh_type or "partial")
-    return true
+    return self:setPage(page, refresh_type or "partial", SwipeRefresh.BACKWARD, generation)
 end
 
 function ReaderView:previousPage()
     local target = table.remove(self.history)
-    if target then self:loadPage(target, "partial"); return true end
+    if target then
+        local generation = self:_nextPageGeneration()
+        self:loadPage(target, "partial", SwipeRefresh.BACKWARD, generation)
+        return true
+    end
 
     local current = self.page.start_position
+    local generation = self:_nextPageGeneration()
     local crosses_chapter = current.paragraph == 1 and current.char == 1 and current.chapter > 1
     local previous_chapter = crosses_chapter and (current.chapter - 1) or nil
     if previous_chapter and not BookService:isChapterDownloaded(self.book, previous_chapter) then
         if type(self.onPrepareChapter) ~= "function" then
+            self:_settleSwipeRefresh()
             UIManager:show(Notification:new{ text = "上一章尚未下载，现在无法读取" })
             return true
         end
         local task, err = self.onPrepareChapter(self, {
             chapter = previous_chapter, paragraph = 1, char = 1,
         }, "partial", {
+            direction = SwipeRefresh.BACKWARD,
+            generation = generation,
             present = function(reader)
-                return reader:_showPreviousPage(current, "partial")
+                return reader:_showPreviousPage(current, "partial", generation)
             end,
         })
-        if not task and err then UIManager:show(Notification:new{ text = tostring(err) }) end
+        if not task and err then
+            self:_settleSwipeRefresh()
+            UIManager:show(Notification:new{ text = tostring(err) })
+        end
         return true
     end
 
-    local ok, err = self:_showPreviousPage(current, "partial")
-    if not ok then UIManager:show(Notification:new{ text = tostring(err) }) end
+    local ok, err = self:_showPreviousPage(current, "partial", generation)
+    if not ok then
+        self:_settleSwipeRefresh()
+        UIManager:show(Notification:new{ text = tostring(err) })
+    end
     return true
 end
 
 function ReaderView:jumpToChapter(chapter_index)
+    self:_settleSwipeRefresh()
     self.history = {}
     self.menu_visible = false
-    self:loadPage({ chapter = chapter_index, paragraph = 1, char = 1 }, "full")
+    local generation = self:_nextPageGeneration()
+    self:loadPage({ chapter = chapter_index, paragraph = 1, char = 1 }, "full", nil, generation)
 end
 
 function ReaderView:jumpChapter(delta)
     local index = math.max(1, math.min(#(self.book.chapters or {}), (self.page.chapter_index or 1) + delta))
     if index == self.page.chapter_index then
+        self:_settleSwipeRefresh()
         UIManager:show(Notification:new{ text = delta < 0 and "已经是第一章" or "已经是最后一章" })
         return true
     end
@@ -482,6 +787,7 @@ function ReaderView:jumpChapter(delta)
 end
 
 function ReaderView:showToc()
+    self:_settleSwipeRefresh()
     self.menu_visible = false
     self:rebuild("ui")
     return UI.showLater(self, "toc", function()
@@ -494,6 +800,7 @@ function ReaderView:showToc()
 end
 
 function ReaderView:showBookInfo()
+    self:_settleSwipeRefresh()
     self.menu_visible = false
     self:rebuild("ui")
     return UI.defer(self, "book_info", function()
@@ -502,6 +809,7 @@ function ReaderView:showBookInfo()
 end
 
 function ReaderView:addToBookshelf()
+    self:_settleSwipeRefresh()
     if Storage:isInLibrary(self.book.id) then UIManager:show(Notification:new{ text = "本书已在书架" }); return true end
     local book, err = BookService:addToBookshelf(self.book)
     if not book then UIManager:show(Notification:new{ text = "加入书架失败：" .. tostring(err) }); return true end
@@ -513,12 +821,14 @@ function ReaderView:addToBookshelf()
 end
 
 function ReaderView:toggleMenu(force)
+    self:_settleSwipeRefresh()
     self.menu_visible = force == nil and not self.menu_visible or force == true
     self:rebuild("ui")
     return true
 end
 
 function ReaderView:applyStyleChange(callback)
+    self:_settleSwipeRefresh()
     callback(self.style)
     self.history = {}
     BookService:clearBookCache(self.book.id)
@@ -548,23 +858,68 @@ function ReaderView:applyFontSelection(selection)
     end)
 end
 
--- ButtonDialog materializes button labels when it is constructed. Rebuild the
--- open dialog in place after a style mutation so its controls immediately
--- show the newly applied values without requiring a close/reopen gesture.
-function ReaderView:refreshLayoutMenu()
+function ReaderView:_refreshLayoutToggle(id, text)
     local dialog = self._layout_dialog
     if not dialog then return false end
-    if type(dialog.reinit) == "function" then
-        dialog.buttons = self:makeLayoutMenuButtons()
-        dialog:reinit()
-        UIManager:setDirty(dialog, "ui", dialog.dimen)
-        return true
+
+    -- ButtonDialog exposes the lookup itself on current KOReader releases;
+    -- older hosts only expose the child ButtonTable.  Resolve either form so
+    -- the callback can repaint the existing row immediately.
+    local button
+    if type(dialog.getButtonById) == "function" then
+        local ok, found = pcall(dialog.getButtonById, dialog, id)
+        if ok then button = found end
     end
-    -- Compatibility fallback for an older host without ButtonDialog:reinit.
-    self._layout_dialog = nil
-    UIManager:close(dialog)
+    if not button then
+        local button_table = dialog.buttontable or dialog.button_table
+        if button_table and type(button_table.getButtonById) == "function" then
+            local ok, found = pcall(button_table.getButtonById, button_table, id)
+            if ok then button = found end
+        end
+    end
+    if not button or type(button.setText) ~= "function" then return false end
+
+    local ok = pcall(button.setText, button, text, button.width)
+    if not ok then return false end
+
+    -- Button:refresh() invalidates exactly the button's own label region.  It
+    -- is important here: rebuilding the whole dialog from inside its click
+    -- callback can leave the old button tree painted until a later UI event.
+    if type(button.refresh) == "function" then
+        local refreshed = pcall(button.refresh, button)
+        if refreshed then return true end
+    end
+
+    local child = button[1]
+    local region = child and child.dimen or button.dimen
+    if child and child.dimen and type(UIManager.widgetRepaint) == "function" then
+        pcall(UIManager.widgetRepaint, UIManager, child, child.dimen.x, button.dimen.y)
+    end
+    if region then UIManager:setDirty(nil, "ui", region) end
+    return true
+end
+
+-- ButtonDialog materializes non-dynamic labels when it is constructed. For
+-- layout changes, rebuild the open dialog on the next UI tick so a callback is
+-- not rebuilding the dialog tree while that same button is still dispatching.
+function ReaderView:refreshLayoutMenu()
+    if not self._layout_dialog then return false end
     return UI.defer(self, "layout_menu_refresh", function()
-        if self._closing then return end
+        local dialog = self._layout_dialog
+        if self._closing or not dialog then return end
+        if type(dialog.reinit) == "function" then
+            dialog.buttons = self:makeLayoutMenuButtons()
+            dialog:reinit()
+            -- ButtonDialog's geometry is recomputed by reinit().  Pass the
+            -- concrete region; the callback-form setDirty used by newer
+            -- widgets is not understood by every 0.15.x host.
+            local region = dialog.movable and dialog.movable.dimen or dialog.dimen
+            if region then UIManager:setDirty(dialog, "ui", region) end
+            return
+        end
+        -- Compatibility fallback for an older host without ButtonDialog:reinit.
+        self._layout_dialog = nil
+        UIManager:close(dialog)
         self:showLayoutMenu()
     end)
 end
@@ -643,11 +998,20 @@ function ReaderView:makeLayoutMenuButtons()
                 s.show_footer = not s.show_footer
             end) end },
         },
+        {
+            { id = "page_animation_toggle", text = self:isSwipeAnimationEnabled() and "动画效果：开" or "动画效果：关", callback = function()
+                self:setSwipeAnimationEnabled(not self:isSwipeAnimationEnabled())
+            end },
+            { id = "chapter_wave_toggle", text = self:isChapterCleanWaveEnabled() and "跨章净屏动画：开" or "跨章净屏动画：关", callback = function()
+                self:setChapterCleanWaveEnabled(not self:isChapterCleanWaveEnabled())
+            end },
+        },
         { { text = "关闭", callback = close } },
     }
 end
 
 function ReaderView:showFontSelection()
+    self:_settleSwipeRefresh()
     local dialog = self._layout_dialog
     if dialog then UIManager:close(dialog) end
     self._layout_dialog = nil
@@ -663,6 +1027,7 @@ function ReaderView:showFontSelection()
 end
 
 function ReaderView:showLayoutMenu()
+    self:_settleSwipeRefresh()
     if self._layout_dialog then
         if UIManager.isWidgetShown and UIManager:isWidgetShown(self._layout_dialog) then return true end
         self._layout_dialog = nil
@@ -719,11 +1084,37 @@ function ReaderView:onFlushSettings()
     end
 end
 
-function ReaderView:onSuspend() self:onFlushSettings() end
+function ReaderView:onSuspend()
+    self:_settleSwipeRefresh()
+    self:onFlushSettings()
+end
+
+-- Rotation actions are dispatched by the host before the screen geometry is
+-- rebuilt.  Settle any old-dimension strip callback first.
+function ReaderView:onIterateRotation()
+    self:_settleSwipeRefresh()
+    return false
+end
+
+function ReaderView:onSwapRotation()
+    self:_settleSwipeRefresh()
+    return false
+end
+
+function ReaderView:onInvertRotation()
+    self:_settleSwipeRefresh()
+    return false
+end
+
+function ReaderView:onRotation()
+    self:_settleSwipeRefresh()
+    return false
+end
 
 function ReaderView:closeReaderNow()
     if self._closing then return true end
     self._closing = true
+    self:_cancelSwipeRefresh()
     if self._exit_dialog then UIManager:close(self._exit_dialog); self._exit_dialog = nil end
     if self._layout_dialog then UIManager:close(self._layout_dialog); self._layout_dialog = nil end
 
@@ -755,6 +1146,7 @@ end
 
 function ReaderView:requestExit()
     if Storage:isInLibrary(self.book.id) then return self:closeReaderNow() end
+    self:_settleSwipeRefresh()
     if self._exit_dialog then
         if UIManager.isWidgetShown and UIManager:isWidgetShown(self._exit_dialog) then return true end
         self._exit_dialog = nil
@@ -791,6 +1183,9 @@ function ReaderView:onClose()
     if self.menu_visible then return self:toggleMenu(false) end
     return self:requestExit()
 end
-ReaderView.onCloseWidget = ReaderView.onFlushSettings
+function ReaderView:onCloseWidget()
+    self:_cancelSwipeRefresh()
+    self:onFlushSettings()
+end
 
 return ReaderView

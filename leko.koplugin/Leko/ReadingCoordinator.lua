@@ -164,7 +164,11 @@ end
 function ReadingCoordinator:prepareChapter(reader, position, refresh_type, options)
     options = options or {}
     if not reader or not reader.book then return nil, "阅读器状态不完整" end
-    if self:isBusy() then return nil, "已有前台读取任务正在进行" end
+    -- A new foreground page request owns the reader. Replacing the previous
+    -- chapter task prevents quick taps from becoming a hidden task queue.
+    -- ForegroundBookTask separately guards every subprocess callback with its
+    -- own generation token.
+    if self:isBusy() then self.task:cancel("replaced") end
     local chapter_index = tonumber(position and position.chapter) or 1
     local chapter = reader.book.chapters and reader.book.chapters[chapter_index]
     if not chapter then return nil, "章节不存在" end
@@ -184,10 +188,24 @@ function ReadingCoordinator:prepareChapter(reader, position, refresh_type, optio
         keep_progress = true,
         finish_on_success = false,
         on_failure = function(err)
+            if reader._closing then return end
+            if options.generation and type(reader.isPageGenerationCurrent) == "function"
+                    and not reader:isPageGenerationCurrent(options.generation) then
+                return
+            end
+            if type(reader._settleSwipeRefresh) == "function" then
+                reader:_settleSwipeRefresh()
+            end
             self:_showError(force_network and "刷新本章失败" or "章节打开失败", err, options.on_failure)
         end,
         on_success = function(updated_book, _, progress, task)
             runAfterPaint(function()
+                if reader._closing then task:complete(progress); return end
+                if options.generation and type(reader.isPageGenerationCurrent) == "function"
+                        and not reader:isPageGenerationCurrent(options.generation) then
+                    task:complete(progress)
+                    return
+                end
                 reader.book = updated_book
                 if force_network then
                     BookService:clearBookCache(updated_book.id)
@@ -196,10 +214,16 @@ function ReadingCoordinator:prepareChapter(reader, position, refresh_type, optio
                 if type(options.present) == "function" then
                     ok, page_err = options.present(reader, updated_book, position, refresh_type)
                 else
-                    ok, page_err = reader:applyPreparedPosition(position, refresh_type)
+                    ok, page_err = reader:applyPreparedPosition(position, refresh_type,
+                        options.direction, options.generation)
                 end
                 task:complete(progress)
-                if not ok then self:_showError("章节加载失败", page_err, options.on_failure) end
+                if not ok then
+                    if type(reader._settleSwipeRefresh) == "function" then
+                        reader:_settleSwipeRefresh()
+                    end
+                    self:_showError("章节加载失败", page_err, options.on_failure)
+                end
             end)
         end,
     }
@@ -212,6 +236,7 @@ function ReadingCoordinator:refreshToc(reader, options)
     BookService:cancelPrefetch(reader.book.id, true)
     local old_page = reader.page
     local old_chapter_count = #(reader.book.chapters or {})
+    local generation = reader.page_generation
     return self.task:start{
         operation = "refresh-toc",
         book = reader.book,
@@ -222,11 +247,24 @@ function ReadingCoordinator:refreshToc(reader, options)
         keep_progress = true,
         finish_on_success = false,
         on_failure = function(err)
+            if reader._closing then return end
+            if generation and type(reader.isPageGenerationCurrent) == "function"
+                    and not reader:isPageGenerationCurrent(generation) then
+                return
+            end
+            if type(reader._settleSwipeRefresh) == "function" then
+                reader:_settleSwipeRefresh()
+            end
             self:_showError("目录检查失败", err, options.on_failure)
         end,
         on_success = function(updated, payload, progress, task)
             runAfterPaint(function()
                 if reader._closing then task:complete(progress); return end
+                if generation and type(reader.isPageGenerationCurrent) == "function"
+                        and not reader:isPageGenerationCurrent(generation) then
+                    task:complete(progress)
+                    return
+                end
                 local change = payload and payload.toc_change or {}
                 if type(reader.applyTocUpdate) == "function" then
                     reader:applyTocUpdate(updated, change)
