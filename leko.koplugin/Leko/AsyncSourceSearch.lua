@@ -129,16 +129,28 @@ local function explorationSeeds(explore, wanted)
 end
 
 local function adaptiveQueueOrder(queue)
-    -- Manual reader judgements are an outer ordering contract.  Keep the
-    -- learned/stratified ordering inside the automatic band, and always leave
-    -- the "last" band in the queue so it is still fully scanned.
+    -- Manual reader judgements are an outer scheduling contract.  A preferred
+    -- source gets one interleaved front-of-queue attempt; a miss/timeout is
+    -- retried from the tail of that insertion queue so one slow source cannot
+    -- block the other preferred sources or the main scan.
+    -- Keep the learned/stratified ordering inside the automatic band, and
+    -- always leave the "last" band in the queue so it is still fully scanned.
     local preferred, automatic, deferred = {}, {}, {}
     for index, entry in ipairs(queue or {}) do
         entry.base_order = index
         local tier = SourcePreference:get(entry)
-        if tier == SourcePreference.PRIORITY then preferred[#preferred + 1] = entry
-        elseif tier == SourcePreference.LAST then deferred[#deferred + 1] = entry
-        else automatic[#automatic + 1] = entry end
+        if tier == SourcePreference.PRIORITY then
+            entry.manual_priority = true
+            entry.fast_phase = false
+            preferred[#preferred + 1] = entry
+        elseif tier == SourcePreference.LAST then
+            entry.manual_priority = false
+            entry.fast_phase = false
+            deferred[#deferred + 1] = entry
+        else
+            entry.manual_priority = false
+            automatic[#automatic + 1] = entry
+        end
     end
     if #preferred > 0 or #deferred > 0 then
         local automatic_order, automatic_fast = adaptiveQueueOrder(automatic)
@@ -148,16 +160,19 @@ local function adaptiveQueueOrder(queue)
         table.sort(preferred, originalOrder)
         table.sort(deferred, originalOrder)
         local ordered = {}
-        for _, entry in ipairs(preferred) do
-            entry.fast_phase = true
-            ordered[#ordered + 1] = entry
+        local preferred_index, automatic_index = 1, 1
+        while preferred_index <= #preferred or automatic_index <= #automatic_order do
+            if automatic_index <= #automatic_order then
+                ordered[#ordered + 1] = automatic_order[automatic_index]
+                automatic_index = automatic_index + 1
+            end
+            if preferred_index <= #preferred then
+                ordered[#ordered + 1] = preferred[preferred_index]
+                preferred_index = preferred_index + 1
+            end
         end
-        for _, entry in ipairs(automatic_order) do ordered[#ordered + 1] = entry end
-        for _, entry in ipairs(deferred) do
-            entry.fast_phase = false
-            ordered[#ordered + 1] = entry
-        end
-        return ordered, math.min(#ordered, #preferred + (automatic_fast or 0))
+        for _, entry in ipairs(deferred) do ordered[#ordered + 1] = entry end
+        return ordered, automatic_fast or 0
     end
     local known, explore = {}, {}
     local now = os.time()
@@ -230,17 +245,37 @@ local function manualQueueOrder(queue)
     for index, entry in ipairs(queue or {}) do
         local item = { entry = entry, index = index }
         local tier = SourcePreference:get(entry)
-        if tier == SourcePreference.PRIORITY then preferred[#preferred + 1] = item
-        elseif tier == SourcePreference.LAST then deferred[#deferred + 1] = item
-        else automatic[#automatic + 1] = item end
+        if tier == SourcePreference.PRIORITY then
+            entry.manual_priority = true
+            entry.fast_phase = false
+            preferred[#preferred + 1] = item
+        elseif tier == SourcePreference.LAST then
+            entry.manual_priority = false
+            entry.fast_phase = false
+            deferred[#deferred + 1] = item
+        else
+            entry.manual_priority = false
+            automatic[#automatic + 1] = item
+        end
     end
     local function stable(left, right) return left.index < right.index end
     table.sort(preferred, stable)
     table.sort(automatic, stable)
     table.sort(deferred, stable)
     local ordered = {}
-    for _, group in ipairs({ preferred, automatic, deferred }) do
-        for _, item in ipairs(group) do ordered[#ordered + 1] = item.entry end
+    local preferred_index, automatic_index = 1, 1
+    while preferred_index <= #preferred or automatic_index <= #automatic do
+        if automatic_index <= #automatic then
+            ordered[#ordered + 1] = automatic[automatic_index].entry
+            automatic_index = automatic_index + 1
+        end
+        if preferred_index <= #preferred then
+            ordered[#ordered + 1] = preferred[preferred_index].entry
+            preferred_index = preferred_index + 1
+        end
+    end
+    for _, item in ipairs(deferred) do
+        ordered[#ordered + 1] = item.entry
     end
     return ordered
 end
@@ -324,10 +359,10 @@ local function executeSourceJob(job)
         if type(job.cached_health) == "table" then health_map[tostring(job.source_id)] = job.cached_health end
         local cached_decision, cached_health = SourceHealth:cachedDecision(source, nil, health_map)
         payload.health = cached_health
-        -- A recent explicit offline result may be skipped. Unknown or expired
-        -- health never triggers a separate probe here: the real search request
-        -- is both faster and a more accurate connectivity test.
-        if cached_decision == false then
+        -- Automatic sources may honor a recent explicit offline result. A
+        -- manually preferred source is deliberately still tried once; the
+        -- reader's choice must not be silently defeated by stale health.
+        if cached_decision == false and job.manual_priority ~= true then
             payload.skipped = true
             payload.error = cached_health and cached_health.error or "书源近期不可连接"
         else
@@ -472,6 +507,8 @@ function AsyncSourceSearch:new(options)
     instance.seen = {}
     instance.queue = nil
     instance.queue_index = 0
+    instance.manual_priority_queue = {}
+    instance.manual_insert_next = false
     instance.retry_queue = {}
     instance.deferred_retry_queue = {}
     instance.fast_attempted_count = 0
@@ -577,14 +614,32 @@ end
 function AsyncSourceSearch:_hasRemainingEntries()
     return #self.retry_queue > 0
         or self.queue and self.queue_index < #self.queue
+        or #self.manual_priority_queue > 0
         or #self.deferred_retry_queue > 0
 end
 
 function AsyncSourceSearch:_nextEntry()
     if #self.retry_queue > 0 then return table.remove(self.retry_queue, 1) end
-    if self.queue and self.queue_index < #self.queue then
+
+    local main_available = self.queue and self.queue_index < #self.queue
+    local preferred_available = #self.manual_priority_queue > 0
+    if main_available and preferred_available then
+        if self.manual_insert_next then
+            self.manual_insert_next = false
+            return table.remove(self.manual_priority_queue, 1)
+        end
         self.queue_index = self.queue_index + 1
+        self.manual_insert_next = true
         return self.queue[self.queue_index]
+    end
+    if main_available then
+        self.queue_index = self.queue_index + 1
+        self.manual_insert_next = true
+        return self.queue[self.queue_index]
+    end
+    if preferred_available then
+        self.manual_insert_next = false
+        return table.remove(self.manual_priority_queue, 1)
     end
     if #self.deferred_retry_queue > 0 then return table.remove(self.deferred_retry_queue, 1) end
     return nil
@@ -600,6 +655,17 @@ function AsyncSourceSearch:_deferEntry(entry)
     if entry and not self.cancelled and not self.finished then
         self.deferred_retry_queue[#self.deferred_retry_queue + 1] = entry
     end
+end
+
+function AsyncSourceSearch:_deferManualPriority(entry)
+    if self.cancelled or self.finished
+            or not entry or entry.manual_priority ~= true or entry.manual_priority_retry_done then
+        return false
+    end
+    entry.manual_priority_retry_done = true
+    self.total_sources = self.total_sources + 1
+    self.manual_priority_queue[#self.manual_priority_queue + 1] = entry
+    return true
 end
 
 function AsyncSourceSearch:_markFastAttempt(entry)
@@ -628,6 +694,7 @@ function AsyncSourceSearch:_finishIfIdle()
     self.finished = true
     pcall(SourceHealth.scheduleFlush, SourceHealth, 20)
     self.queue = nil
+    self.manual_priority_queue = {}
     self.retry_queue = {}
     self.deferred_retry_queue = {}
     self:_notifyProgress(stage, true)
@@ -667,8 +734,9 @@ function AsyncSourceSearch:_prepareQueue()
             and tostring(summary.id or "") ~= skipped_id
             and (self.mode ~= "cover" or summary.cover_supported ~= false)
         if eligible then
+            local manual_priority = SourcePreference:get(summary) == SourcePreference.PRIORITY
             local decision = SourceHealth:cachedDecision(summary, nil, health_map)
-            if decision == false then
+            if decision == false and not manual_priority then
                 pre_skipped = pre_skipped + 1
             else
                 queue[#queue + 1] = {
@@ -679,6 +747,7 @@ function AsyncSourceSearch:_prepareQueue()
                     weight = summary.weight,
                     custom_order = summary.custom_order,
                     health = health_map[tostring(summary.id or "")],
+                    manual_priority = manual_priority,
                     records_path = records_path,
                     record_offset = summary.record_offset,
                     record_length = summary.record_length,
@@ -687,13 +756,25 @@ function AsyncSourceSearch:_prepareQueue()
         end
     end
     summaries = nil
-    -- Legado relies on a wider thread pool and source order. Kindle 7 cannot
-    -- afford that many workers, so use learned source quality instead: sources
-    -- that previously produced exact matches or were explicitly selected run
-    -- first, while one unknown source is interleaved after every four known
-    -- sources so newly imported good sources are never starved.
+    -- Keep learned quality inside the automatic main queue. Manual-priority
+    -- entries are held in their own insertion queue so failed entries can be
+    -- appended to that queue's tail without waiting for the entire main scan.
     queue, self.fast_phase_count = adaptiveQueueOrder(queue)
-    self.queue = queue
+    local main_queue, manual_priority_queue, deferred_queue = {}, {}, {}
+    for _, entry in ipairs(queue) do
+        if entry.manual_priority == true then
+            manual_priority_queue[#manual_priority_queue + 1] = entry
+        elseif SourcePreference:get(entry) == SourcePreference.LAST then
+            deferred_queue[#deferred_queue + 1] = entry
+        else
+            main_queue[#main_queue + 1] = entry
+        end
+    end
+    self.queue = main_queue
+    self.queue_index = 0
+    self.manual_priority_queue = manual_priority_queue
+    self.manual_insert_next = false
+    self.deferred_retry_queue = deferred_queue
     self.total_sources = #queue
     self.skipped_sources = pre_skipped
     self:_notifyProgress(pre_skipped > 0
@@ -736,6 +817,9 @@ function AsyncSourceSearch:_processSourceResult(entry, payload)
     if payload.error then self:_addError(entry and entry.name, payload.error) end
     local direct = type(payload.results) == "table" and payload.results or {}
     local emitted = self:_emit(direct, entry)
+    -- A preferred source that returned no usable result gets one later retry at
+    -- the tail of the manual insertion queue, before that queue is exhausted.
+    if not emitted then self:_deferManualPriority(entry) end
     -- Drop the decoded IPC tree as soon as the tiny rows have been handed off.
     -- On Kindle 7 this matters more than keeping a large payload alive until the
     -- next periodic collection.
@@ -764,6 +848,7 @@ function AsyncSourceSearch:_processSourceResult(entry, payload)
         end
     end
     self:_notifyProgress(stage, emitted or self.completed_sources == self.total_sources)
+    return emitted
 end
 
 function AsyncSourceSearch:_continueAfterSource()
@@ -810,7 +895,12 @@ function AsyncSourceSearch:_reapWorker(worker, outcome, retry_entry)
             self:_releaseWorkerBudget(worker)
             worker.finished = true
             self.reaping_count = math.max(0, self.reaping_count - 1)
-            if retry_entry == "deferred" then self:_deferEntry(worker.entry)
+            if retry_entry == "deferred" then
+                if worker.entry and worker.entry.manual_priority == true then
+                    self:_deferManualPriority(worker.entry)
+                else
+                    self:_deferEntry(worker.entry)
+                end
             elseif retry_entry then self:_returnEntry(worker.entry) end
             if outcome and not self.cancelled then self:_processSourceResult(worker.entry, outcome) end
             if not self.paused and not self.cancelled then self:_continueAfterSource() end
@@ -892,6 +982,7 @@ function AsyncSourceSearch:_requestEntry(entry)
         book_author = self.book and self.book.author,
         keyword = self.keyword ~= "" and self.keyword or tostring(self.book and self.book.title or ""),
         mode = self.mode,
+        manual_priority = entry.manual_priority == true,
         priority_score = entry.priority_score,
         inspect_limit = SearchSettings:getLimit(),
     }
@@ -964,15 +1055,29 @@ function AsyncSourceSearch:_pollWorker(worker)
         if socket.gettime() - worker.started_at >= deadline then
             worker.finished = true
             ffiutil.terminateSubProcess(worker.pid)
-            if worker.entry and worker.entry.fast_phase and not worker.entry.fast_retry_done then
-                -- A short first-pass timeout is not a source failure. Defer this
-                -- source until after the main queue, then retry once with the full
-                -- 14-second budget. This improves time-to-first-results without
-                -- reducing eventual compatibility or poisoning health history.
-                worker.entry.fast_retry_done = true
-                self:_markFastAttempt(worker.entry)
-                self:_notifyProgress("快速阶段暂未响应，已留到完整扫描再试 · "
-                    .. tostring(self.fast_attempted_count) .. "/" .. tostring(self.fast_phase_count), true)
+            if worker.entry
+                    and (worker.entry.fast_phase or worker.entry.manual_priority == true)
+                    and not worker.entry.fast_retry_done
+                    and not worker.entry.manual_priority_retry_done then
+                -- A first-pass timeout is not a source failure. Automatic
+                -- fast-phase entries go to the full-scan retry queue; a
+                -- preferred entry is appended to its own insertion queue by
+                -- the reaper, so it keeps its place among manual retries.
+                if worker.entry.manual_priority ~= true then
+                    worker.entry.fast_retry_done = true
+                    self:_markFastAttempt(worker.entry)
+                else
+                    -- This first timeout has no result payload to pass through
+                    -- _processSourceResult, but it is still one completed
+                    -- attempt because the retry is counted separately.
+                    self.completed_sources = self.completed_sources + 1
+                    self:_deferManualPriority(worker.entry)
+                end
+                local stage = worker.entry.manual_priority == true
+                    and "手动优先源首次未响应，已排到插队队列末尾重试"
+                    or ("快速阶段暂未响应，已留到完整扫描再试 · "
+                        .. tostring(self.fast_attempted_count) .. "/" .. tostring(self.fast_phase_count))
+                self:_notifyProgress(stage, true)
                 self:_reapWorker(worker, nil, "deferred")
             else
                 self:_reapWorker(worker, {
@@ -1023,31 +1128,50 @@ end
 
 function AsyncSourceSearch:applySourcePreference()
     if self.cancelled or self.finished then return false end
-    local changed = false
-    if self.queue and self.queue_index < #self.queue then
-        local reordered = {}
-        for index = 1, self.queue_index do reordered[#reordered + 1] = self.queue[index] end
-        local pending = {}
-        for index = self.queue_index + 1, #self.queue do pending[#pending + 1] = self.queue[index] end
-        local ordered = manualQueueOrder(pending)
-        for _, entry in ipairs(ordered) do reordered[#reordered + 1] = entry end
-        self.queue = reordered
-        changed = true
+    local old_main, old_preferred, old_deferred = {}, {}, {}
+    local pending = {}
+    if self.queue then
+        for index = self.queue_index + 1, #self.queue do
+            old_main[#old_main + 1] = self.queue[index]
+            pending[#pending + 1] = self.queue[index]
+        end
     end
+    for _, entry in ipairs(self.manual_priority_queue or {}) do
+        old_preferred[#old_preferred + 1] = entry
+        pending[#pending + 1] = entry
+    end
+    for _, entry in ipairs(self.deferred_retry_queue or {}) do
+        old_deferred[#old_deferred + 1] = entry
+        pending[#pending + 1] = entry
+    end
+
+    local main, preferred, deferred = {}, {}, {}
+    for _, entry in ipairs(manualQueueOrder(pending)) do
+        local tier = SourcePreference:get(entry)
+        if tier == SourcePreference.PRIORITY then
+            preferred[#preferred + 1] = entry
+        elseif tier == SourcePreference.LAST then
+            deferred[#deferred + 1] = entry
+        else
+            main[#main + 1] = entry
+        end
+    end
+
+    local function differs(left, right)
+        if #left ~= #right then return true end
+        for index, entry in ipairs(left) do
+            if entry ~= right[index] then return true end
+        end
+        return false
+    end
+
     local retry = manualQueueOrder(self.retry_queue)
-    local deferred = manualQueueOrder(self.deferred_retry_queue)
-    if #retry ~= #self.retry_queue or #deferred ~= #self.deferred_retry_queue then
-        changed = true
-    else
-        for index, entry in ipairs(retry) do
-            if entry ~= self.retry_queue[index] then changed = true; break end
-        end
-        if not changed then
-            for index, entry in ipairs(deferred) do
-                if entry ~= self.deferred_retry_queue[index] then changed = true; break end
-            end
-        end
-    end
+    local changed = differs(main, old_main) or differs(preferred, old_preferred)
+        or differs(deferred, old_deferred) or differs(retry, self.retry_queue)
+    self.queue = main
+    self.queue_index = 0
+    self.manual_priority_queue = preferred
+    self.manual_insert_next = false
     self.retry_queue, self.deferred_retry_queue = retry, deferred
     if changed and not self.paused then self:_scheduleFill(0) end
     return changed
@@ -1109,6 +1233,7 @@ function AsyncSourceSearch:cancel()
     local active = {}
     for worker in pairs(self.workers) do active[#active + 1] = worker end
     self.queue = nil
+    self.manual_priority_queue = {}
     self.retry_queue = {}
     self.deferred_retry_queue = {}
     self.seen = {}

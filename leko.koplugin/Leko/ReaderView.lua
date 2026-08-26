@@ -63,8 +63,6 @@ local ReaderView = InputContainer:extend{
 function ReaderView:init()
     self.style = Storage:getReaderStyle()
     self.history = {}
-    self.pages_since_save = 0
-    self.last_progress_flush_at = os.time()
     self.menu_visible = false
     self._exit_dialog = nil
     self._layout_dialog = nil
@@ -73,6 +71,8 @@ function ReaderView:init()
     self._prefetch_footer_signature = nil
     self._prefetch_footer_rendered_signature = nil
     self._prefetch_footer_refresh_pending = false
+    self._progress_dirty = false
+    self._footer_dirty = true
     self.page_generation = 0
     self._pending_rebuild = nil
     self.swipe_animation_enabled = self.style.page_transition_enabled ~= false
@@ -126,8 +126,8 @@ function ReaderView:init()
     if Device:hasKeys() then
         self.key_events.Close = { { "Back" }, { "Esc" } }
         self.key_events.ReaderMenu = { { "Menu" } }
-        self.key_events.PageForward = { { "Right" }, { "RPgFwd" }, { "PgFwd" } }
-        self.key_events.PageBackward = { { "Left" }, { "LPgBack" }, { "PgBack" } }
+        self.key_events.PageForward = { { "Right" }, { "RPgFwd" }, { "LPgFwd" }, { "PgFwd" } }
+        self.key_events.PageBackward = { { "Left" }, { "RPgBack" }, { "LPgBack" }, { "PgBack" } }
     end
 
     BookService:observePrefetch(self.book.id, self, function(state)
@@ -184,6 +184,36 @@ function ReaderView:getMenuMetrics()
     return top_h, bottom_h
 end
 
+function ReaderView:_syncPrefetchState()
+    if not self.book or type(BookService.getPrefetchState) ~= "function" then
+        return self.prefetch_state
+    end
+    self.prefetch_state = BookService:getPrefetchState(self.book.id)
+    return self.prefetch_state
+end
+
+function ReaderView:refreshFooterFromCache(refresh_type)
+    if self._closing or not self.page then return false end
+    self:_settleSwipeRefresh()
+    self:_syncPrefetchState()
+    self._prefetch_footer_signature = ReaderFooter:prefetchSignature(self.prefetch_state)
+    self._prefetch_footer_rendered_signature = nil
+    self._footer_dirty = true
+    local region = self.menu_visible and self.dimen or self:_footerRegion()
+    return self:rebuild(refresh_type or "full", region or self.dimen)
+end
+
+function ReaderView:_scheduleFooterRefresh(force)
+    return UI.defer(self, "footer_restore", function()
+        if self._closing or not self.page then return end
+        if not force and (self.menu_visible
+                or (UIManager.isWidgetShown and not UIManager:isWidgetShown(self))) then
+            return
+        end
+        self:refreshFooterFromCache(force and "full" or "fast")
+    end)
+end
+
 function ReaderView:buildFooterStatus(page, geometry)
     local total_chapters = #(self.book.chapters or {})
     local state = self.prefetch_state
@@ -191,6 +221,8 @@ function ReaderView:buildFooterStatus(page, geometry)
     -- that signature so a queued prefetch notification can coalesce with the
     -- page turn instead of rebuilding the whole reading page a second time.
     self._prefetch_footer_rendered_signature = ReaderFooter:prefetchSignature(state)
+    self._prefetch_footer_signature = self._prefetch_footer_rendered_signature
+    self._footer_dirty = false
     local chapter_index = tonumber(page.chapter_index or 1) or 1
     local chapter_percentage = 0
     -- Paginator already loaded the current chapter to create this page. Keep
@@ -314,12 +346,13 @@ function ReaderView:_schedulePrefetchFooterRefresh()
 end
 
 function ReaderView:onPrefetchProgress(state)
+    local previous_signature = self._prefetch_footer_signature
     self.prefetch_state = state
+    self._prefetch_footer_signature = ReaderFooter:prefetchSignature(state)
+    self._footer_dirty = true
     if self._closing or self.menu_visible or not self.page or not self.style.show_footer then return end
     if UIManager.isWidgetShown and not UIManager:isWidgetShown(self) then return end
-    local signature = ReaderFooter:prefetchSignature(state)
-    if signature == self._prefetch_footer_signature then return end
-    self._prefetch_footer_signature = signature
+    if self._prefetch_footer_signature == previous_signature then return end
     self:_schedulePrefetchFooterRefresh()
 end
 
@@ -438,6 +471,13 @@ function ReaderView:buildMenuOverlay()
 end
 
 function ReaderView:rebuild(refresh_type, refresh_region)
+    -- The callback is not guaranteed to run after a dialog closes or a
+    -- reflow reconstructs the ReaderView. Read the service-owned state at
+    -- every visual rebuild so the native 0.15.47 footer cannot retain a stale
+    -- cache bar when no new notification arrives.
+    -- The cache window is established by setPage before the target page is
+    -- built. Here we only recover the service-owned state for a redraw.
+    self:_syncPrefetchState()
     -- The ordinary path must remain independent of transition state. This is
     -- especially important immediately after the user turns animation off:
     -- a stale visual coordinator flag must not turn a direct rebuild into a
@@ -471,6 +511,7 @@ end
 -- it is not a physical E Ink waveform-complete notification.
 function ReaderView:_finishSwipeSubmission()
     if self._closing or not self.page then return end
+    self:_syncPrefetchState()
     local page_widget = self:buildReadingPage(self.page)
     if self.menu_visible then
         local top, bottom = self:buildMenuOverlay()
@@ -560,19 +601,16 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
     local chapter_changed = previous_chapter ~= nil and previous_chapter ~= page.chapter_index
     if not direction then self:_cancelSwipeRefresh() end
     self.page = page
-    self.pages_since_save = (self.pages_since_save or 0) + 1
-    local now_time = os.time()
-    local flush_position = chapter_changed or now_time - (self.last_progress_flush_at or 0) >= 60
-    BookService:savePosition(self.book, page.start_position, flush_position)
-    if flush_position then
-        self.pages_since_save = 0
-        self.last_progress_flush_at = now_time
-        self._last_persisted_position = table.concat({
-            tostring(page.start_position.chapter or 1),
-            tostring(page.start_position.paragraph or 1),
-            tostring(page.start_position.char or 1),
-        }, ":")
-    end
+    self._progress_dirty = true
+    self._footer_dirty = true
+    -- Kindle flash storage is intentionally not touched on page turns. Keep
+    -- the exact cursor in memory and write it once when the reader closes.
+    BookService:savePosition(self.book, page.start_position, false)
+    -- Establish the cache window before constructing the target page. This
+    -- lets the footer show the existing unfinished cached/total state on the
+    -- first paint of a page turn, instead of waiting for a later event.
+    BookService:requestPrefetch(self.book, page.chapter_index, BookService.prefetch_window)
+    self:_syncPrefetchState()
     if direction and self:isSwipeAnimationEnabled() and self.swipe_refresh then
         self.menu_visible = false
         local target_widget = self:buildReadingPage(page)
@@ -605,7 +643,6 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
         -- not consult, schedule or settle the transition coordinator.
         self:rebuild(refresh_type or "partial")
     end
-    BookService:requestPrefetch(self.book, page.chapter_index, BookService.prefetch_window)
     return true
 end
 
@@ -672,13 +709,18 @@ function ReaderView:applyTocUpdate(updated_book, change)
     end
     target_index = target_index or (updated_book.position and updated_book.position.chapter) or 1
     if position then
-        position.chapter = target_index
         local target = updated_book.chapters and updated_book.chapters[target_index]
+        local same_chapter = current_chapter == target_index
+            and (not current_id or (target and tostring(current_id) == tostring(target.id)))
+        position.chapter = target_index
         position.chapter_id = target and target.id or nil
+        if not same_chapter then
+            position.paragraph = 1
+            position.char = 1
+        end
         local rebuilt = Paginator:makePage(updated_book, position, self.style)
         if rebuilt then
-            self.page = rebuilt
-            self:rebuild("ui")
+            self:setPage(rebuilt, "ui")
         end
     end
     return true
@@ -795,6 +837,7 @@ function ReaderView:showToc()
             book = self.book,
             current_chapter = self.page.chapter_index,
             onChapterSelected = function(chapter_index) self:jumpToChapter(chapter_index) end,
+            on_return = function() self:_scheduleFooterRefresh(true) end,
         }
     end, "full")
 end
@@ -824,6 +867,7 @@ function ReaderView:toggleMenu(force)
     self:_settleSwipeRefresh()
     self.menu_visible = force == nil and not self.menu_visible or force == true
     self:rebuild("ui")
+    if not self.menu_visible then self:_scheduleFooterRefresh(true) end
     return true
 end
 
@@ -837,10 +881,14 @@ function ReaderView:applyStyleChange(callback)
     Storage:saveReaderStyle(self.style)
     if not page then UIManager:show(Notification:new{ text = tostring(err) }); return end
     self.page = page
+    self._progress_dirty = true
+    self._footer_dirty = true
     self.menu_visible = true
-    BookService:savePosition(self.book, page.start_position, true)
+    -- Reflow changes only the in-memory cursor; the close path persists it.
+    BookService:savePosition(self.book, page.start_position, false)
     self:rebuild("full")
     self:refreshLayoutMenu()
+    self:_scheduleFooterRefresh(true)
 end
 
 function ReaderView:applyFontSelection(selection)
@@ -921,6 +969,7 @@ function ReaderView:refreshLayoutMenu()
         self._layout_dialog = nil
         UIManager:close(dialog)
         self:showLayoutMenu()
+        self:_scheduleFooterRefresh(true)
     end)
 end
 
@@ -960,6 +1009,7 @@ function ReaderView:makeLayoutMenuButtons()
         local dialog = self._layout_dialog
         if dialog then UIManager:close(dialog) end
         self._layout_dialog = nil
+        self:_scheduleFooterRefresh(true)
     end
 
     local function chooseFont()
@@ -1015,11 +1065,13 @@ function ReaderView:showFontSelection()
     local dialog = self._layout_dialog
     if dialog then UIManager:close(dialog) end
     self._layout_dialog = nil
+    self:_scheduleFooterRefresh(true)
     return UI.showLater(self, "font_selection", function()
         return FontSelectionView:new{
             style = self.style,
             on_selected = function(selection) self:applyFontSelection(selection) end,
             on_return = function()
+                self:_scheduleFooterRefresh(true)
                 if not self._closing then self:showLayoutMenu() end
             end,
         }
@@ -1031,6 +1083,7 @@ function ReaderView:showLayoutMenu()
     if self._layout_dialog then
         if UIManager.isWidgetShown and UIManager:isWidgetShown(self._layout_dialog) then return true end
         self._layout_dialog = nil
+        self:_scheduleFooterRefresh(true)
     end
     return UI.showModalLater(self, "layout_menu", function()
         local dialog = ButtonDialog:new{
@@ -1038,7 +1091,10 @@ function ReaderView:showLayoutMenu()
             modal = true,
             rows_per_page = 6,
             buttons = self:makeLayoutMenuButtons(),
-            tap_close_callback = function() self._layout_dialog = nil end,
+            tap_close_callback = function()
+                self._layout_dialog = nil
+                self:_scheduleFooterRefresh(true)
+            end,
         }
         self._layout_dialog = dialog
         return dialog
@@ -1070,22 +1126,21 @@ function ReaderView:onPageForward() return self:nextPage() end
 function ReaderView:onPageBackward() return self:previousPage() end
 
 function ReaderView:onFlushSettings()
-    if self.page then
+    if self.page and self._progress_dirty then
         local pos = self.page.start_position or {}
-        local signature = table.concat({
-            tostring(pos.chapter or 1), tostring(pos.paragraph or 1), tostring(pos.char or 1),
-        }, ":")
-        if signature ~= self._last_persisted_position then
-            BookService:savePosition(self.book, pos, true)
-            self._last_persisted_position = signature
+        local saved = BookService:savePosition(self.book, pos, true)
+        if saved ~= false then
+            self._progress_dirty = false
+        else
+            self._progress_dirty = true
         end
-        self.pages_since_save = 0
-        self.last_progress_flush_at = os.time()
     end
 end
 
 function ReaderView:onSuspend()
     self:_settleSwipeRefresh()
+    -- Power/suspend is the other safe persistence boundary. Do not write on
+    -- every page turn; save the latest in-memory cursor before sleep.
     self:onFlushSettings()
 end
 

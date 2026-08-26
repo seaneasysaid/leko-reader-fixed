@@ -2,8 +2,8 @@
 --
 -- This module deliberately knows nothing about fonts, page counts, widgets or
 -- refresh policy.  It only maps a normalized chapter position to a stable
--- text-progress percentage and describes whether the temporary prefetch hint
--- is currently active.
+-- text-progress percentage and describes whether an unfinished prefetch window
+-- should remain visible in the footer.
 
 local Util = require("Leko/Util")
 
@@ -72,21 +72,36 @@ function ReaderFooter:percentage(model, page_position, chapter_index, force_end)
     return clamp(consumed / metrics.total, 0, 1)
 end
 
+function ReaderFooter:shouldShowPrefetch(state)
+    if type(state) ~= "table" then return false end
+    local total = tonumber(state.total or 0) or 0
+    if total <= 0 then return false end
+
+    -- The footer is intentionally visible by default for a known cache
+    -- window. Hide it only when there is no adjacent work or the window is
+    -- explicitly complete; waiting/paused/partial states still communicate
+    -- the last known cached/total progress.
+    local status = tostring(state.status or "")
+    if status == "ready" or status == "end" then return false end
+    local cached = math.max(0, math.min(total, tonumber(state.cached or 0) or 0))
+    return state.active == true or cached < total
+end
+
+-- Keep the 0.15.47 helper available to callers that used the old name; the
+-- rendering policy itself is now expressed by shouldShowPrefetch().
 function ReaderFooter:isPrefetchActive(state)
-    return type(state) == "table"
-        and state.active == true
-        and tonumber(state.total or 0) > 0
+    return self:shouldShowPrefetch(state)
 end
 
 function ReaderFooter:prefetchSignature(state)
-    if not self:isPrefetchActive(state) then return "idle" end
+    if not self:shouldShowPrefetch(state) then return "idle" end
     local cached = math.max(0, math.min(
         tonumber(state.total) or 0, tonumber(state.cached or 0) or 0))
-    return table.concat({ "active", tostring(cached), tostring(tonumber(state.total) or 0) }, ":")
+    return table.concat({ "visible", tostring(cached), tostring(tonumber(state.total) or 0) }, ":")
 end
 
 function ReaderFooter:prefetchLabel(state)
-    if not self:isPrefetchActive(state) then return nil end
+    if not self:shouldShowPrefetch(state) then return nil end
     local total = math.max(1, tonumber(state.total) or 1)
     local cached = math.max(0, math.min(total, tonumber(state.cached or 0) or 0))
     return {

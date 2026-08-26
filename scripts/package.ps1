@@ -18,6 +18,18 @@ $versionText = Get-Content -Raw -Encoding UTF8 -LiteralPath $versionFile
 $match = [regex]::Match($versionText, 'version\s*=\s*"([^"]+)"')
 if (-not $match.Success) { throw 'Unable to read plugin version.' }
 $version = $match.Groups[1].Value
+$mainFile = Join-Path $pluginRoot 'main.lua'
+$mainText = Get-Content -Raw -Encoding UTF8 -LiteralPath $mainFile
+$mainMatch = [regex]::Match($mainText, 'EXPECTED_VERSION\s*=\s*"([^"]+)"')
+if (-not $mainMatch.Success -or $mainMatch.Groups[1].Value -ne $version) {
+    throw 'Version.lua and main.lua do not declare the same release version.'
+}
+$installFile = Join-Path $pluginRoot 'INSTALL.txt'
+$installText = Get-Content -Raw -Encoding UTF8 -LiteralPath $installFile
+$installMatch = [regex]::Match($installText, '(?m)^Leko Reader\s+([^\s]+)\s+安装说明')
+if (-not $installMatch.Success -or $installMatch.Groups[1].Value -ne $version) {
+    throw 'Version.lua and INSTALL.txt do not declare the same release version.'
+}
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $zipPath = Join-Path $OutputDirectory ("Leko-Reader-KOReader-{0}.zip" -f $version)

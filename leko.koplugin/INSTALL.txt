@@ -1,4 +1,4 @@
-Leko Reader 0.15.47 安装说明（新手版）
+Leko Reader 0.15.48 安装说明（新手版）
 
 你需要先在 Kindle 上安装 KOReader，也就是常说的“Kindle 第三方阅读器”。Leko 不能单独运行。
 

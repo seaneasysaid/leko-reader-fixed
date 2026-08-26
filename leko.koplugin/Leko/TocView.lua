@@ -115,14 +115,24 @@ function TocView:init()
         UIManager:close(menu, "full")
         if self.onChapterSelected then self.onChapterSelected(item.chapter_index) end
     end
-    self.close_callback = function() UIManager:close(self, "full") end
+    self.close_callback = function()
+        UIManager:close(self, "full")
+        self:_notifyReturn()
+    end
     Menu.init(self)
     self:switchItemTable(self.title, self.item_table, selection)
 end
 
 function TocView:onReturn()
     UIManager:close(self, "full")
+    self:_notifyReturn()
     return true
+end
+
+function TocView:_notifyReturn()
+    if self._return_notified then return end
+    self._return_notified = true
+    if type(self.on_return) == "function" then self.on_return() end
 end
 
 return TocView

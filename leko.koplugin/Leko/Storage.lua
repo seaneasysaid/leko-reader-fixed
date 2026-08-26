@@ -1207,8 +1207,16 @@ function Storage:saveBookProgress(book)
     if not book or not book.id then return false, "book.id is required" end
     Util.mkdirp(self:getBookDir(book.id))
     local progress_settings = LuaSettings:open(self:getBookProgressPath(book.id))
+    local position = Util.positionCopy(book.position)
     progress_settings.data = {
-        position = Util.positionCopy(book.position),
+        -- Keep the nested shape used by 0.15.39, while mirroring the cursor
+        -- fields at the top level for recovery from early progress files.
+        format_version = 2,
+        position = position,
+        chapter = position.chapter,
+        chapter_id = position.chapter_id,
+        paragraph = position.paragraph,
+        char = position.char,
         last_read_at = tonumber(book.last_read_at or os.time()) or os.time(),
     }
     progress_settings:flush()
@@ -1221,8 +1229,22 @@ function Storage:loadBookProgress(book_id)
     local settings = LuaSettings:open(path)
     local data = settings.data
     if type(data) ~= "table" then return nil end
+    local raw_position = data.position
+    if type(raw_position) ~= "table" then raw_position = data end
+    if type(raw_position) ~= "table"
+            or (raw_position.chapter == nil and raw_position.chapter_index == nil
+                and raw_position.paragraph == nil and raw_position.paragraph_index == nil
+                and raw_position.char == nil and raw_position.char_index == nil) then
+        return nil
+    end
+    local position = {
+        chapter = raw_position.chapter or raw_position.chapter_index,
+        chapter_id = raw_position.chapter_id or raw_position.chapterId,
+        paragraph = raw_position.paragraph or raw_position.paragraph_index,
+        char = raw_position.char or raw_position.char_index,
+    }
     return {
-        position = Util.positionCopy(data.position),
+        position = Util.positionCopy(position),
         last_read_at = tonumber(data.last_read_at or 0) or 0,
     }
 end

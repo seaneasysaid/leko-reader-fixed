@@ -484,20 +484,19 @@ function BookInfoView:showBookSourceSwitcher()
                     on_failure = function() search:resume() end,
                     on_success = function()
                         search:cancel()
-                        -- The detail page may have been closed only to expose
-                        -- the preserved source list.  A later source choice
-                        -- still belongs to this detail session, so revive the
-                        -- page before the list is closed; otherwise the second
-                        -- switch updates an invisible, permanently-closing
-                        -- widget and leaves the user without a return route.
-                        self._closing = false
-                        self._details_closed_notified = false
-                        if not UIManager.isWidgetShown or not UIManager:isWidgetShown(self) then
-                            UIManager:show(self, "full")
+                        -- With no active reader, enter the mapped current
+                        -- position after the mutation task releases its
+                        -- foreground slot. An active reader is reloaded by
+                        -- App and only needs the source list to close.
+                        if not self.reader_active then
+                            local function resumeReading()
+                                if not self._closing then self:startReading() end
+                            end
+                            if type(UIManager.nextTick) == "function" then UIManager:nextTick(resumeReading)
+                            else UIManager:scheduleIn(0, resumeReading) end
                         end
                     end,
                     on_source_view_closing = function(closing_view)
-                        self._return_view = closing_view
                         if closing_view and closing_view.prepareForReturn then
                             closing_view:prepareForReturn()
                         end

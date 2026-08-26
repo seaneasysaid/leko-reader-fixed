@@ -7,7 +7,7 @@ local App = require("Leko/App")
 local ErrorGuard = require("Leko/ErrorGuard")
 local FileManagerTab = require("Leko/FileManagerTab")
 local VERSION = require("Leko/Version").version
-local EXPECTED_VERSION = "0.15.47"
+local EXPECTED_VERSION = "0.15.48"
 
 local Leko = WidgetContainer:extend{
     name = "leko",

@@ -113,10 +113,67 @@ end
 
 function App:showBookInfoObject(book, reader)
     local BookInfoView = require("Leko/BookInfoView")
-    UIManager:show(BookInfoView:new{
+    local info_view
+
+    local function runNext(callback)
+        if type(UIManager.nextTick) == "function" then
+            UIManager:nextTick(callback)
+        else
+            UIManager:scheduleIn(0, callback)
+        end
+    end
+
+    local function refreshReaderFooter()
+        if not reader then return end
+        if type(reader.refreshFooterFromCache) == "function" then
+            reader:refreshFooterFromCache("full")
+        elseif UIManager.setDirty then
+            UIManager:setDirty(reader, "full")
+        end
+    end
+
+    local function closeDetails()
+        if not info_view then return end
+        -- BookInfoView's close callback must not treat this handoff as a
+        -- normal return: the active reader is already the destination.
+        info_view._entering_reader = true
+        if not UIManager.isWidgetShown or UIManager:isWidgetShown(info_view) then
+            UIManager:close(info_view, "full")
+        end
+    end
+
+    local function revealExistingReader(selected, read_options)
+        if not reader then return nil, "阅读器状态不可用" end
+        local chapter_index = tonumber(read_options and read_options.chapter_index)
+        if chapter_index and reader.page and reader.page.chapter_index ~= chapter_index then
+            reader:jumpToChapter(chapter_index)
+        end
+        runNext(function()
+            closeDetails()
+            refreshReaderFooter()
+            if read_options and type(read_options.on_reader_shown) == "function" then
+                pcall(read_options.on_reader_shown, reader, selected)
+            end
+        end)
+        return true
+    end
+
+    local function returnToUpdatedReader(updated)
+        if not reader then return end
+        reader.book = updated
+        reader.history = {}
+        local target = updated.position or { chapter = 1, paragraph = 1, char = 1 }
+        reader:loadPage(target, "full")
+        runNext(function()
+            closeDetails()
+            refreshReaderFooter()
+        end)
+    end
+
+    info_view = BookInfoView:new{
         book = book,
         onRead = function(selected, read_options)
-            if reader then return nil, "阅读器已打开" end
+            if reader then return revealExistingReader(selected, read_options) end
             return self:openBookObject(selected, read_options)
         end,
         onChapterSelected = function(selected, chapter_index)
@@ -124,7 +181,6 @@ function App:showBookInfoObject(book, reader)
                 reader:jumpToChapter(chapter_index)
             else
                 selected.position = { chapter = chapter_index, paragraph = 1, char = 1 }
-                Storage:saveBookProgress(selected)
                 return self:openBookObject(selected, { chapter_index = chapter_index })
             end
         end,
@@ -138,11 +194,10 @@ function App:showBookInfoObject(book, reader)
         end,
         onBookUpdated = function(updated, change)
             if reader then
-                reader.book = updated
                 if change and change.source_changed then
-                    reader.history = {}
-                    reader:loadPage(updated.position or { chapter = 1, paragraph = 1, char = 1 }, "ui")
+                    returnToUpdatedReader(updated)
                 else
+                    reader.book = updated
                     reader:rebuild("ui")
                 end
             end
@@ -156,7 +211,13 @@ function App:showBookInfoObject(book, reader)
             self:refreshBookshelf()
         end,
         onBookDeleted = function() self:refreshBookshelf() end,
-    }, "full")
+        reader_active = reader ~= nil,
+        onDetailsClosed = function()
+            if reader then runNext(refreshReaderFooter) end
+        end,
+    }
+    UIManager:show(info_view, "full")
+    return info_view
 end
 
 function App:openBook(book_id)

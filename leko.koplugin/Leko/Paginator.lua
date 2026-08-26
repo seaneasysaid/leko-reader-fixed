@@ -156,12 +156,32 @@ local function paragraphLength(model, paragraph_index)
     return length
 end
 
+local function chapterId(book, chapter_index)
+    local chapter = book and book.chapters and book.chapters[chapter_index]
+    return chapter and chapter.id or nil
+end
+
+local function makePosition(book, chapter_index, paragraph_index, char_index)
+    return {
+        chapter = chapter_index,
+        chapter_id = chapterId(book, chapter_index),
+        paragraph = paragraph_index,
+        char = char_index,
+    }
+end
+
 local function normalizePosition(book, position)
     position = Util.positionCopy(position)
     if position.chapter < 1 then position.chapter = 1 end
     if position.chapter > #book.chapters then position.chapter = #book.chapters end
     if position.paragraph < 1 then position.paragraph = 1 end
     if position.char < 1 then position.char = 1 end
+    local current_id = chapterId(book, position.chapter)
+    if position.chapter_id ~= nil and tostring(position.chapter_id) ~= tostring(current_id) then
+        position.paragraph = 1
+        position.char = 1
+    end
+    position.chapter_id = current_id
     return position
 end
 
@@ -174,12 +194,13 @@ function Paginator:_advanceToValid(book, position)
             if position.chapter >= #book.chapters then
                 return {
                     chapter = #book.chapters,
+                    chapter_id = chapterId(book, #book.chapters),
                     paragraph = #model.paragraphs,
                     char = paragraphLength(model, #model.paragraphs) + 1,
                     at_end = true,
                 }
             end
-            position = { chapter = position.chapter + 1, paragraph = 1, char = 1 }
+            position = makePosition(book, position.chapter + 1, 1, 1)
         else
             local length = paragraphLength(model, position.paragraph)
             if position.char > length then
@@ -330,11 +351,7 @@ function Paginator:makePage(book, requested_position, style)
                     if geometry.body_line_height > remaining_height and (added_line or #page.elements > 0) then
                         local next_layout_offset = line.offset
                         local next_char = content_char_index + math.max(0, next_layout_offset - prefix_length - 1)
-                        page.next_position = {
-                            chapter = chapter_index,
-                            paragraph = paragraph_index,
-                            char = next_char,
-                        }
+                        page.next_position = makePosition(book, chapter_index, paragraph_index, next_char)
                         return page
                     end
 
@@ -360,11 +377,7 @@ function Paginator:makePage(book, requested_position, style)
                     added_line = true
 
                     if not is_last_line and remaining_height < geometry.body_line_height then
-                        page.next_position = {
-                            chapter = chapter_index,
-                            paragraph = paragraph_index,
-                            char = next_char,
-                        }
+                        page.next_position = makePosition(book, chapter_index, paragraph_index, next_char)
                         return page
                     end
                 end
@@ -374,11 +387,7 @@ function Paginator:makePage(book, requested_position, style)
                 char_index = content_char_index + window_count
                 model._utf8_hints[paragraph_index] = { char = char_index, byte = next_byte }
                 if remaining_height < geometry.body_line_height then
-                    page.next_position = {
-                        chapter = chapter_index,
-                        paragraph = paragraph_index,
-                        char = char_index,
-                    }
+                    page.next_position = makePosition(book, chapter_index, paragraph_index, char_index)
                     return page
                 end
             else
@@ -396,24 +405,17 @@ function Paginator:makePage(book, requested_position, style)
                 page.used_height = page.used_height + paragraph_gap
                 remaining_height = remaining_height - paragraph_gap
             elseif added_line then
-                page.next_position = {
-                    chapter = chapter_index,
-                    paragraph = paragraph_index,
-                    char = 1,
-                }
+                page.next_position = makePosition(book, chapter_index, paragraph_index, 1)
                 return page
             end
         end
     end
 
     if chapter_index < #book.chapters then
-        page.next_position = { chapter = chapter_index + 1, paragraph = 1, char = 1 }
+        page.next_position = makePosition(book, chapter_index + 1, 1, 1)
     else
-        page.next_position = {
-            chapter = chapter_index,
-            paragraph = #model.paragraphs,
-            char = paragraphLength(model, #model.paragraphs) + 1,
-        }
+        page.next_position = makePosition(book, chapter_index, #model.paragraphs,
+            paragraphLength(model, #model.paragraphs) + 1)
         page.at_end = true
     end
     return page

@@ -1148,8 +1148,8 @@ function BookService:switchContentSource(book, result, progress_callback, option
     candidate.position = {
         chapter = new_index,
         chapter_id = new_chapters[new_index] and new_chapters[new_index].id or nil,
-        paragraph = 1,
-        char = 1,
+        paragraph = math.max(1, tonumber(old_position and old_position.paragraph) or 1),
+        char = math.max(1, tonumber(old_position and old_position.char) or 1),
     }
 
     local target_file_rollback
@@ -1342,6 +1342,7 @@ function BookService:refreshToc(book)
     end
 
     local old_chapters = book.chapters or {}
+    local old_position = Util.positionCopy(book.position)
     local old_position_id = book.position and book.position.chapter_id
     if not old_position_id and book.position and book.chapters and book.chapters[book.position.chapter] then
         old_position_id = book.chapters[book.position.chapter].id
@@ -1443,15 +1444,23 @@ function BookService:prepareReading(book, chapter_index)
     local content, err = self:ensureChapter(book, chapter_index)
     if not content then return nil, err end
     local chapter = book.chapters[chapter_index]
+    local previous = Util.positionCopy(book.position)
+    local same_chapter = previous.chapter == chapter_index
+    -- A legacy progress file may not have chapter_id; the numeric chapter is
+    -- still useful. If both IDs exist, however, a replacement chapter must
+    -- never inherit the old chapter's paragraph/character cursor.
+    if same_chapter and previous.chapter_id ~= nil
+            and tostring(previous.chapter_id) ~= tostring(chapter and chapter.id) then
+        same_chapter = false
+    end
     book.position = {
         chapter = chapter_index,
         chapter_id = chapter and chapter.id or nil,
-        paragraph = 1,
-        char = 1,
+        paragraph = same_chapter and previous.paragraph or 1,
+        char = same_chapter and previous.char or 1,
     }
-    -- Progress is a tiny independent file. Commit it only after the requested
-    -- chapter is safely on disk, so cancelling a failed preview changes nothing.
-    Storage:saveBookProgress(book)
+    -- Entering the reader only prepares memory. The reader persists the
+    -- position once when its page is closed, avoiding flash writes here.
     return book
 end
 
@@ -1513,11 +1522,13 @@ function BookService:markTocUpdateSeen(book)
 end
 
 function BookService:savePosition(book, position, flush)
+    if type(book) ~= "table" then return false, "book is required" end
     book.position = Util.positionCopy(position)
     local chapter = book.chapters and book.chapters[book.position.chapter]
-    book.position.chapter_id = chapter and chapter.id or book.position.chapter_id
+    book.position.chapter_id = chapter and chapter.id or nil
     book.last_read_at = os.time()
-    if flush ~= false then Storage:saveBookProgress(book) end
+    if flush ~= false then return Storage:saveBookProgress(book) end
+    return true
 end
 
 function BookService:bindRuntimeSource(book)
