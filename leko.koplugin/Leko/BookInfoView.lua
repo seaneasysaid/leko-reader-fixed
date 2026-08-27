@@ -421,7 +421,15 @@ function BookInfoView:startReading(chapter_index)
             UIManager:show(InfoMessage:new{ text = "无法启动阅读任务：\n" .. tostring(err or "未知错误") })
             return
         end
-        self._reading_task = task
+        -- Existing-reader handoffs complete synchronously and return `true`
+        -- instead of a cancellable ForegroundBookTask.  Never retain that
+        -- boolean as a task handle: closing this view would otherwise try to
+        -- call `true:cancel()` and abort KOReader with an uncaught Lua error.
+        if type(task) == "table" and type(task.cancel) == "function" then
+            self._reading_task = task
+        else
+            self._reading_task = nil
+        end
     end)
 end
 
@@ -523,9 +531,10 @@ function BookInfoView:showBookSourceSwitcher()
 end
 
 function BookInfoView:cancelBookOperation()
-    if self._reading_task then
-        self._reading_task:cancel("detail-closed")
-        self._reading_task = nil
+    local reading_task = self._reading_task
+    self._reading_task = nil
+    if type(reading_task) == "table" and type(reading_task.cancel) == "function" then
+        reading_task:cancel("detail-closed")
     end
     if self._mutations then self._mutations:cancel("detail-closed") end
 end
