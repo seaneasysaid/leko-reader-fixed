@@ -16,19 +16,38 @@ if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
 
 $versionText = Get-Content -Raw -Encoding UTF8 -LiteralPath $versionFile
 $match = [regex]::Match($versionText, 'version\s*=\s*"([^"]+)"')
-if (-not $match.Success) { throw 'Unable to read plugin version.' }
+if (-not ($match.Success)) { throw 'Unable to read plugin version.' }
 $version = $match.Groups[1].Value
 $mainFile = Join-Path $pluginRoot 'main.lua'
 $mainText = Get-Content -Raw -Encoding UTF8 -LiteralPath $mainFile
 $mainMatch = [regex]::Match($mainText, 'EXPECTED_VERSION\s*=\s*"([^"]+)"')
-if (-not $mainMatch.Success -or $mainMatch.Groups[1].Value -ne $version) {
-    throw 'Version.lua and main.lua do not declare the same release version.'
+if ($mainMatch.Success) {
+    if ($mainMatch.Groups[1].Value -ne $version) {
+        throw 'Version.lua and main.lua do not declare the same release version.'
+    }
+} elseif ($mainText -notmatch 'require\(\s*["'']Leko/Version["'']\s*\)\.version') {
+    throw 'main.lua does not use the canonical Leko/Version release version.'
 }
 $installFile = Join-Path $pluginRoot 'INSTALL.txt'
 $installText = Get-Content -Raw -Encoding UTF8 -LiteralPath $installFile
-$installMatch = [regex]::Match($installText, '(?m)^Leko Reader\s+([^\s]+)\s+安装说明')
-if (-not $installMatch.Success -or $installMatch.Groups[1].Value -ne $version) {
+$installMatch = [regex]::Match($installText, '(?m)^Leko Reader\s+([^\s]+)\s+')
+$installVersion = if ($installMatch.Success) { [string]$installMatch.Groups[1].Value } else { '' }
+if ($installMatch.Success -eq $false -or $installVersion -ne [string]$version) {
     throw 'Version.lua and INSTALL.txt do not declare the same release version.'
+}
+$nativeBridge = Join-Path $pluginRoot 'Leko\native\liblekoqjs.so'
+if (-not (Test-Path -LiteralPath $nativeBridge -PathType Leaf)) {
+    throw "Missing Kindle ARM native bridge: $nativeBridge"
+}
+$nativeBytes = [IO.File]::ReadAllBytes($nativeBridge)
+if ($nativeBytes.Length -lt 52 -or $nativeBytes[0] -ne 0x7f -or $nativeBytes[1] -ne 0x45 -or
+        $nativeBytes[2] -ne 0x4c -or $nativeBytes[3] -ne 0x46 -or $nativeBytes[4] -ne 1 -or $nativeBytes[5] -ne 1) {
+    throw 'Kindle native bridge is not a 32-bit little-endian ELF file.'
+}
+$machine = [BitConverter]::ToUInt16($nativeBytes, 18)
+$flags = [BitConverter]::ToUInt32($nativeBytes, 36)
+if ($machine -ne 40 -or $flags -ne 0x05000200) {
+    throw ('Kindle native bridge ABI mismatch: machine={0}, flags=0x{1:x8}' -f $machine, $flags)
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -66,6 +85,12 @@ try {
     }
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
+        $resolvedStage = [IO.Path]::GetFullPath($tempRoot)
+        $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolvedStage.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($resolvedStage) -notmatch '^leko-public-package-[0-9a-f]{32}$') {
+            throw 'Refusing to remove an unexpected package staging path.'
+        }
         Remove-Item -LiteralPath $tempRoot -Recurse -Force
     }
 }
@@ -95,7 +120,8 @@ try {
         'leko.koplugin/Leko/App.lua',
         'leko.koplugin/Leko/MemoryGuard.lua',
         'leko.koplugin/Leko/ProcessBudget.lua',
-        'leko.koplugin/Leko/Version.lua'
+        'leko.koplugin/Leko/Version.lua',
+        'leko.koplugin/Leko/native/liblekoqjs.so'
     )) {
         $entry = $archive.GetEntry($required)
         if ($null -eq $entry -or $entry.Length -le 0) {

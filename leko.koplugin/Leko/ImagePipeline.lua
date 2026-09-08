@@ -1,4 +1,4 @@
-local mime = require("mime")
+local CryptoCompat = require("Leko/CryptoCompat")
 local RenderImage = require("ui/renderimage")
 local ImageInfo = require("Leko/ImageInfo")
 local Util = require("Leko/Util")
@@ -59,7 +59,7 @@ end
 function ImagePipeline:decodeDataUri(value)
     local media_type, encoded = tostring(value or ""):match("^data:(image/[%w%+%.%-]+);base64,(.+)$")
     if not media_type then return nil end
-    local ok, body = pcall(mime.unb64, encoded)
+    local ok, body = pcall(CryptoCompat.base64Decode, encoded)
     if not ok or not body then return nil, "封面 data URI 解码失败" end
     return { body = body, content_type = media_type, url = "data:" }
 end
@@ -86,13 +86,13 @@ function ImagePipeline:prepare(body, content_type, options)
 
     local data_media, data_encoded = body:match("^%s*data:(image/[%w%+%.%-]+);base64,(.+)$")
     if data_media and data_encoded then
-        local ok, decoded = pcall(mime.unb64, data_encoded)
+        local ok, decoded = pcall(CryptoCompat.base64Decode, data_encoded)
         if ok and decoded then addCandidate(candidates, seen, decoded, "解码 data URI") end
     end
     if #body >= 32 and #body <= 3 * 1024 * 1024 and body:match("^[A-Za-z0-9+/=\r\n%s]+$") then
         local compact = body:gsub("%s+", "")
         if #compact % 4 == 0 then
-            local ok, decoded = pcall(mime.unb64, compact)
+            local ok, decoded = pcall(CryptoCompat.base64Decode, compact)
             if ok and decoded then addCandidate(candidates, seen, decoded, "解码 Base64 响应") end
         end
     end

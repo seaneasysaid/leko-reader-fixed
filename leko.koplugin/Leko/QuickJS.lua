@@ -8,6 +8,7 @@
 
 local rapidjson = require("rapidjson")
 local ChineseConvert = require("Leko/ChineseConvert")
+local Charset = require("Leko/Charset")
 local ExecutionTrace = require("Leko/ExecutionTrace")
 local JavaHostCompat = require("Leko/JavaHostCompat")
 local unpack = table.unpack or unpack
@@ -107,6 +108,49 @@ end
 
 local function trim(value)
     return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+-- loginUrl/jsLib may define helpers once and rule snippets use them later in
+-- the same Realm. Promote top-level let/const only for that opt-in path;
+-- nested declarations retain ordinary JavaScript scope.
+local function promoteTopLevelLexicals(script)
+    script = tostring(script or "")
+    local output, index, braces, parens, brackets = {}, 1, 0, 0, 0
+    local quote, escaped, line_comment, block_comment = nil, false, false, false
+    local function identifier(byte)
+        return byte and ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90)
+            or (byte >= 97 and byte <= 122) or byte == 95 or byte == 36)
+    end
+    while index <= #script do
+        local char, next_byte = script:sub(index, index), script:byte(index + 1)
+        if line_comment then
+            output[#output + 1] = char; if char == "\n" then line_comment = false end; index = index + 1
+        elseif block_comment then
+            output[#output + 1] = char
+            if char == "*" and next_byte == 47 then output[#output + 1] = "/"; index = index + 2; block_comment = false
+            else index = index + 1 end
+        elseif quote then
+            output[#output + 1] = char
+            if escaped then escaped = false elseif char == "\\" then escaped = true elseif char == quote then quote = nil end
+            index = index + 1
+        elseif char == "/" and next_byte == 47 then output[#output + 1] = "//"; index = index + 2; line_comment = true
+        elseif char == "/" and next_byte == 42 then output[#output + 1] = "/*"; index = index + 2; block_comment = true
+        elseif char == "'" or char == '"' or char == "`" then output[#output + 1] = char; quote = char; escaped = false; index = index + 1
+        elseif braces == 0 and parens == 0 and brackets == 0 and (char == "l" or char == "c") then
+            local keyword = char == "l" and "let" or "const"
+            local ending = index + #keyword - 1
+            if script:sub(index, ending) == keyword and not identifier(script:byte(index - 1))
+                    and not identifier(script:byte(ending + 1)) then output[#output + 1] = "var"; index = ending + 1
+            else output[#output + 1] = char; index = index + 1 end
+        else
+            output[#output + 1] = char
+            if char == "{" then braces = braces + 1 elseif char == "}" and braces > 0 then braces = braces - 1
+            elseif char == "(" then parens = parens + 1 elseif char == ")" and parens > 0 then parens = parens - 1
+            elseif char == "[" then brackets = brackets + 1 elseif char == "]" and brackets > 0 then brackets = brackets - 1 end
+            index = index + 1
+        end
+    end
+    return table.concat(output)
 end
 
 -- JsExtensions.toNumChapter uses the reference title-number pattern and
@@ -263,6 +307,49 @@ local function readFile(path)
     return value
 end
 
+-- The native bridge parses the environment envelope as UTF-8 JSON. Runtime
+-- state may contain an isolated legacy-encoded byte; replace only invalid
+-- sequences at this unavoidable text boundary so one value cannot prevent a
+-- fresh jsLib Realm from starting.
+local function sanitizeUtf8(value)
+    value = tostring(value or "")
+    local output, index, changed = {}, 1, false
+    local replacement = string.char(0xEF, 0xBF, 0xBD)
+    while index <= #value do
+        local first = value:byte(index)
+        local length = 1
+        if first < 0x80 then
+            length = 1
+        elseif first >= 0xC2 and first <= 0xDF then
+            local b2 = value:byte(index + 1)
+            length = b2 and b2 >= 0x80 and b2 <= 0xBF and 2 or 0
+        elseif first >= 0xE0 and first <= 0xEF then
+            local b2, b3 = value:byte(index + 1), value:byte(index + 2)
+            local second_ok = b2 and b2 >= 0x80 and b2 <= 0xBF
+                and (first ~= 0xE0 or b2 >= 0xA0)
+                and (first ~= 0xED or b2 <= 0x9F)
+            length = second_ok and b3 and b3 >= 0x80 and b3 <= 0xBF and 3 or 0
+        elseif first >= 0xF0 and first <= 0xF4 then
+            local b2, b3, b4 = value:byte(index + 1), value:byte(index + 2), value:byte(index + 3)
+            local second_ok = b2 and b2 >= 0x80 and b2 <= 0xBF
+                and (first ~= 0xF0 or b2 >= 0x90)
+                and (first ~= 0xF4 or b2 <= 0x8F)
+            length = second_ok and b3 and b3 >= 0x80 and b3 <= 0xBF
+                and b4 and b4 >= 0x80 and b4 <= 0xBF and 4 or 0
+        else
+            length = 0
+        end
+        if length > 0 then
+            output[#output + 1] = value:sub(index, index + length - 1)
+            index = index + length
+        else
+            output[#output + 1] = replacement
+            index, changed = index + 1, true
+        end
+    end
+    return changed and table.concat(output) or value
+end
+
 local function writeFile(path, value)
     local file = io.open(path, "wb")
     if not file then return nil, "cannot open temporary file" end
@@ -280,6 +367,7 @@ local function tempPath(suffix)
 end
 
 local function jsonEncode(value)
+    if type(value) == "string" then value = sanitizeUtf8(value) end
     local ok, encoded = pcall(rapidjson.encode, value)
     return ok and encoded or nil, ok and nil or tostring(encoded)
 end
@@ -295,6 +383,18 @@ end
 
 local function isByteArray(value)
     return type(value) == "table" and rawget(value, "__leko_byte_array") ~= nil
+end
+
+local function isSelectorList(value)
+    return type(value) == "table" and rawget(value, "__leko_selector_list") ~= nil
+end
+
+local function isJavaStringList(value)
+    return type(value) == "table" and rawget(value, "__leko_java_string_list") ~= nil
+end
+
+local function isJavaList(value)
+    return type(value) == "table" and rawget(value, "__leko_java_list") ~= nil
 end
 
 local function isResponseProxy(value)
@@ -333,13 +433,14 @@ function Session:_encode(value, seen, depth)
     if depth > 48 then return { __leko_kind = "undefined" } end
     if value == nil then return { __leko_kind = "undefined" } end
     local value_type = type(value)
-    if value_type == "boolean" or value_type == "string" then return value end
+    if value_type == "boolean" then return value end
+    if value_type == "string" then return sanitizeUtf8(value) end
     if value_type == "number" then
         return isFiniteNumber(value) and value or { __leko_kind = "undefined" }
     end
     if value_type == "cdata" and ffi_ok then
         local ok, text = pcall(ffi.string, value)
-        if ok and text then return text end
+        if ok and text then return sanitizeUtf8(text) end
         return { __leko_kind = "undefined" }
     end
     if value_type == "function" or value_type == "thread" or value_type == "userdata" then
@@ -360,11 +461,43 @@ function Session:_encode(value, seen, depth)
         }
     end
     if isByteArray(value) then
-        local bytes = {}
-        for index, item in ipairs(rawget(value, "__leko_byte_array") or {}) do
-            bytes[index] = tonumber(item) and (tonumber(item) % 256) or 0
+        local binary = rawget(value, "__leko_byte_array") or ""
+        if type(binary) ~= "string" then
+            local bytes = {}
+            for index, item in ipairs(binary) do
+                bytes[index] = string.char((tonumber(item) or 0) % 256)
+            end
+            binary = table.concat(bytes)
         end
-        return { __leko_kind = "byte_array", value = bytes }
+        -- Keep native-decoded bytes in Lua. Java byte arrays are already
+        -- represented by opaque session handles, so sending the same payload
+        -- back through Base64/JSON would only decode and re-encode it again.
+        local handle = { kind = "java_byte_array", bytes = binary }
+        return {
+            __leko_kind = "java_byte_array",
+            id = self:_register(handle, "java_byte_array"),
+        }
+    end
+    if isSelectorList(value) then
+        local encoded = {}
+        for index, item in ipairs(rawget(value, "__leko_selector_list") or {}) do
+            encoded[index] = self:_encode(item, seen, depth + 1)
+        end
+        return { __leko_kind = "selector_list", value = encoded }
+    end
+    if isJavaStringList(value) then
+        local encoded = {}
+        for index, item in ipairs(rawget(value, "__leko_java_string_list") or {}) do
+            encoded[index] = self:_encode(item, seen, depth + 1)
+        end
+        return { __leko_kind = "java_string_list", value = encoded }
+    end
+    if isJavaList(value) then
+        local encoded = {}
+        for index, item in ipairs(rawget(value, "__leko_java_list") or {}) do
+            encoded[index] = self:_encode(item, seen, depth + 1)
+        end
+        return { __leko_kind = "java_list", value = encoded }
     end
     if isResponseProxy(value) then
         return { __leko_kind = "response", id = self:_register(value, "response") }
@@ -389,7 +522,7 @@ function Session:_encode(value, seen, depth)
             if (type(key) == "string" or type(key) == "number")
                     and tostring(key):sub(1, 2) ~= "__"
                     and type(item) ~= "function" then
-                result[tostring(key)] = self:_encode(item, seen, depth + 1)
+                result[sanitizeUtf8(key)] = self:_encode(item, seen, depth + 1)
             end
         end
     end
@@ -407,11 +540,12 @@ function Session:_decode(value, depth)
     if kind == "java_ref" then
         return { kind = tostring(value.ref_kind or ""), name = tostring(value.name or "") }
     end
-    if kind == "dom" or kind == "dom_list" or kind == "response" then
+    if kind == "dom" or kind == "dom_list" or kind == "response"
+            or kind == "response_headers" or kind == "response_request" then
         local item = self.handles[tonumber(value.id)]
         return item and item.value or nil
     end
-    if kind == "java_object" or kind == "java_byte_array" then
+    if kind == "java_object" or kind == "java_byte_array" or kind == "java_map" then
         local item = self.handles[tonumber(value.id)]
         return item and item.value or nil
     end
@@ -419,6 +553,10 @@ function Session:_decode(value, depth)
         local bytes = {}
         for index, item in ipairs(value.value or {}) do bytes[index] = tonumber(item) or 0 end
         return bytes
+    end
+    if kind == "js_byte_array_b64" then
+        local Crypto = require("Leko/CryptoCompat")
+        return { kind = "java_byte_array", bytes = Crypto.base64Decode(value.value or "") }
     end
     local result = {}
     for key, item in pairs(value) do result[key] = self:_decode(item, depth + 1) end
@@ -458,21 +596,78 @@ local function makeHostError(message)
     error("HOST_API_UNSUPPORTED: host-unsupported: " .. tostring(message or "unsupported host operation"))
 end
 
+local function stableDeviceId(env, Digest)
+    local cached = tostring(rawget(env or {}, "__leko_device_id") or "")
+    if cached ~= "" then return cached end
+    local ok_storage, Storage = pcall(require, "Leko/Storage")
+    if ok_storage and type(Storage) == "table" and type(Storage.getInstallDeviceId) == "function" then
+        local ok_value, value = pcall(Storage.getInstallDeviceId, Storage)
+        if ok_value and tostring(value or "") ~= "" then
+            rawset(env, "__leko_device_id", tostring(value))
+            return tostring(value)
+        end
+    end
+    local source = type(env) == "table" and rawget(env, "source") or nil
+    local target = type(source) == "table" and (rawget(source, "__target") or source) or nil
+    local identity = type(target) == "table" and (rawget(target, "source_key")
+        or rawget(target, "id") or rawget(target, "base_url")) or "Leko"
+    local value = Digest:md5(tostring(identity or "Leko")):sub(1, 16)
+    if type(env) == "table" then rawset(env, "__leko_device_id", value) end
+    return value
+end
+
 function Session:_wrapJavaValue(value)
+    if isResponseProxy(value) then return self:_makeHandle(value, "response") end
+    if isDomValue(value) then
+        return self:_makeHandle(value, rawget(value, "__values") ~= nil and "dom_list" or "dom")
+    end
     if type(value) ~= "table" or rawget(value, "kind") == nil then return value end
     local kind = rawget(value, "kind")
     if kind == "java_byte_array" then return self:_makeHandle(value, "java_byte_array") end
+    if kind == "JavaMap" then return self:_makeHandle(value, "java_map") end
+    if kind == "response" or kind == "dom" or kind == "dom_list" then return self:_makeHandle(value, kind) end
     return self:_makeHandle(value, "java_object")
 end
 
 function Session:_javaObjectMethod(id, name, args)
     local entry = self.handles[tonumber(id)]
-    if not entry or (entry.kind ~= "java_object" and entry.kind ~= "java_byte_array") then
+    if not entry or (entry.kind ~= "java_object" and entry.kind ~= "java_byte_array"
+            and entry.kind ~= "java_map") then
         makeHostError("released Java object handle")
     end
     if entry.kind == "java_byte_array" then
         if name == "property" then return JavaHostCompat:handleProperty(entry.value, args[1]) end
         return JavaHostCompat:method(entry.value, name, args)
+    end
+    if entry.kind == "java_object" and entry.value.kind == "OkHttpCall" and name == "execute" then
+        local request = entry.value.request or {}
+        local java = self.env and self.env.java or {}
+        local connect = type(java) == "table" and java.connect or nil
+        if type(connect) ~= "function" then makeHostError("okhttp3 transport is unavailable") end
+        local body = request.body
+        if type(body) == "table" and body.kind == "OkHttpRequestBody" then body = body.body end
+        local ok, response = pcall(connect, java, {
+            url = request.url or "", method = request.method or "GET", body = body or "", headers = request.headers or {},
+        })
+        if not ok then error(response) end
+        return self:_wrapJavaValue(response)
+    end
+    if entry.kind == "java_object" and entry.value.kind == "JsoupConnection"
+            and (name == "execute" or name == "get" or name == "post") then
+        local request = entry.value
+        local java = self.env and self.env.java or {}
+        local connect = type(java) == "table" and java.connect or nil
+        if type(connect) ~= "function" then makeHostError("org.jsoup transport is unavailable") end
+        local method = name == "post" and "POST" or (request.method or "GET")
+        local ok, response = pcall(connect, java, {
+            url = request.url or "", method = method, body = request.body or "", headers = request.headers or {},
+        })
+        if not ok then error(response) end
+        if name == "execute" then return self:_wrapJavaValue(response) end
+        local parser = type(self.env.jsoupParse) == "function" and self.env.jsoupParse
+        if type(parser) ~= "function" then makeHostError("org.jsoup parser is unavailable") end
+        local body = type(response) == "table" and type(response.body) == "function" and response.body() or ""
+        return self:_wrapJavaValue(parser(body))
     end
     return self:_wrapJavaValue(JavaHostCompat:method(entry.value, name, args))
 end
@@ -492,6 +687,12 @@ function Session:_javaMethod(name, args)
     elseif name == "construct" then
         return self:_wrapJavaValue(JavaHostCompat:construct(args[1], { unpack(args, 2) }))
     elseif name == "static" then
+        if args[1] == "org.jsoup.Jsoup" and args[2] == "parse" then
+            local parser = type(env.jsoupParse) == "function" and env.jsoupParse
+                or (type(env.parseHtml) == "function" and env.parseHtml)
+            if type(parser) ~= "function" then makeHostError("org.jsoup.Jsoup.parse requires HTML parser") end
+            return self:_wrapJavaValue(parser(args[3] or "", args[4], args[5]))
+        end
         return self:_wrapJavaValue(JavaHostCompat:static(args[1], args[2], { unpack(args, 3) }))
     end
     local fn = methodFromTable(java, name)
@@ -502,7 +703,11 @@ function Session:_javaMethod(name, args)
             if fn then return fn(unpack(args or {})) end
         elseif name == "getStringList" then
             fn = sourceMethodAlias(env, name)
-            if fn then return fn(unpack(args or {})) end
+            if fn then
+                local values = fn(unpack(args or {}))
+                if type(values) == "table" then return { __leko_java_string_list = values } end
+                return values
+            end
         elseif name == "getElement" then
             local values = type(env.getElements) == "function" and env.getElements(unpack(args or {})) or {}
             -- Legado's AnalyzeRule.getElement returns a Jsoup Elements-like
@@ -535,8 +740,7 @@ function Session:_javaMethod(name, args)
         if name == "base64Decode" and crypto_ok then return Crypto.base64Decode(args[1]) end
         if name == "base64DecodeToByteArray" and crypto_ok then
             local decoded = Crypto.base64Decode(args[1])
-            local bytes = { decoded:byte(1, #decoded) }
-            return { __leko_byte_array = bytes }
+            return { __leko_byte_array = decoded }
         end
         if name == "createSymmetricCrypto" and crypto_ok then
             local ok_crypto, crypto = pcall(function()
@@ -551,6 +755,9 @@ function Session:_javaMethod(name, args)
         if name == "hexDecodeToString" and crypto_ok then return Crypto.unhex(args[1]) end
         if name == "bytesToStr" then
             local bytes, output = args[1], {}
+            if type(bytes) == "table" and rawget(bytes, "kind") == "java_byte_array" then
+                return tostring(rawget(bytes, "bytes") or "")
+            end
             if type(bytes) ~= "table" then return tostring(bytes or "") end
             for index, byte in ipairs(bytes) do output[index] = string.char((tonumber(byte) or 0) % 256) end
             return table.concat(output)
@@ -565,7 +772,15 @@ function Session:_javaMethod(name, args)
         if name == "desEncodeToBase64String" and crypto_ok then
             return Crypto:desEncodeToBase64String(args[1], args[2], args[3], args[4])
         end
-        if (name == "urlEncode" or name == "encodeURI") and koreader_ok then return koreader_util.urlEncode(tostring(args[1] or "")) end
+        if (name == "urlEncode" or name == "encodeURI") and koreader_ok then
+            local value = tostring(args[1] or "")
+            local requested_charset = tostring(args[2] or "")
+            if requested_charset ~= "" then
+                local encoded = Charset:encode(value, requested_charset)
+                if encoded ~= nil then value = encoded end
+            end
+            return koreader_util.urlEncode(value)
+        end
         if name == "urlDecode" and koreader_ok then return koreader_util.urlDecode(tostring(args[1] or "")) end
         if name == "getCookie" and env.cookie and type(env.cookie.getCookie) == "function" then
             return env.cookie:getCookie(args[1] or env.baseUrl)
@@ -574,7 +789,9 @@ function Session:_javaMethod(name, args)
         if name == "getWebViewUA" or name == "getUserAgent" then
             return "Mozilla/5.0 (Linux; Kindle) AppleWebKit/537.36 Mobile Safari/537.36"
         end
-        if name == "androidId" and ok then return Digest:md5(tostring(env.baseUrl or "Leko")):sub(1, 16) end
+        if (name == "androidId" or name == "deviceID") and ok then
+            return stableDeviceId(env, Digest)
+        end
         if name == "timeFormat" or name == "timeFormatUTC" then
             local timestamp = tonumber(args[1]) or 0
             if timestamp > 100000000000 then timestamp = timestamp / 1000 end
@@ -634,6 +851,52 @@ function Session:_domMethod(kind, id, name, args)
     if not entry then makeHostError("released " .. tostring(kind) .. " handle") end
     local value = entry.value
     if name == "release" then self.handles[tonumber(id)] = nil; return nil end
+    if kind == "response_headers" then
+        local headers = type(value) == "table" and value or {}
+        if name == "get" then
+            local wanted = tostring(args[1] or ""):lower()
+            for key, item in pairs(headers) do
+                if tostring(key):lower() == wanted then return item end
+            end
+            return nil
+        end
+        if name == "names" or name == "keySet" then
+            local names = {}
+            for key in pairs(headers) do
+                if tostring(key):sub(1, 2) ~= "__" then names[#names + 1] = tostring(key) end
+            end
+            table.sort(names)
+            return names
+        end
+        if name == "isEmpty" then return next(headers) == nil end
+        if name == "toString" then
+            local rows = {}
+            for key, item in pairs(headers) do
+                if tostring(key):sub(1, 2) ~= "__" then rows[#rows + 1] = tostring(key) .. ": " .. tostring(item) end
+            end
+            table.sort(rows)
+            return table.concat(rows, "\n")
+        end
+    elseif kind == "response_request" then
+        local target = type(value) == "table" and (value.url or value.request_url) or value
+        if type(target) == "function" then
+            local ok, result = pcall(target, value)
+            target = ok and result or ""
+        end
+        if name == "url" then return tostring(target or "") end
+        if name == "toString" then return tostring(target or "") end
+    elseif kind == "response" and (name == "headers" or name == "request") then
+        local fn = type(value) == "table" and rawget(value, name) or nil
+        local result = type(fn) == "function" and fn(value, unpack(args or {})) or nil
+        if name == "headers" and args[1] ~= nil then return result or {} end
+        return self:_makeHandle(result or {}, name == "headers" and "response_headers" or "response_request")
+    end
+    if kind == "response" and name == "toArray" then
+        local body = type(value) == "table" and type(rawget(value, "body")) == "function"
+            and value.body(value) or ""
+        local ok, decoded = pcall(rapidjson.decode, tostring(body or ""))
+        return ok and type(decoded) == "table" and decoded or {}
+    end
     local function removeNode(node)
         if type(node) ~= "table" then return false end
         local remove = rawget(node, "remove")
@@ -653,6 +916,7 @@ function Session:_domMethod(kind, id, name, args)
     local function nodeValue(node, method, method_args)
         if type(node) ~= "table" then return nil end
         local fn = rawget(node, method)
+        if method == "attr" and type(fn) ~= "function" then fn = rawget(node, "getattribute") end
         if type(fn) == "function" then return fn(node, unpack(method_args or {})) end
         if method == "text" then
             local content = rawget(node, "getcontent")
@@ -674,6 +938,12 @@ function Session:_domMethod(kind, id, name, args)
         local values = rawget(value, "__values") or {}
         if name == "values" then return values end
         if name == "size" then return #values end
+        if name == "toArray" then
+            local output = {}
+            for index, node in ipairs(values) do output[index] = node end
+            return output
+        end
+        if name == "isEmpty" then return #values == 0 end
         if name == "get" then return values[(tonumber(args[1]) or 0) + 1] end
         if name == "first" then return values[1] end
         if name == "last" then return values[#values] end
@@ -722,6 +992,8 @@ function Session:_domMethod(kind, id, name, args)
                 return matches
             end
         end
+        if name == "attr" then return nodeValue(value, "attr", args) or "" end
+        if name == "hasAttr" then return nodeValue(value, "attr", args) ~= nil end
         if name == "text" or name == "html" or name == "outerHtml" then return nodeValue(value, name, args) or "" end
         if name == "selectFirst" then
             local matches = nodeValue(value, "select", args)
@@ -769,13 +1041,17 @@ function Session:hostCall(method, args)
             or method:sub(1, 6) == "cache." then
         local dot = method:find(".", 1, true)
         local kind, name = method:sub(1, dot - 1), method:sub(dot + 1)
-        return self:_stateMethod(kind, name, args)
+        return self:_wrapJavaValue(self:_stateMethod(kind, name, args))
     elseif method:sub(1, 4) == "dom." then
         return self:_domMethod("dom", args[1], method:sub(5), { unpack(args, 2) })
     elseif method:sub(1, 9) == "dom_list." then
         return self:_domMethod("dom_list", args[1], method:sub(10), { unpack(args, 2) })
     elseif method:sub(1, 9) == "response." then
         return self:_domMethod("response", args[1], method:sub(10), { unpack(args, 2) })
+    elseif method:sub(1, 17) == "response_headers." then
+        return self:_domMethod("response_headers", args[1], method:sub(18), { unpack(args, 2) })
+    elseif method:sub(1, 17) == "response_request." then
+        return self:_domMethod("response_request", args[1], method:sub(18), { unpack(args, 2) })
     elseif method:sub(1, 7) == "crypto." then
         return self:_domMethod("crypto", args[1], method:sub(8), { unpack(args, 2) })
     elseif method:sub(1, 12) == "java_object." then
@@ -840,16 +1116,50 @@ local HOST_BOOTSTRAP = [[
   const callNative = globalThis.__lekoHostCall;
   const call = function () {
     if (typeof callNative !== "function") throw new Error("host-unsupported: QuickJS host callback is unavailable");
-    return revive(callNative.apply(null, arguments));
+    const hadResult = Object.prototype.hasOwnProperty.call(globalThis, "result");
+    const savedResult = globalThis.result;
+    let response;
+    try {
+      const nativeArgs = Array.of(arguments[0]);
+      for (let index = 1; index < arguments.length; index += 1) {
+        nativeArgs.push(wire(arguments[index]));
+      }
+      response = callNative.apply(null, nativeArgs);
+    } finally {
+      if (hadResult) globalThis.result = savedResult;
+      else delete globalThis.result;
+    }
+    return revive(response);
   };
+  const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function encodeBase64Bytes(value) {
+    let output = "";
+    for (let index = 0; index < value.length; index += 3) {
+      const a = Number(value[index]) & 255;
+      const hasB = index + 1 < value.length;
+      const hasC = index + 2 < value.length;
+      const b = hasB ? Number(value[index + 1]) & 255 : 0;
+      const c = hasC ? Number(value[index + 2]) & 255 : 0;
+      const packed = (a << 16) | (b << 8) | c;
+      output += base64Alphabet.charAt((packed >>> 18) & 63)
+        + base64Alphabet.charAt((packed >>> 12) & 63)
+        + (hasB ? base64Alphabet.charAt((packed >>> 6) & 63) : "=")
+        + (hasC ? base64Alphabet.charAt(packed & 63) : "=");
+    }
+    return output;
+  }
   function revive(value) {
     if (value === null || value === undefined) return value;
     if (Array.isArray(value)) return value.map(revive);
     if (typeof value !== "object") return value;
     if (value.__leko_kind === "undefined") return undefined;
+    if (value.__leko_kind === "selector_list") return makeSelectorList(value.value || []);
+    if (value.__leko_kind === "java_string_list") return makeJavaStringList(value.value || []);
+    if (value.__leko_kind === "java_list") return makeJavaList(value.value || []);
     if (value.__leko_kind === "dom" || value.__leko_kind === "dom_list" || value.__leko_kind === "response"
+        || value.__leko_kind === "response_headers" || value.__leko_kind === "response_request"
         || value.__leko_kind === "crypto" || value.__leko_kind === "java_object"
-        || value.__leko_kind === "java_byte_array")
+        || value.__leko_kind === "java_byte_array" || value.__leko_kind === "java_map")
       return makeHandle(value.__leko_kind, value.id);
     if (value.__leko_kind === "java_ref") {
       if (value.ref_kind === "package") return makeJavaPackage(value.name);
@@ -869,7 +1179,16 @@ local HOST_BOOTSTRAP = [[
         if (property === "__leko_kind") return kind;
         if (property === "__leko_id") return id;
         if (property === "toJSON") return function () { return { __leko_kind: kind, id: id }; };
-        if (property === Symbol.toPrimitive) return function () { return call(kind + ".toString", id); };
+        if (property === Symbol.toPrimitive) return function () {
+          return call(kind === "java_map" ? "java_object.toString" : kind + ".toString", id);
+        };
+        if (kind === "java_map") {
+          if (property === "then") return undefined;
+          if (property === "get" || property === "containsKey" || property === "isEmpty"
+              || property === "toString")
+            return function () { return call("java_object." + String(property), id, ...arguments); };
+          if (typeof property === "string") return call("java_object.get", id, property);
+        }
         if (kind === "java_byte_array" && property === "length") return call("java_object.property", id, "length");
         if (kind === "java_byte_array" && typeof property === "string" && /^\d+$/.test(property))
           return call("java_object.property", id, property);
@@ -879,6 +1198,12 @@ local HOST_BOOTSTRAP = [[
             for (let i = 0; i < length; i++) yield call("java_object.property", id, String(i));
           };
         if (kind === "dom_list" && property === "length") return call("dom_list.size", id);
+        if (kind === "dom_list" && typeof property === "string" && /^\d+$/.test(property))
+          return call("dom_list.get", id, Number(property));
+        if (kind === "dom_list" && property === "toArray")
+          return function () { return call("dom_list.toArray", id) || []; };
+        if (kind === "dom_list" && property === "isEmpty")
+          return function () { return call("dom_list.isEmpty", id); };
         if (kind === "dom_list" && property === "forEach") return function (callback) {
           const values = call("dom_list.values", id) || [];
           values.forEach(function (item, index) { callback(item, index, values); });
@@ -887,11 +1212,37 @@ local HOST_BOOTSTRAP = [[
           const values = call("dom_list.values", id) || [];
           return values.map(function (item, index) { return callback(item, index, values); });
         };
+        if (kind === "dom_list" && typeof property !== "string")
+          return function* () {
+            const length = call("dom_list.size", id) || 0;
+            for (let i = 0; i < length; i++) yield call("dom_list.get", id, i);
+          };
         if (property === "then") return undefined;
         return function () { return call(kind + "." + String(property), id, ...arguments); };
       },
       set: function () { throw new Error("host-unsupported: DOM handles are immutable from JavaScript"); }
     });
+  }
+  function makeSelectorList(values) {
+    const array = Array.isArray(values) ? values.map(revive) : [];
+    Object.defineProperty(array, "toArray", {
+      value: function () { return array.slice(); }, enumerable: false
+    });
+    return array;
+  }
+  function makeJavaStringList(values) {
+    const array = Array.isArray(values) ? values.map(revive) : [];
+    Object.defineProperty(array, "toArray", {
+      value: function () { return array.slice(); }, enumerable: false
+    });
+    return array;
+  }
+  function makeJavaList(values) {
+    const array = Array.isArray(values) ? values.map(revive) : [];
+    Object.defineProperty(array, "toArray", {
+      value: function () { return array.slice(); }, enumerable: false
+    });
+    return array;
   }
   const sourceMethods = new Set(["getLoginHeader","putLoginHeader","removeLoginHeader","put","get",
     "putLoginInfo","getLoginInfoMap","getLoginInfo","getKey","refreshExplore","refreshJSLib",
@@ -900,8 +1251,23 @@ local HOST_BOOTSTRAP = [[
   const bookMethods = new Set(["getVariable","setVariable","putVariable","putCustomVariable",
     "setReverseToc","setUseReplaceRule"]);
   const chapterMethods = new Set(["getVariable","setVariable","putVariable","putCustomVariable","isVip","isPay"]);
-  function makeState(kind, initial) {
+  function makeState(kind, initial, deferred) {
     const target = Object.assign({}, initial || {});
+    // Book/source objects can contain a complete local TOC, saved profiles or
+    // a large rule library. They are host properties, not per-rule input.
+    // Accessors preserve normal reads, enumeration and explicit JSON export
+    // without eagerly copying those values for every chapter evaluation.
+    for (const key of (Array.isArray(deferred) ? deferred : [])) {
+      Object.defineProperty(target, String(key), {
+        configurable: true, enumerable: true,
+        get: function () { return call("state.get", kind, String(key)); },
+        set: function (value) {
+          Object.defineProperty(target, String(key), {
+            configurable: true, enumerable: true, writable: true, value: value
+          });
+        }
+      });
+    }
     const changed = Object.create(null);
     Object.defineProperty(target, "__lekoChanged", { value: changed, enumerable: false });
     const methods = kind === "source" ? sourceMethods : (kind === "book" ? bookMethods : chapterMethods);
@@ -939,9 +1305,10 @@ local HOST_BOOTSTRAP = [[
       return function () { return call(kind + "." + String(property), ...arguments); };
     }});
   }
-  globalThis.source = makeState("source", revive(input.source));
-  globalThis.book = input.book == null ? undefined : makeState("book", revive(input.book));
-  globalThis.chapter = input.chapter == null ? undefined : makeState("chapter", revive(input.chapter));
+  const stateFields = input.__lekoStateFields || {};
+  globalThis.source = makeState("source", revive(input.source), stateFields.source);
+  globalThis.book = input.book == null ? undefined : makeState("book", revive(input.book), stateFields.book);
+  globalThis.chapter = input.chapter == null ? undefined : makeState("chapter", revive(input.chapter), stateFields.chapter);
   globalThis.cookie = makeService("cookie");
   globalThis.cache = makeService("cache");
   globalThis.java = new Proxy({}, { get: function (object, property) {
@@ -976,14 +1343,15 @@ local HOST_BOOTSTRAP = [[
     globalThis[name] = incoming;
   }
   for (const name of Object.keys(input)) {
-    if (name === "source" || name === "book" || name === "chapter" || name === "result" || name === "currentResponse"
-        || name === "__lekoFunctions" || name === "__lekoSession") continue;
+    if (name === "source" || name === "book" || name === "chapter" || name === "result" || name === "src" || name === "currentResponse"
+        || name === "__src_is_result" || name === "__lekoFunctions" || name === "__lekoSession") continue;
     if (name === "java" || name === "cookie" || name === "cache") continue;
     // Refresh primitive bindings on every evaluation, but retain ordinary
     // object mutations made by scripts in this reused session.
     installBinding(name, revive(input[name]));
   }
   globalThis.result = revive(input.result);
+  globalThis.src = input.__src_is_result ? globalThis.result : revive(input.src);
   globalThis.currentResponse = revive(input.currentResponse);
   globalThis.context = revive(input.context);
   globalThis.window = globalThis;
@@ -1017,6 +1385,13 @@ local HOST_BOOTSTRAP = [[
         if (property === "__leko_name") return object.__leko_name;
         if (property === "toJSON" || property === "then") return undefined;
         if (typeof property === "symbol") return undefined;
+        if (object.__leko_name === "okhttp3.Request" && String(property) === "Builder")
+          return makeJavaClass("okhttp3.Request.Builder");
+        if (object.__leko_name === "org.jsoup.Connection" && String(property) === "Method")
+          return makeJavaClass("org.jsoup.Connection.Method");
+        if (object.__leko_name === "org.jsoup.Connection.Method"
+            && ["GET", "POST", "PUT", "DELETE", "HEAD"].indexOf(String(property)) >= 0)
+          return String(property);
         return function () { return call("java.static", object.__leko_name, String(property), ...arguments); };
       },
       apply: function (object, thisArg, args) {
@@ -1058,6 +1433,7 @@ local HOST_BOOTSTRAP = [[
   }
   globalThis.JavaImporter = JavaImporter;
   globalThis.Packages = makeJavaPackage("");
+  globalThis.org = makeJavaPackage("org");
   if (typeof globalThis.Java === "undefined") globalThis.Java = { type: function (name) {
     return call("java.resolve", String(name));
   }};
@@ -1065,13 +1441,20 @@ local HOST_BOOTSTRAP = [[
   // undefined identifier would otherwise surface as a misleading generic
   // ReferenceError/TypeError, while the compatibility classifier already
   // knows these names are outside the KOReader host boundary.
-  for (const name of ["SecretKeySpec", "IvParameterSpec",
-      "PKCS8EncodedKeySpec", "ByteArrayInputStream", "ByteArrayOutputStream",
+  for (const name of ["ByteArrayInputStream", "ByteArrayOutputStream",
       "GZIPInputStream", "OkHttpClient", "LinkedHashMap", "Request"]) {
     if (typeof globalThis[name] === "undefined") globalThis[name] = function () {
       throw new Error("host-unsupported: constructor " + name + " is not mapped");
     };
   }
+  globalThis.SecretKeySpec = makeJavaClass("javax.crypto.spec.SecretKeySpec");
+  globalThis.IvParameterSpec = makeJavaClass("javax.crypto.spec.IvParameterSpec");
+  globalThis.PKCS8EncodedKeySpec = makeJavaClass("java.security.spec.PKCS8EncodedKeySpec");
+  globalThis.X509EncodedKeySpec = makeJavaClass("java.security.spec.X509EncodedKeySpec");
+  globalThis.RSAPublicKeySpec = makeJavaClass("java.security.spec.RSAPublicKeySpec");
+  globalThis.BigInteger = makeJavaClass("java.math.BigInteger");
+  globalThis.Cipher = makeJavaClass("javax.crypto.Cipher");
+  globalThis.Mac = makeJavaClass("javax.crypto.Mac");
   function wire(value, seen) {
     if (value === null) return { __leko_kind: "null" };
     if (value === undefined) return { __leko_kind: "undefined" };
@@ -1083,7 +1466,7 @@ local HOST_BOOTSTRAP = [[
     if (typeof value !== "object") return value;
     if (value.__leko_kind) return { __leko_kind: value.__leko_kind, id: value.__leko_id };
     if (value instanceof Uint8Array) {
-      return { __leko_kind: "byte_array", value: Array.from(value, function (item) { return Number(item); }) };
+      return { __leko_kind: "js_byte_array_b64", value: encodeBase64Bytes(value) };
     }
     seen = seen || [];
     if (seen.indexOf(value) >= 0) return { __leko_kind: "undefined" };
@@ -1145,9 +1528,22 @@ output.puts(JSON.stringify(result));
 output.close();
 ]]
 
-local function fillBootstrap(script)
+-- Compile the host wrapper once per native Realm. Each invocation still
+-- creates fresh bindings from its own input; nested host calls retain their
+-- existing save/restore boundary. Re-parsing this large wrapper per TOC row
+-- costs far more than the row's short URL rule on a Kindle.
+local HOST_FUNCTION = HOST_BOOTSTRAP:gsub("^%(function %(%)", "(function (__lekoScript)")
+    :gsub("__LEKO_USER_SCRIPT__", "__lekoScript"):gsub("%)%(%)%s*$", ")")
+
+local function fillBootstrap(script, session)
     local encoded, err = jsonEncode(tostring(script or ""))
     if not encoded then return nil, err end
+    if session and session.native then
+        if session.host_function_ready then
+            return "globalThis.__lekoRunRule(" .. encoded .. ")"
+        end
+        return "(globalThis.__lekoRunRule = " .. HOST_FUNCTION .. ")(" .. encoded .. ")"
+    end
     return HOST_BOOTSTRAP:gsub("__LEKO_USER_SCRIPT__", function() return encoded end), nil
 end
 
@@ -1175,6 +1571,7 @@ function Session:_freeNative()
         self.runtime = nil
     end
     self.native = false
+    self.host_function_ready = nil
     self.host_buffer = nil
     -- LuaJIT owns the callback trampoline through this reference.  It must be
     -- released only after the native context has stopped calling it.
@@ -1189,7 +1586,8 @@ function Session:_newNative()
     self.lib = lib
     local options = ffi.new("lqjs_runtime_options")
     options.abi_version, options.flags = BRIDGE_ABI, 0
-    options.memory_limit_bytes, options.max_stack_bytes = MAX_MEMORY, MAX_STACK
+    options.memory_limit_bytes = tonumber(self.memory_limit_bytes) or MAX_MEMORY
+    options.max_stack_bytes = MAX_STACK
     local error_value = ffi.new("lqjs_error")
     self.runtime = lib.lqjs_runtime_new(options, error_value)
     if self.runtime == nil then return nil, self:_nativeError(error_value, "QuickJS runtime creation failed") end
@@ -1354,6 +1752,7 @@ function Session.new(env)
     local self = setmetatable({
         env = env or {}, native = false, closed = false, handles = {}, next_handle = 1,
         busy = 0, last_used = os.clock(), source_target = nil,
+        memory_limit_bytes = tonumber(env and rawget(env, "__quickjs_memory_limit")) or MAX_MEMORY,
     }, Session)
     active_sessions[#active_sessions + 1] = self
     if ffi_ok then
@@ -1372,12 +1771,30 @@ function Session.new(env)
     return self
 end
 
+local function serializeState(session, value)
+    -- The desktop command-line fallback has no synchronous host callbacks.
+    if not session.native then return session:_encode(value) end
+    if type(value) ~= "table" then return session:_encode(value) end
+    local target = rawget(value, "__target") or value
+    if type(target) ~= "table" or #target > 0 then return session:_encode(value) end
+    local initial, deferred = {}, {}
+    for key, item in pairs(target) do
+        if type(key) == "string" and key:sub(1, 2) ~= "__"
+                and (type(item) == "table" or (type(item) == "string" and #item > 2048)) then
+            deferred[#deferred + 1] = key
+        else
+            initial[key] = item
+        end
+    end
+    return session:_encode(initial), deferred
+end
+
 local function serializeEnv(session, env)
     local input = {}
     local functions = {}
     local skip = {
         java = true, cookie = true, cache = true, source = true, book = true,
-        chapter = true, result = true, currentResponse = true,
+        chapter = true, result = true, src = true, currentResponse = true,
         __quickjs_session = true, __js_lib = true,
     }
     for key, value in pairs(env or {}) do
@@ -1389,10 +1806,16 @@ local function serializeEnv(session, env)
             end
         end
     end
-    input.source = session:_encode(env and env.source)
-    input.book = session:_encode(env and env.book)
-    input.chapter = session:_encode(env and env.chapter)
+    input.__lekoStateFields = {}
+    input.source, input.__lekoStateFields.source = serializeState(session, env and env.source)
+    input.book, input.__lekoStateFields.book = serializeState(session, env and env.book)
+    input.chapter, input.__lekoStateFields.chapter = serializeState(session, env and env.chapter)
     input.result = session:_encode(env and env.result)
+    if env and type(env.result) == "string" and env.src == env.result then
+        input.__src_is_result = true
+    else
+        input.src = session:_encode(env and env.src)
+    end
     input.currentResponse = session:_encode(env and env.currentResponse)
     input.context = session:_encode(env and env.context)
     input.__lekoFunctions = functions
@@ -1454,18 +1877,24 @@ function Session:_eval(script, env, options)
     self.env = env or self.env or {}
     script = QuickJS:unwrap(script)
     if trim(script) == "" then return nil end
-    local source, source_error = fillBootstrap(script)
+    if options and options.promote_lexicals then script = promoteTopLevelLexicals(script) end
+    local source, source_error = fillBootstrap(script, self)
     if not source then return nil, source_error end
     local input = serializeEnv(self, self.env)
     local result, err
     if self.native then
         result, err = self:_evalNative(source, input,
-            options and options.timeout_ms or DEFAULT_TIMEOUT,
-            options and options.max_result_bytes or DEFAULT_RESULT)
+            options and options.timeout_ms
+                or tonumber(self.env and rawget(self.env, "__quickjs_timeout_ms"))
+                or DEFAULT_TIMEOUT,
+            options and options.max_result_bytes
+                or tonumber(self.env and rawget(self.env, "__quickjs_max_result_bytes"))
+                or DEFAULT_RESULT)
     else
         result, err = self:_evalQJS(source, input)
     end
     if not result then return nil, err end
+    if self.native then self.host_function_ready = true end
     if result.kind == "undefined" then return nil end
     local envelope = result.value
     if type(envelope) ~= "table" then return self:_decode(envelope) end
@@ -1475,11 +1904,16 @@ end
 
 function Session:eval(script, env, options)
     if self.closed then return nil, "QuickJS session is closed" end
+    -- Host calls may synchronously run another rule in this same source-owned
+    -- Realm (for example loginUi action -> java.ajax -> request parsing). The
+    -- nested evaluation must not replace the outer action's java/toast bridge.
+    local previous_env = self.env
     self.busy = (tonumber(self.busy) or 0) + 1
     self.last_used = os.clock()
     local result = pack(xpcall(function()
         return self:_eval(script, env, options)
     end, debug.traceback))
+    self.env = previous_env
     self.busy = math.max(0, (tonumber(self.busy) or 1) - 1)
     self.last_used = os.clock()
     if not result[1] then return nil, "QuickJS execution panic: " .. tostring(result[2]) end
@@ -1498,7 +1932,8 @@ function QuickJS:_session(env)
     env = env or {}
     local session = rawget(env, "__quickjs_session")
     if session and not session.closed then
-        session.env, session.last_used = env, os.clock()
+        if (tonumber(session.busy) or 0) == 0 then session.env = env end
+        session.last_used = os.clock()
         return session
     end
     local source = rawget(env, "source")
@@ -1507,7 +1942,8 @@ function QuickJS:_session(env)
     if source_target and rawget(source_target, "__quickjs_session")
             and not rawget(source_target, "__quickjs_session").closed then
         session = rawget(source_target, "__quickjs_session")
-        session.env, session.source_target, session.last_used = env, source_target, os.clock()
+        if (tonumber(session.busy) or 0) == 0 then session.env = env end
+        session.source_target, session.last_used = source_target, os.clock()
     else
         local create_error
         session, create_error = Session.new(env)
@@ -1524,6 +1960,13 @@ function QuickJS:eval(script, env, options)
         env.last_js_error = rawget(env, "__js_lib_error")
         return nil, rawget(env, "__js_lib_error")
     end
+    if env and rawget(env, "__promote_rule_lexicals")
+            and (not options or options.promote_lexicals == nil) then
+        local inherited = {}
+        for key, value in pairs(options or {}) do inherited[key] = value end
+        inherited.promote_lexicals = true
+        options = inherited
+    end
     local session, session_error = self:_session(env)
     if not session then
         if env then env.last_js_error = session_error end
@@ -1539,7 +1982,33 @@ function QuickJS:eval(script, env, options)
     return value, err
 end
 
-function QuickJS:installLibrary(script, env)
+-- Evaluate several independent completion-value scripts inside one native
+-- call.  Host callbacks still run in order against the same environment, but
+-- Lua/JSON/bootstrap setup is paid once for the whole small batch.  Callers
+-- must only batch scripts whose observable state does not depend on a
+-- different per-item environment.
+function QuickJS:evalBatch(scripts, env, options)
+    if type(scripts) ~= "table" or #scripts == 0 then return {} end
+    local batch_env = {}
+    for key, value in pairs(env or {}) do batch_env[key] = value end
+    batch_env.lekoBatchScripts = scripts
+    local program = [[
+(function (codes) {
+  var output = [];
+  for (var index = 0; index < codes.length; index++) {
+    output.push((0, eval)(String(codes[index])));
+  }
+  return output;
+})(lekoBatchScripts)
+]]
+    local inherited = {}
+    for key, value in pairs(options or {}) do inherited[key] = value end
+    inherited.timeout_ms = tonumber(inherited.timeout_ms) or math.max(DEFAULT_TIMEOUT, #scripts * 40)
+    inherited.max_result_bytes = tonumber(inherited.max_result_bytes) or DEFAULT_RESULT
+    return self:eval(program, batch_env, inherited)
+end
+
+function QuickJS:installLibrary(script, env, options)
     script = trim(script)
     if script == "" then return nil end
     local previous_kind
@@ -1547,7 +2016,7 @@ function QuickJS:installLibrary(script, env)
         previous_kind = rawget(env, "__diagnostic_js_kind")
         rawset(env, "__diagnostic_js_kind", "library")
     end
-    local value, err = self:eval(script, env)
+    local value, err = self:eval(script, env, options)
     if env then rawset(env, "__diagnostic_js_kind", previous_kind) end
     return value, err
 end

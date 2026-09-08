@@ -1,8 +1,5 @@
 local DataUri = {}
-
-local BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local BASE64_MAP = {}
-for index = 1, #BASE64_CHARS do BASE64_MAP[BASE64_CHARS:sub(index, index)] = index - 1 end
+local CryptoCompat = require("Leko/CryptoCompat")
 
 local function trim(value)
     return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -16,24 +13,54 @@ local function percentDecode(value)
 end
 
 local function base64Decode(value)
-    value = tostring(value or ""):gsub("%s+", ""):gsub("[^%w%+/%=]", "")
-    local output, buffer, bits = {}, 0, 0
-    for index = 1, #value do
-        local char = value:sub(index, index)
-        if char == "=" then break end
-        local code = BASE64_MAP[char]
-        if code ~= nil then
-            buffer = buffer * 64 + code
-            bits = bits + 6
-            while bits >= 8 do
-                bits = bits - 8
-                local byte = math.floor(buffer / (2 ^ bits)) % 256
-                output[#output + 1] = string.char(byte)
-                buffer = buffer % (2 ^ bits)
-            end
-        end
+    return CryptoCompat.base64Decode(value)
+end
+
+local function hexEncode(value)
+    return (tostring(value or ""):gsub(".", function(char)
+        return string.format("%02x", char:byte())
+    end))
+end
+
+local function hexDecode(value)
+    value = tostring(value or ""):gsub("%s+", "")
+    if #value % 2 ~= 0 or value:find("[^%x]") then return nil, "invalid hex payload" end
+    return (value:gsub("(%x%x)", function(pair) return string.char(tonumber(pair, 16)) end))
+end
+
+local function descriptorValue(descriptor, key)
+    if type(descriptor) ~= "table" then return nil end
+    if descriptor[key] ~= nil then return descriptor[key] end
+    local camel = key:gsub("_([%a])", function(letter) return letter:upper() end)
+    return descriptor[camel]
+end
+
+local function descriptorEncoding(descriptor)
+    if type(descriptor) ~= "table" then return "" end
+    for _, key in ipairs({ "result_encoding", "payload_encoding", "result_format", "payload_format", "encoding" }) do
+        local value = descriptorValue(descriptor, key)
+        if value ~= nil then return tostring(value):lower() end
     end
-    return table.concat(output)
+    return ""
+end
+
+-- Typed aggregate data: hand-offs expose their byte payload as hex to rules
+-- that call java.hexDecodeToString(result), matching AnalyzeUrl on Android.
+function DataUri:ruleInput(value, descriptor)
+    value = tostring(value or "")
+    local encoding = descriptorEncoding(descriptor)
+    if encoding == "raw" or encoding == "plain" or encoding == "text" or encoding == "none" then
+        return value
+    end
+    if encoding == "hex" or encoding == "hexadecimal" then
+        local decoded, err = hexDecode(value)
+        if not decoded then return nil, err end
+        return value
+    end
+    if type(descriptor) == "table" and (descriptor.raw == true or descriptor.raw_result == true) then
+        return value
+    end
+    return hexEncode(value)
 end
 
 function DataUri:is(value)

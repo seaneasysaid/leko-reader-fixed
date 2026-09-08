@@ -163,6 +163,12 @@ function ForegroundBookTask:start(job)
         elseif job.finish_on_success == false then
             self:complete(progress)
         end
+        if payload and payload.warning and job.operation == "prepare" then
+            require("ui/uimanager"):show(require("ui/widget/notification"):new{
+                text = tostring(payload.warning), timeout = 8,
+            })
+        end
+
     end)
 
     if not worker then

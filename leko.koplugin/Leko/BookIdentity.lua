@@ -9,10 +9,6 @@ local TITLE_SUFFIXES = {
     "txt全集下载", "txt下载", "电子书下载", "电子书",
 }
 
-local SITE_SUFFIXES = {
-    "笔趣阁", "顶点小说", "顶点中文", "69书吧", "小说网", "小说阅读网", "书库", "阅读网",
-}
-
 local SEMANTIC_CONTINUATIONS = {
     "续", "续集", "前传", "后传", "番外", "外传", "第二部", "第2部", "二部", "2部",
     "第三部", "第3部", "三部", "3部",
@@ -92,9 +88,6 @@ local function isPresentationSuffix(value)
         local normalized = suffix:lower():gsub("[%s%p%c]", "")
         if value == normalized or value:find(normalized, 1, true) then return true end
     end
-    for _, suffix in ipairs(SITE_SUFFIXES) do
-        if value == suffix or value:find(suffix, 1, true) then return true end
-    end
     return false
 end
 
@@ -139,22 +132,6 @@ local function stripKnownSuffixes(value)
     return trim(value)
 end
 
-local function stripSiteSuffix(value)
-    value = trim(value)
-    local lower = value:lower()
-    for _, suffix in ipairs(SITE_SUFFIXES) do
-        local needle = suffix:lower()
-        if #lower > #needle and lower:sub(-#needle) == needle then
-            local prefix = trim(value:sub(1, #value - #suffix))
-            -- These are unambiguous site labels. Remove an optional separator
-            -- before them, but never remove semantic continuation words.
-            prefix = prefix:gsub("[%s%-%_|·—–－]+$", "")
-            return trim(prefix)
-        end
-    end
-    return value
-end
-
 local function removePunctuation(value)
     value = value:gsub("[%s%p%c]", "")
     for _, token in ipairs(PUNCTUATION) do value = removePlain(value, token) end
@@ -177,7 +154,6 @@ function BookIdentity:normalizeTitle(value)
     value = stripOuterWrappers(value)
     value = stripTrailingBrackets(value)
     value = stripKnownSuffixes(value)
-    value = stripSiteSuffix(value)
     value = stripOuterWrappers(value)
     return removePunctuation(value)
 end
@@ -272,3 +248,4 @@ function BookIdentity:bestExactTitle(results, wanted_title, wanted_author, prefe
 end
 
 return BookIdentity
+

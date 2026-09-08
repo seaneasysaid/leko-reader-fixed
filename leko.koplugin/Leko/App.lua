@@ -9,6 +9,21 @@ local App = {
     reading_coordinator = nil,
 }
 
+function App:getCurrentReadingContext()
+    local reader = self.reader
+    if not reader or type(reader.getCurrentReadingContext) ~= "function" then return { api_version = 1, active = false } end
+    local ok, context = pcall(reader.getCurrentReadingContext, reader)
+    if not ok or type(context) ~= "table" then return { api_version = 1, active = false } end
+    local snapshot = {}
+    for key, value in pairs(context) do snapshot[key] = value end
+    return snapshot
+end
+
+function App:closeReadingStatistics()
+    if self.reader and self.reader.statistics_bridge then return self.reader.statistics_bridge:close() end
+    return true
+end
+
 local function tocUpdater()
     local ok, updater = pcall(require, "Leko/AsyncTocUpdate")
     return ok and updater or nil
@@ -114,6 +129,7 @@ end
 function App:showBookInfoObject(book, reader)
     local BookInfoView = require("Leko/BookInfoView")
     local info_view
+    if reader and type(reader.onReadingPaused) == "function" then reader:onReadingPaused() end
 
     local function runNext(callback)
         if type(UIManager.nextTick) == "function" then
@@ -213,7 +229,10 @@ function App:showBookInfoObject(book, reader)
         onBookDeleted = function() self:refreshBookshelf() end,
         reader_active = reader ~= nil,
         onDetailsClosed = function()
-            if reader then runNext(refreshReaderFooter) end
+            if reader then
+                if type(reader.onReadingResumed) == "function" then reader:onReadingResumed() end
+                runNext(refreshReaderFooter)
+            end
         end,
     }
     UIManager:show(info_view, "full")
@@ -251,6 +270,7 @@ function App:_createReader(book, reader_options)
             end
         end,
         onReaderClosed = function()
+            coordinator:cancel("reader-closed")
             self.reader = nil
             coordinator.active_reader = nil
             local return_view = reader_options.return_view

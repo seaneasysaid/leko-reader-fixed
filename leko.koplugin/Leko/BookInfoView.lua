@@ -521,6 +521,27 @@ function BookInfoView:showBookSourceSwitcher()
             onSourcePriorityChanged = function()
                 search:applySourcePreference()
             end,
+            onManualRefresh = function()
+                local previous_search = search
+                local replacement = SourceSearchController:new{
+                    book = self.book,
+                    mode = "content",
+                    force_refresh = true,
+                    view = view,
+                }
+                search = replacement
+                replacement:start()
+                previous_search:cancel()
+                if view._disposed then replacement:cancel(); return end
+                view:releaseResults()
+                view.results = current and { current } or {}
+                view:_initializeResults()
+                view.searching = true
+                view.scanned = 0
+                view.total_sources = 0
+                view.search_stage = "正在清除本次缓存并重新搜索"
+                view:refreshItems()
+            end,
             onCancelSearch = function() search:cancel() end,
         }
         search.options.view = view
@@ -561,10 +582,12 @@ function BookInfoView:showCoverSourceSwitcher()
         local search = SourceSearchController:new{
             book = self.book,
             mode = "cover",
+            force_refresh = true,
         }
         view = CoverBrowserView:new{
             title = "封面换源",
-            results = {},
+            results = { BookService:currentCoverCandidate(self.book)
+                or BookService:currentContentCandidate(self.book) },
             searching = true,
             total_sources = 0,
             search_stage = "搜到一个就立即显示；其余书源继续后台搜索",
@@ -587,7 +610,10 @@ function BookInfoView:showCoverSourceSwitcher()
             view:setSearchProgress(scanned, total, stage, false,
                 session and session.discovered_count, session and session.overflow_count)
         end
-        search.options.on_done = function(_, session)
+        search.options.on_done = function(errors, session)
+            if #view.results == 0 and errors and #errors > 0 then
+                view.error_text = "搜索失败详情：" .. Util.truncateUtf8(tostring(errors[1]), 180)
+            end
             local total = session and session.total_sources or 0
             local completed = session and session.completed_sources or total
             view:setSearchProgress(completed, total,

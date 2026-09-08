@@ -7,13 +7,19 @@ local App = require("Leko/App")
 local ErrorGuard = require("Leko/ErrorGuard")
 local FileManagerTab = require("Leko/FileManagerTab")
 local VERSION = require("Leko/Version").version
-local EXPECTED_VERSION = "0.15.49"
 
 local Leko = WidgetContainer:extend{
     name = "leko",
     fullname = "Leko Reader · " .. VERSION,
     is_doc_only = false,
 }
+
+function Leko:getCurrentReadingContext()
+    local context = App:getCurrentReadingContext()
+    local snapshot = {}
+    for key, value in pairs(context or {}) do snapshot[key] = value end
+    return snapshot
+end
 
 function Leko:onDispatcherRegisterActions()
     Dispatcher:registerAction("leko_open", {
@@ -27,18 +33,6 @@ end
 function Leko:init()
     logger.info("Leko plugin: initializing", self.fullname,
         self.ui and self.ui.document and "reader" or "filemanager")
-    if tostring(VERSION) ~= EXPECTED_VERSION then
-        local message = string.format(
-            "Leko 文件版本不一致（检测到 %s，需要 %s）。请完全退出 KOReader，删除旧的 leko.koplugin 后复制完整的新目录，再重新打开 KOReader。无需重启 Kindle。",
-            tostring(VERSION), EXPECTED_VERSION)
-        logger.err("Leko plugin: mixed plugin files:", message)
-        UIManager:show(InfoMessage:new{ text = message })
-        self:onDispatcherRegisterActions()
-        if self.ui and self.ui.menu and type(self.ui.menu.registerToMainMenu) == "function" then
-            self.ui.menu:registerToMainMenu(self)
-        end
-        return false
-    end
     ErrorGuard:run("initialize", function() App:init() end)
     -- Install only the FileManager build-after wrapper.  The ordinary plugin
     -- menu entry below remains the explicit fallback if the host cannot expose
@@ -70,6 +64,12 @@ end
 
 function Leko:onSuspend()
     pcall(function() require("Leko/MobileSourceImport"):notifySuspend() end)
+    self:onFlushSettings()
+end
+
+function Leko:onExit()
+    pcall(function() require("Leko/SearchResultCache"):onExit() end)
+    pcall(App.closeReadingStatistics, App)
     self:onFlushSettings()
 end
 

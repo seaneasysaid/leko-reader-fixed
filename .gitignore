@@ -46,7 +46,6 @@
 !/native/bridge/lqjs_bridge.c
 !/native/bridge/lqjs_bridge.h
 !/native/bridge/qjs_version.h
-!/native/bridge/test_lqjs_bridge.c
 !/native/bridge/verify-kindle-abi.sh
 
 # Release and generated-table build scripts.
@@ -54,3 +53,9 @@
 /scripts/*
 !/scripts/generate_charset_tables.py
 !/scripts/package.ps1
+
+# Release documentation and validation script.
+!/CHANGELOG.md
+!/leko.koplugin/README.md
+!/scripts/validate-lean-rebuild.ps1
+

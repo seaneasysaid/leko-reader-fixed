@@ -34,6 +34,7 @@ local function compactSource(source)
         cookies = source.cookies,
         variables = source.variables,
         login_header = source.login_header,
+        login_info = source.login_info,
         enabled_cookie_jar = source.enabled_cookie_jar,
     }
 end
@@ -44,6 +45,7 @@ local function compactRuntime(source, fallback)
             cookies = source.cookies,
             variables = source.variables,
             login_header = source.login_header,
+            login_info = source.login_info,
         }
     end
     return fallback
@@ -54,12 +56,15 @@ local function applyRuntime(source, runtime)
     if type(runtime.cookies) == "table" then source.cookies = runtime.cookies end
     if type(runtime.variables) == "table" then source.variables = runtime.variables end
     if runtime.login_header ~= nil then source.login_header = runtime.login_header end
+    if type(runtime.login_info) == "table" then source.login_info = runtime.login_info end
     return source
 end
 
 local function compactResult(result, source)
     return {
         title = tostring(result and result.title or ""),
+        title_mismatch = result and result.title_mismatch,
+        author_mismatch = result and result.author_mismatch,
         author = tostring(result and result.author or ""),
         book_url = result and result.book_url or nil,
         toc_url = result and result.toc_url or nil,
@@ -270,8 +275,19 @@ function AsyncCoverFetch:start(job, callback)
                 return fetched, fetch_err
             end
 
-            -- Fast path: a search-list cover with its compact request context can
-            -- be shown without loading the full source pack.
+            -- Image requests execute the same header/library rules as text
+            -- requests. Compact search metadata is not an executable source:
+            -- it omits header_rule, jsLib and loginUrl. Load the one source
+            -- record in this worker before either direct or detail fallback.
+            if result.source_id then
+                local source_error
+                source, source_error = loadFullSource()
+                if not source then
+                    payload.error = tostring(source_error)
+                    Storage:releaseSourceSettings()
+                    return
+                end
+            end
             local direct_error
             if tostring(resolved.cover or "") ~= "" then
                 if not source then
@@ -311,12 +327,8 @@ function AsyncCoverFetch:start(job, callback)
                 Storage:releaseSourceSettings()
                 return
             end
-            if not BookIdentity:sameTitle(result.title, info.title) then
-                payload.error = "详情页书名与当前书籍不一致，已跳过该封面"
-                Storage:releaseSourceSettings()
-                return
-            end
             resolved = compactResult(info, detail_source)
+            resolved.title_mismatch = not BookIdentity:sameTitle(result.title, info.title)
             resolved.author_mismatch = BookIdentity:authorDiffers(result.author, info.author)
             if tostring(resolved.cover or "") == "" then
                 payload.error = direct_error

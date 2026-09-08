@@ -8,19 +8,11 @@ local Notification = require("ui/widget/notification")
 local UIManager = require("ui/uimanager")
 
 local ErrorGuard = require("Leko/ErrorGuard")
-local AsyncSourceCatalog = require("Leko/AsyncSourceCatalog")
-local AsyncSourceImport = require("Leko/AsyncSourceImport")
 local AsyncStorageStats = require("Leko/AsyncStorageStats")
-local Importer = require("Leko/Importer")
-local SearchView = require("Leko/SearchView")
 local SearchSettings = require("Leko/SearchSettings")
-local SourceView = require("Leko/SourceView")
-local SourceBackupView = require("Leko/SourceBackupView")
 local Storage = require("Leko/Storage")
-local StorageView = require("Leko/StorageView")
 local TaskProgress = require("Leko/TaskProgress")
 local UI = require("Leko/UI")
-local MobileSourceImportView = require("Leko/MobileSourceImportView")
 local BUILD = require("Leko/Version").version
 
 local function showResult(ok_value, err, success_text, onChanged)
@@ -39,9 +31,9 @@ local function showSourceImportResult(result, err, onChanged)
     end
     local summary
     if result.total ~= nil and result.supported ~= nil then
-        summary = Importer:summarizeSourceStats(result)
+        summary = require("Leko/Importer"):summarizeSourceStats(result)
     else
-        summary = Importer:summarizeSources(result)
+        summary = require("Leko/Importer"):summarizeSources(result)
     end
     UIManager:show(InfoMessage:new{
         text = summary .. "\n\n书源已经准备好，现在可以返回书架搜书。",
@@ -74,21 +66,21 @@ end
 
 function ImportMenuView:_handleAction(action)
     if action == "txt" then
-        Importer:chooseFile(function(path)
+        require("Leko/Importer"):chooseFile(function(path)
             local loading = InfoMessage:new{ text = "正在导入 TXT……", dismissable = false }
             UIManager:show(loading)
             UIManager:nextTick(function()
-                local book, err = Importer:importTextFile(path)
+                local book, err = require("Leko/Importer"):importTextFile(path)
                 UIManager:close(loading)
                 showResult(book, err, book and ("已导入：" .. book.title), self.onChanged)
             end)
         end)
     elseif action == "dir" then
-        Importer:chooseDirectory(function(path)
+        require("Leko/Importer"):chooseDirectory(function(path)
             local loading = InfoMessage:new{ text = "正在导入章节目录……", dismissable = false }
             UIManager:show(loading)
             UIManager:nextTick(function()
-                local book, err = Importer:importDirectory(path)
+                local book, err = require("Leko/Importer"):importDirectory(path)
                 UIManager:close(loading)
                 showResult(book, err, book and ("已导入：" .. book.title), self.onChanged)
             end)
@@ -174,7 +166,7 @@ function SourceHubView:_refreshSourceStats(force_storage)
 end
 
 function SourceHubView:showBackups()
-    UIManager:show(SourceBackupView:new{
+    UIManager:show(require("Leko/SourceBackupView"):new{
         on_changed = function()
             Storage:clearCachedStorageStats()
             self:_refreshSourceStats(true)
@@ -201,7 +193,7 @@ function SourceHubView:_addWelcomeGuide()
             return
         end
         progress:update(1, "正在更新书源列表……", 2)
-        ticket = AsyncSourceCatalog:ensure(function(catalog_ok, err)
+        ticket = require("Leko/AsyncSourceCatalog"):ensure(function(catalog_ok, err)
             ticket = nil
             progress:close()
             if not catalog_ok then
@@ -245,7 +237,7 @@ function SourceHubView:_startSourceImport(spec)
         cancel_text = "取消导入",
         cancel_callback = function()
             if not worker then return true end
-            local cancelled = AsyncSourceImport:cancel(worker)
+            local cancelled = require("Leko/AsyncSourceImport"):cancel(worker)
             if cancelled ~= false then
                 if self._source_import_worker == worker then self._source_import_worker = nil end
                 return true
@@ -257,7 +249,7 @@ function SourceHubView:_startSourceImport(spec)
     progress:show()
 
     local start_err
-    worker, start_err = AsyncSourceImport:start({
+    worker, start_err = require("Leko/AsyncSourceImport"):start({
         kind = spec.kind,
         path = spec.path,
         url = spec.url,
@@ -289,7 +281,7 @@ end
 
 function SourceHubView:openMobileSourceImport()
     NetworkMgr:runWhenConnected(function()
-        local view, err = MobileSourceImportView.open{
+        local view, err = require("Leko/MobileSourceImportView").open{
             on_changed = function()
                 Storage:clearCachedStorageStats()
                 self:_refreshSourceStats(true)
@@ -334,7 +326,7 @@ end
 
 function SourceHubView:_handleAction(action)
     if action == "manage" then
-        UIManager:show(SourceView:new{
+        UIManager:show(require("Leko/SourceView"):new{
             on_changed = function()
                 Storage:clearCachedStorageStats()
                 self:_refreshSourceStats(true)
@@ -344,7 +336,7 @@ function SourceHubView:_handleAction(action)
     elseif action == "mobile" then
         self:openMobileSourceImport()
     elseif action == "local" then
-        Importer:chooseFile(function(path)
+        require("Leko/Importer"):chooseFile(function(path)
             self:_startSourceImport{ kind = "file", path = path }
         end)
     elseif action == "url" then
@@ -395,9 +387,9 @@ function MainMenuView:init()
         { text = "关于 Leko", mandatory = BUILD, action = "about" },
     }
     self.onMenuSelect = function(menu, item) menu:handleAction(item.action) end
-    self.close_callback = function() UIManager:close(self, "full") end
+    self.close_callback = function() self._closed = true; UIManager:close(self, "full") end
     Menu.init(self)
-    UIManager:nextTick(function()
+    UIManager:scheduleIn(0.2, function()
         if self._closed then return end
         AsyncStorageStats:start(function(ok, stats)
             if ok and stats and not self._closed then self:_updateStorageRow(stats) end
@@ -539,7 +531,7 @@ end
 
 function MainMenuView:_handleAction(action)
     if action == "search" then
-        SearchView:prompt{
+        require("Leko/SearchView"):prompt{
             owner = self,
             onReadBook = self.onReadBook,
             onBookAdded = function(book)
@@ -560,7 +552,7 @@ function MainMenuView:_handleAction(action)
             end,
         }, "full")
     elseif action == "storage" then
-        UIManager:show(StorageView:new{
+        UIManager:show(require("Leko/StorageView"):new{
             on_sources_changed = function()
                 self:refreshSourceCount()
                 if self.onChanged then self.onChanged() end
@@ -577,7 +569,7 @@ function MainMenuView:_handleAction(action)
                 .. "• 搜索结果可先试读，退出时再决定是否加入书架。\n"
                 .. "• 书籍详情 → 书籍换源：更换正文来源。\n"
                 .. "• 书籍详情 → 更多 → 刷新目录与书籍信息：手动检查更新。\n"
-                .. "• 阅读页 → 排版：调整字号、行距、页边距、段距和缩进。\n"
+                .. "• 阅读页 → 阅读设置：调整字体、字号、行距、页边距、段距和缩进。\n"
                 .. "• 全书缓存完成后，才能导出完整 TXT、EPUB 或 MOBI。\n\n"
                 .. "出错时\n\n"
                 .. "先确认《欢迎来到 Leko》能正常阅读，再尝试另一条书源。如果所有书源都失败，可以运行“JavaScript 引擎检查”，并查看“最近一次错误”。",

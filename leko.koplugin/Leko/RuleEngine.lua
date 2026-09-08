@@ -797,10 +797,35 @@ local function valueFromNode(node, attribute)
     else return nodeAttribute(node, attribute) end
 end
 
+local function splitScriptReplacement(script)
+    -- `##` belongs to the rule layer, not JavaScript. Find it only outside a
+    -- string and balanced JavaScript grouping so `"a##b"` / regex literals do
+    -- not get truncated. This keeps selector + <js> + replacement pipelines
+    -- from accidentally feeding the replacement clause back into QuickJS.
+    local quote, escaped, depth = nil, false, 0
+    for index = 1, #script - 1 do
+        local char = script:sub(index, index)
+        if quote then
+            if escaped then escaped = false
+            elseif char == "\\" then escaped = true
+            elseif char == quote then quote = nil end
+        elseif char == "'" or char == '"' or char == "`" then quote = char
+        elseif char == "(" or char == "[" or char == "{" then depth = depth + 1
+        elseif char == ")" or char == "]" or char == "}" then depth = math.max(0, depth - 1)
+        elseif depth == 0 and char == "#" and script:sub(index + 1, index + 1) == "#" then
+            return script:sub(1, index - 1), script:sub(index)
+        end
+    end
+    return script, nil
+end
+
 local function splitPostScript(rule)
     rule = tostring(rule or "")
     local trimmed = Util.trim(rule)
-    if trimmed:lower():match("^@js:") then return "", trimmed, "" end
+    if trimmed:lower():match("^@js:") then
+        local script, suffix = splitScriptReplacement(trimmed)
+        return suffix and suffix or "", script, ""
+    end
     local lower_rule = rule:lower()
     local open_pos = lower_rule:find("<js>", 1, true)
     if open_pos then
@@ -809,6 +834,10 @@ local function splitPostScript(rule)
             local before = rule:sub(1, open_pos - 1):gsub("%s+$", "")
             local script = rule:sub(open_pos, close_pos + 4)
             local after = rule:sub(close_pos + 5):gsub("^%s+", "")
+            -- A trailing replacement applies to the JS result. Move it into
+            -- the static portion so extractAll's established replacement path
+            -- processes it after the script rather than as a selector.
+            if after:sub(1, 2) == "##" then return before .. after, script, "" end
             return before, script, after
         elseif open_pos == 1 then return "", rule, "" end
     end
@@ -817,11 +846,41 @@ local function splitPostScript(rule)
     -- treating the whole string as a legacy selector silently returns no node.
     local inline_js = lower_rule:find("@js:", 1, true)
     if inline_js and inline_js > 1 then
-        return rule:sub(1, inline_js - 1):gsub("%s+$", ""), rule:sub(inline_js), ""
+        local script, suffix = splitScriptReplacement(rule:sub(inline_js))
+        return rule:sub(1, inline_js - 1):gsub("%s+$", "") .. (suffix or ""), script, ""
     end
     local a = lower_rule:find("\n@js:", 1, true)
-    if a then return rule:sub(1, a - 1), rule:sub(a + 1), "" end
+    if a then
+        local script, suffix = splitScriptReplacement(rule:sub(a + 1))
+        return rule:sub(1, a - 1) .. (suffix or ""), script, ""
+    end
     return rule, nil, ""
+end
+
+function RuleEngine:isStaticJsonProjection(rule)
+    local static, script = splitPostScript(Util.trim(tostring(rule or "")))
+    if script then return false end
+    -- These are rule-language operators, not guessed JavaScript API names.
+    if static:find("{{", 1, true) or static:lower():find("@put:", 1, true)
+            or static:lower():find("@get:", 1, true) then return false end
+    local path = Util.trim((Util.splitPlain(static, "##"))[1] or "")
+    path = path:gsub("^@?[Jj][Ss][Oo][Nn]:", "")
+    if path == "$" then return true end
+    path = path:gsub("^%$%.", "")
+    if path == "" then return false end
+    for part in path:gmatch("[^%.]+") do
+        if not part:match("^[%a_][%w_%-]*$") then return false end
+    end
+    return not path:find("..", 1, true) and path:sub(1, 1) ~= "." and path:sub(-1) ~= "."
+end
+
+local function scriptReferencesRawResponse(script)
+    script = tostring(script or "")
+    -- False positives (for example an identifier mentioned in a string) only
+    -- retain the legacy payload.  The frontier checks avoid false negatives
+    -- such as `resultData`, which is an unrelated local name.
+    return script:match("%f[%w_]result%f[^%w_]") ~= nil
+        or script:match("%f[%w_]src%f[^%w_]") ~= nil
 end
 
 local function flattenResult(value)
@@ -839,9 +898,51 @@ local function flattenResult(value)
     return { value }
 end
 
-local function scriptInput(values, force_list)
-    if type(values) ~= "table" or #values == 0 then return nil end
-    return (not force_list and #values == 1) and values[1] or values
+local function selectorList(values)
+    return { __leko_selector_list = values }
+end
+
+local function scriptInput(values, force_list, preserve_selector_list)
+    if type(values) ~= "table" then return nil end
+    if #values == 0 then return preserve_selector_list and selectorList(values) or nil end
+    if not force_list and #values == 1 then return values[1] end
+    return preserve_selector_list and selectorList(values) or values
+end
+
+-- `&&` composes rules, but it is also JavaScript syntax. Keep script blocks
+-- atomic so a condition inside <js>/@js is never split into separate rules.
+local function splitRuleAnd(value)
+    value = tostring(value or "")
+    if value == "" or not value:find("&&", 1, true) then return { value } end
+    local trimmed = Util.trim(value):lower()
+    if trimmed:match("^@js:") or trimmed:match("^<js>") then return { value } end
+    local result, start, index = {}, 1, 1
+    local in_js, quote, escaped = false, nil, false
+    while index <= #value do
+        local chunk = value:sub(index, index + 4):lower()
+        if not in_js and value:sub(index, index + 3):lower() == "<js>" then
+            in_js = true; index = index + 4
+        elseif in_js and chunk == "</js>" then
+            in_js = false; index = index + 5
+        else
+            local char = value:sub(index, index)
+            if in_js then
+                if quote then
+                    if escaped then escaped = false
+                    elseif char == "\\" then escaped = true
+                    elseif char == quote then quote = nil end
+                elseif char == "'" or char == '"' or char == "`" then
+                    quote = char
+                end
+            elseif char == "&" and value:sub(index, index + 1) == "&&" then
+                result[#result + 1] = value:sub(start, index - 1)
+                start, index = index + 2, index + 1
+            end
+            index = index + 1
+        end
+    end
+    result[#result + 1] = value:sub(start)
+    return result
 end
 
 local function htmlParserNeedsDangerPlaceholderMode(body)
@@ -900,7 +1001,7 @@ function RuleEngine:parseDocument(body, content_type)
     return root, "html"
 end
 
-function RuleEngine:_jsEnv(context, base_url, env, result)
+function RuleEngine:_jsEnv(context, base_url, env, result, prefer_context, options)
     local out = {}
     for key, value in pairs(env or {}) do out[key] = value end
     -- Legado's `@js:` receives the raw response body when the rule has no
@@ -910,7 +1011,13 @@ function RuleEngine:_jsEnv(context, base_url, env, result)
     -- explicit selector result when one exists, while retaining the raw
     -- response as the default input for pure scripts.
     local raw_result = out.__raw_response_body
-    local js_result = result ~= nil and result or (raw_result ~= nil and raw_result or context)
+    if options and options.omit_raw_response then raw_result = nil end
+    local js_result = result
+    if js_result == nil then
+        if prefer_context then js_result = context
+        elseif raw_result ~= nil then js_result = raw_result
+        else js_result = context end
+    end
     out.context, out.result, out.src = context, js_result, raw_result ~= nil and tostring(raw_result) or nodeHtml(context)
     out.baseUrl, out.base_url = base_url or out.baseUrl or "", base_url or out.base_url or ""
     out.variables = out.variables or {}
@@ -979,15 +1086,41 @@ function RuleEngine:_expandTemplates(text, context, base_url, env, rule_result)
                 return self:extract(context, nested_rule, base_url, "", env)
             end
             local lower = inner:lower()
+            -- These two forms occur once per item in large JSON catalogues.
+            -- They are pure and independent of the response payload, avoiding
+            -- a QuickJS round-trip for every chapter without changing dynamic
+            -- templates.
+            if inner == "source.getKey()" then
+                local proxy = env and rawget(env, "source")
+                local source = type(proxy) == "table" and rawget(proxy, "__target") or nil
+                return tostring((source and (rawget(source, "source_key") or rawget(source, "base_url"))) or "")
+            end
+            local time_method, time_path = inner:match("^java%.(timeFormat)%(%s*java%.getString%(%s*['\"](.-)['\"]%s*%)%s*%)$")
+            if not time_method then
+                time_method, time_path = inner:match("^java%.(timeFormatUTC)%(%s*java%.getString%(%s*['\"](.-)['\"]%s*%)%s*%)$")
+            end
+            if time_method and time_path then
+                local timestamp = tonumber(self:extract(context, time_path, base_url, "", env)) or 0
+                if timestamp > 100000000000 then timestamp = timestamp / 1000 end
+                return os.date("%Y-%m-%d %H:%M", math.floor(timestamp))
+            end
             if inner:sub(1, 1) == "$" or inner:match("^//")
                 or lower:match("^@?css:") or lower:match("^@?json:") or lower:match("^@?xpath:")
                 or lower:match("^class%.") or lower:match("^id%.") or lower:match("^tag%.") then
-                return self:extract(context, inner, base_url, "", env)
+                local extracted = self:extract(context, inner, base_url, "", env)
+                if Util.trim(tostring(extracted or "")) == ""
+                        and type(env) == "table" and type(env.book) == "table" then
+                    extracted = self:extract(env.book, inner, base_url, "", env)
+                end
+                return extracted
             end
             -- In a selector -> JS -> URL pipeline, `result` means the value
             -- produced by the previous step. The environment also carries
             -- __raw_response_body for pure @js rules; allowing that fallback
             -- here would substitute the whole search JSON into {{result}}.
+            -- Arbitrary expressions may read result/src through helpers or
+            -- computed property names. Source-text matching cannot prove that
+            -- the response is unused.
             local value = QuickJS:eval(inner, self:_jsEnv(context, base_url, env, rule_result))
             return value ~= nil and tostring(value) or ""
         end)
@@ -1030,9 +1163,17 @@ end
 -- response while another phase passes the selected value.  `rule_result` is
 -- reserved for the value produced by the preceding pipeline step (the value
 -- visible to {{result}}); it is deliberately separate from the response body.
-function RuleEngine:_evaluateRuleScript(script, context, base_url, env, values, rule_result, force_list)
+function RuleEngine:_evaluateRuleScript(script, context, base_url, env, values, rule_result, force_list,
+        preserve_selector_list, prefer_context)
+    if env and env.__data_uri_error then return nil, env.__data_uri_error end
     script = self:_expandTemplates(script, context, base_url, env, rule_result)
-    local js_env = self:_jsEnv(context, base_url, env, scriptInput(values, force_list))
+    local script_input = scriptInput(values, force_list, preserve_selector_list == true)
+    -- A typed response defines the input format; the spelling of the script
+    -- does not. Keep explicit selector results and selected JSON nodes intact.
+    if env and env.__data_uri_rule_input and script_input == nil and not prefer_context then
+        script_input = env.__data_uri_encoded_body
+    end
+    local js_env = self:_jsEnv(context, base_url, env, script_input, prefer_context == true)
     local source_proxy = env and rawget(env, "source")
     local source = type(source_proxy) == "table" and rawget(source_proxy, "__target") or nil
     if source then
@@ -1043,8 +1184,178 @@ function RuleEngine:_evaluateRuleScript(script, context, base_url, env, values, 
             rawget(env, "__diagnostic_rule_field") or "rule-script", script, base_url)
     end
     local result, err = QuickJS:eval(script, js_env)
-    if err and env then env.last_js_error = err end
+    if err and env then
+        if env.__nested_request_error then
+            err = "NESTED_REQUEST_FAILED: " .. tostring(env.__nested_request_error)
+        end
+        env.last_js_error = err
+    end
     return result, err
+end
+
+local PURE_URL_JAVA_METHODS = {
+    md5Encode = true, md5Encode16 = true, digestHex = true,
+    HMacHex = true, HMacBase64 = true,
+    base64Encode = true, base64Decode = true,
+    hexEncodeToString = true, hexDecodeToString = true,
+    urlEncode = true, urlDecode = true, encodeURI = true,
+}
+
+local function safeDeferredUrlScript(script)
+    script = QuickJS:unwrap(script)
+    if script == "" or scriptReferencesRawResponse(script) then return false end
+    -- Dynamic access and indirect calls cannot be classified by looking for
+    -- literal result/src references. Keep these on the full-context path.
+    if script:find("[", 1, true) or script:find("`", 1, true) then return false end
+    for _, name in ipairs({ "eval", "Function", "function", "globalThis", "this", "constructor" }) do
+        if script:match("%f[%w_]" .. name .. "%f[^%w_]") then return false end
+    end
+    for prefix, name in script:gmatch("([^%w_%.])([%a_$][%w_$]*)%s*%(") do
+        if name ~= "encodeURIComponent" and name ~= "decodeURIComponent"
+                and name ~= "encodeURI" and name ~= "decodeURI" then return false end
+    end
+    if script:match("^[%a_$][%w_$]*%s*%(") then return false end
+    for _, name in ipairs({
+        "context", "baseUrl", "base_url", "source", "book", "chapter",
+        "cookie", "cache",
+    }) do
+        if script:match("%f[%w_]" .. name .. "%f[^%w_]") then return false end
+    end
+    local lower = script:lower()
+    for _, token in ipairs({
+        "java.ajax", "java.get", "java.post", "java.put", "java.head",
+        "fetch(", "xmlhttprequest", "javaimporter", "packages.",
+        "eval(", "function(", "webview", "startbrowser",
+    }) do
+        if lower:find(token, 1, true) then return false end
+    end
+    for method in script:gmatch("java%.([%w_]+)%s*%(") do
+        if not PURE_URL_JAVA_METHODS[method] then return false end
+    end
+    local without_calls = script:gsub("java%.[%w_]+%s*%(", "(")
+    if without_calls:find("java%.") then return false end
+    return true
+end
+
+local function capturedScript(script, values)
+    return (tostring(script or ""):gsub("{{([%s%S]-)}}", function(inner)
+        return tostring((values or {})[Util.trim(inner)] or "")
+    end))
+end
+
+-- Capture only simple JSON-path templates.  The original rule remains owned
+-- by the source definition; toc.lua stores a signature and the two or three
+-- scalar values needed by a chapter, never a copy of the long script or the
+-- complete response body.
+function RuleEngine:prepareDeferredUrl(context, rule, base_url, env)
+    local static, script, after = splitPostScript(rule)
+    if not script or Util.trim(static) ~= "" or Util.trim(after) ~= "" then return nil end
+    script = QuickJS:unwrap(script)
+    if not safeDeferredUrlScript(script) then return nil end
+    local values, count = {}, 0
+    for inner in script:gmatch("{{([%s%S]-)}}") do
+        inner = Util.trim(inner)
+        if not inner:match("^%$[%.%[]") or inner:find("%s") then return nil end
+        if values[inner] == nil then
+            local value = self:extract(context, inner, base_url, "", env)
+            if Util.trim(tostring(value or "")) == ""
+                    and type(env) == "table" and type(env.book) == "table" then
+                value = self:extract(env.book, inner, base_url, "", env)
+            end
+            value = tostring(value or "")
+            -- Template values are substituted back into the source rule at
+            -- open time.  Reject characters that could escape the ordinary
+            -- quoted URL fragments used by this optimization.
+            if value:find("['\"\\\r\n]") then return nil end
+            values[inner] = value
+            count = count + 1
+        end
+    end
+    if count == 0 then return nil end
+    local bindings = {}
+    for _, name in ipairs({ "key", "searchKey", "page" }) do
+        if script:match("%f[%w_]" .. name .. "%f[^%w_]") then
+            bindings[name] = type(env) == "table" and env[name] or nil
+        end
+    end
+    local keys, identity = {}, {}
+    for key in pairs(values) do keys[#keys + 1] = key end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+        identity[#identity + 1] = key
+        identity[#identity + 1] = values[key]
+    end
+    for _, name in ipairs({ "key", "searchKey", "page" }) do
+        if bindings[name] ~= nil then
+            identity[#identity + 1] = name
+            identity[#identity + 1] = tostring(bindings[name])
+        end
+    end
+    local signature = Digest:md5(tostring(rule or ""))
+    return {
+        version = 1,
+        signature = signature,
+        identity = Digest:md5(signature .. "\n" .. table.concat(identity, "\n")),
+        values = values,
+        bindings = bindings,
+    }
+end
+
+function RuleEngine:resolveDeferredUrl(capture, rule, base_url, env, resolution_base_url)
+    if type(capture) ~= "table" or tonumber(capture.version) ~= 1 then
+        return nil, "延迟章节地址数据无效"
+    end
+    if tostring(capture.signature or "") ~= Digest:md5(tostring(rule or "")) then
+        return nil, "书源章节地址规则已更新，请刷新目录"
+    end
+    local static, script, after = splitPostScript(rule)
+    if not script or Util.trim(static) ~= "" or Util.trim(after) ~= "" then
+        return nil, "章节地址规则不再支持延迟执行"
+    end
+    script = QuickJS:unwrap(script)
+    if not safeDeferredUrlScript(script) then return nil, "章节地址规则超出安全延迟范围" end
+    script = capturedScript(script, capture.values)
+    local js_env = self:_jsEnv({}, base_url, env, nil, false, { omit_raw_response = true })
+    for name, value in pairs(capture.bindings or {}) do js_env[name] = value end
+    local value, err = QuickJS:eval(script, js_env)
+    if err then return nil, err end
+    value = Util.trim(tostring(value or ""))
+    if value == "" then return nil, "章节地址规则返回空内容" end
+    return Http:absolute(resolution_base_url or base_url, value)
+end
+
+-- Eager callers still avoid one native/bootstrap round-trip per chapter.
+-- Batches are deliberately small so KT2 never builds a multi-megabyte script
+-- or result envelope.
+function RuleEngine:extractUrlsBatch(nodes, rule, base_url, env, resolution_base_url, batch_size)
+    local scripts, captures = {}, {}
+    for index, node in ipairs(nodes or {}) do
+        local capture = self:prepareDeferredUrl(node, rule, base_url, env)
+        if not capture then return nil end
+        local _, script = splitPostScript(rule)
+        scripts[index] = capturedScript(QuickJS:unwrap(script), capture.values)
+        captures[index] = capture
+    end
+    if #scripts == 0 then return {} end
+    local output = {}
+    batch_size = math.max(1, math.min(64, tonumber(batch_size or 32) or 32))
+    local js_env = self:_jsEnv({}, base_url, env, nil, false, { omit_raw_response = true })
+    for first = 1, #scripts, batch_size do
+        local chunk = {}
+        for index = first, math.min(#scripts, first + batch_size - 1) do
+            chunk[#chunk + 1] = scripts[index]
+        end
+        local values, err = QuickJS:evalBatch(chunk, js_env, {
+            timeout_ms = math.max(1000, #chunk * 80),
+        })
+        if not values then return nil, err end
+        for offset = 1, #chunk do
+            local value = Util.trim(tostring(values[offset] or ""))
+            if value == "" then return nil, "批量章节地址规则返回空内容" end
+            output[first + offset - 1] = Http:absolute(resolution_base_url or base_url, value)
+        end
+    end
+    return output, nil, captures
 end
 
 function RuleEngine:_selectStatic(context, rule)
@@ -1182,7 +1493,7 @@ function RuleEngine:select(context, rule, env)
     if global_script then
         local values = global_static ~= "" and self:select(context, global_static, env) or {}
         local result, err = self:_evaluateRuleScript(
-            global_script, context, env and env.base_url, env, values)
+            global_script, context, env and env.base_url, env, values, nil, nil, global_static ~= "")
         if result ~= nil then values = flattenResult(result) end
         if global_after ~= "" then
             local piped = {}
@@ -1217,7 +1528,7 @@ function RuleEngine:select(context, rule, env)
         if static ~= "" then values = self:_selectStatic(context, static) end
         if script then
             local result, err = self:_evaluateRuleScript(
-                script, context, env and env.base_url, env, values, nil, true)
+                script, context, env and env.base_url, env, values, nil, true, static ~= "")
             if result ~= nil then values = flattenResult(result) end
             if after ~= "" then
                 local piped = {}
@@ -1233,10 +1544,10 @@ function RuleEngine:select(context, rule, env)
     return {}
 end
 
-function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
+function RuleEngine:extractAll(context, rule, base_url, env, rule_result, prefer_context)
     if rule == nil then return {} end
     if type(rule) == "table" then
-        local output = {}; for _, item in ipairs(rule) do for _, value in ipairs(self:extractAll(context, item, base_url, env, rule_result)) do output[#output + 1] = value end end; return output
+        local output = {}; for _, item in ipairs(rule) do for _, value in ipairs(self:extractAll(context, item, base_url, env, rule_result, prefer_context)) do output[#output + 1] = value end end; return output
     end
     rule = Util.trim(rule)
     if rule == "" then return {} end
@@ -1257,7 +1568,8 @@ function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
             local values = global_static ~= ""
             and (pipelined and self:select(context, global_static, env) or self:extractAll(context, global_static, static_base_url, env)) or {}
         local result, err = self:_evaluateRuleScript(
-            global_script, context, base_url, env, values, rule_result)
+            global_script, context, base_url, env, values, rule_result, nil,
+            global_static ~= "", prefer_context)
         if result ~= nil then values = flattenResult(result) end
         if pipelined then
             local extracted = {}
@@ -1267,7 +1579,8 @@ function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
                 if type(value) == "string" and Util.trim(value):sub(1, 1) == "<" then
                     pipeline_context = self:parseDocument(value)
                 end
-                for _, item in ipairs(self:extractAll(pipeline_context, global_after, base_url, env, value)) do extracted[#extracted + 1] = item end
+                for _, item in ipairs(self:extractAll(pipeline_context, global_after, base_url, env,
+                        value, prefer_context)) do extracted[#extracted + 1] = item end
             end
             return extracted
         end
@@ -1284,7 +1597,9 @@ function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
     local union = Util.splitPlain(rule, "%%")
     if #union > 1 then
         local lists = {}
-        for _, part in ipairs(union) do lists[#lists + 1] = self:extractAll(context, part, base_url, env) end
+        for _, part in ipairs(union) do
+            lists[#lists + 1] = self:extractAll(context, part, base_url, env, nil, prefer_context)
+        end
         return interleaveLists(lists)
     end
 
@@ -1346,7 +1661,8 @@ function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
 
         if script then
             local js_result, err = self:_evaluateRuleScript(
-                script, context, base_url, env, values, rule_result)
+                script, context, base_url, env, values, rule_result, nil,
+                static ~= "", prefer_context)
             if js_result ~= nil then values = flattenResult(js_result) end
             if after ~= "" then
                 local piped = {}
@@ -1356,7 +1672,8 @@ function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
                     if type(value) == "string" and Util.trim(value):sub(1, 1) == "<" then
                         pipeline_context = self:parseDocument(value)
                     end
-                    for _, item in ipairs(self:extractAll(pipeline_context, after, base_url, env, value)) do piped[#piped + 1] = item end
+                    for _, item in ipairs(self:extractAll(pipeline_context, after, base_url, env,
+                            value, prefer_context)) do piped[#piped + 1] = item end
                 end
                 values = piped
             end
@@ -1387,10 +1704,10 @@ function RuleEngine:extractAll(context, rule, base_url, env, rule_result)
     return {}
 end
 
-function RuleEngine:extract(context, rule, base_url, joiner, env)
+function RuleEngine:extract(context, rule, base_url, joiner, env, prefer_context)
     local collected = {}
-    for _, part in ipairs(Util.splitPlain(tostring(rule or ""), "&&")) do
-        local values = self:extractAll(context, part, base_url, env)
+    for _, part in ipairs(splitRuleAnd(rule)) do
+        local values = self:extractAll(context, part, base_url, env, nil, prefer_context)
         if #values > 0 then collected[#collected + 1] = table.concat(values, joiner or "\n") end
     end
     return table.concat(collected, joiner or "")
@@ -1402,13 +1719,15 @@ end
 -- creates an invalid request URL (e.g. book + author + latest-chapter links).
 -- Keep `&&` composition intact because sources may intentionally construct a
 -- URL from multiple rule parts; only collapse each selector to its first value.
-function RuleEngine:extractUrl(context, rule, base_url, env)
+function RuleEngine:extractUrl(context, rule, base_url, env, prefer_context, resolution_base_url)
     local collected = {}
-    for _, part in ipairs(Util.splitPlain(tostring(rule or ""), "&&")) do
-        local values = self:extractAll(context, part, base_url, env)
+    prefer_context = prefer_context == true
+    for _, part in ipairs(splitRuleAnd(rule)) do
+        local values = self:extractAll(context, part, base_url, env, nil, prefer_context)
         if #values > 0 then
             local value = tostring(values[1] or "")
-            if base_url and value ~= "" then value = Http:absolute(base_url, value) end
+            local resolution_base = resolution_base_url or base_url
+            if resolution_base and value ~= "" then value = Http:absolute(resolution_base, value) end
             collected[#collected + 1] = value
         end
     end
@@ -1444,11 +1763,10 @@ end
 function RuleEngine:formatContent(value, base_url)
     value = tostring(value or "")
     local image_contract = {
-        rendering = "unsupported-placeholder",
+        rendering = "omitted",
         -- The text-only reader cannot render HtmlFormatter keep-img output.
-        -- Keep a stable ASCII placeholder so an HTML tag can never become
-        -- visible reader text or vary with the source page encoding.
-        placeholder = "[image]",
+        -- Omit unsupported images from text; retain their diagnostic metadata.
+        placeholder = "",
         base_url = diagnosticUrl(base_url or ""),
         count = 0,
         items = {},
@@ -1496,7 +1814,7 @@ function RuleEngine:formatContent(value, base_url)
                 has_legado_params = raw_url:find("{", 1, true) ~= nil,
             }
         end
-        return "\n[image]\n"
+        return ""
     end)
     value = value:gsub("<[^>]+>", function(tag)
         return ""

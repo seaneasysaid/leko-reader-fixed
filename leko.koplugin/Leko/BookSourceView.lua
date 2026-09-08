@@ -28,6 +28,11 @@ end
 function BookSourceView:buildItems()
     local items = {}
     local count = #(self.results or {})
+    items[#items + 1] = {
+        text = "刷新本次换源搜索",
+        refresh_search = true,
+        separator = false,
+    }
     if self.searching then
         items[#items + 1] = {
             text = SearchResultFormatter:progressText(self.scanned, self.total_sources, count),
@@ -48,9 +53,20 @@ function BookSourceView:buildItems()
         items[#items + 1] = formatted
     end
     if not self.searching and count == 0 then
-        items[1] = { text = "没有找到可用的同名内容源", dim = true }
+        items[#items + 1] = { text = "没有找到可用的同名内容源", dim = true }
     end
     return items
+end
+
+function BookSourceView:_installMenuCallbacks()
+    StreamingResultList._installMenuCallbacks(self)
+    local select = self.onMenuSelect
+    self.onMenuSelect = function(menu, item)
+        if item.refresh_search then
+            return menu:requestManualRefresh()
+        end
+        return select(menu, item)
+    end
 end
 
 function BookSourceView:_sortResultsIfNeeded()

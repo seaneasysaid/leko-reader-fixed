@@ -45,6 +45,12 @@ function TocView:_buildItems(selected_chapter)
         items[#items + 1] = {
             text = tostring(chapter.title or ("第" .. tostring(index) .. " 章")),
             mandatory = chapter.downloaded and "●" or "○",
+            -- Native Menu only evaluates this for visible rows. Never scan
+            -- every chapter file before allowing the directory to appear.
+            mandatory_func = function()
+                local BookService = require("Leko/BookService")
+                return BookService:isChapterDownloaded(self.book, index) and "●" or "○"
+            end,
             bold = index == current,
             chapter_index = index,
         }
@@ -93,13 +99,6 @@ end
 function TocView:init()
     self.title_bar_left_icon = "home"
     self.onLeftButtonTap = function() self:onReturn() end
-    -- book.lua/toc.lua intentionally do not get rewritten after every cached
-    -- chapter. Rebind their display flags from the authoritative disk cache
-    -- before the first directory paint.
-    local service_ok, BookService = pcall(require, "Leko/BookService")
-    if service_ok and type(BookService.refreshChapterDownloadStates) == "function" then
-        pcall(BookService.refreshChapterDownloadStates, BookService, self.book)
-    end
     local chapters = self.book.chapters or {}
     local current = clamp(tonumber(self.current_chapter or 1) or 1, 1, math.max(1, #chapters))
     self.current_chapter = current

@@ -130,6 +130,7 @@ local function applySourceRuntime(source, runtime)
     if type(runtime.cookies) == "table" then source.cookies = runtime.cookies end
     if type(runtime.variables) == "table" then source.variables = runtime.variables end
     if runtime.login_header ~= nil then source.login_header = runtime.login_header end
+    if type(runtime.login_info) == "table" then source.login_info = runtime.login_info end
     return source
 end
 
@@ -666,9 +667,34 @@ end
 
 local resolveCandidateInfo
 
+local function rangedProgress(callback, first, span, fallback)
+    return function(stage, current, total)
+        if type(callback) ~= "function" then return end
+        local value = tonumber(first) or 0
+        current, total = tonumber(current), tonumber(total)
+        if current and total and total > 0 then
+            value = value + math.floor((tonumber(span) or 0) * math.max(0, math.min(1, current / total)))
+        end
+        callback(value, stage or fallback, 100)
+    end
+end
+
+local function detailIdentityWarning(expected, actual)
+    local notes = {}
+    if tostring(actual.title or "") ~= "" and not BookIdentity:sameTitle(expected.title, actual.title) then
+        notes[#notes + 1] = "书源返回书名《" .. tostring(actual.title) .. "》，与所选《"
+            .. tostring(expected.title or "") .. "》不同，可能是别名或其他书籍。"
+    end
+    if BookIdentity:authorDiffers(expected.author, actual.author) then
+        notes[#notes + 1] = "书源的作者标注与所选记录不同。"
+    end
+    if #notes > 0 then return table.concat(notes, "\n") .. "已继续打开，请核对内容。" end
+end
+
 function BookService:ensureToc(book, progress_callback)
     if not book then return nil, "book required" end
-    local function report(value, text) if progress_callback then progress_callback(value, text) end end
+    local function report(value, text) if progress_callback then progress_callback(value, text, 100) end end
+    if book.toc_pending then return self:refreshToc(book, progress_callback) end
     if type(book.chapters) == "table" and #book.chapters > 0 then
         book.chapter_count = #book.chapters
         book.toc_ready = true
@@ -693,12 +719,12 @@ function BookService:ensureToc(book, progress_callback)
     -- promote a candidate into a resolved book descriptor. This restores the
     -- search -> detail -> TOC invariant and avoids guessing URL bases.
     if book.detail_resolved ~= true or tostring(book.toc_url or "") == "" then
-        report(0, "获取书籍详情")
-        local loaded, info_err = resolveCandidateInfo(source, book)
+        report(5, "获取书籍详情")
+        local loaded, info_err = resolveCandidateInfo(source, book, {
+            on_progress = rangedProgress(progress_callback, 5, 15, "获取书籍详情"),
+        })
         if not loaded then return nil, info_err end
-        if tostring(loaded.title or "") ~= "" and not BookIdentity:sameTitle(book.title, loaded.title) then
-            return nil, "书源详情页返回了另一部书，已阻止错误结果"
-        end
+        book._identity_warning = detailIdentityWarning(book, loaded)
         info = loaded
         for _, key in ipairs({ "title", "author", "intro", "cover", "book_url", "toc_url", "toc_html", "info_html",
             "_detail_base_url", "_detail_response_url", "_detail_request_base_url", "_detail_content_type",
@@ -717,9 +743,10 @@ function BookService:ensureToc(book, progress_callback)
             end
         end
     end
-    report(1, "获取章节目录")
+    report(25, "获取章节目录")
     local toc, toc_err = LegadoSource:getToc(source, info, {
         cache_read = true, cache_write = false, save_runtime = false,
+        on_progress = rangedProgress(progress_callback, 25, 50, "获取章节目录"),
     })
     if not toc then return nil, "目录请求失败：" .. tostring(toc_err or "未知错误") end
     if #toc == 0 then return nil, "目录为空" end
@@ -728,6 +755,7 @@ function BookService:ensureToc(book, progress_callback)
     -- transport's own 8 MiB limit.
     saveInlineResponse(book, source, info)
     local previous_chapters = book.chapters or {}
+    book.toc_node_count, book.toc_list_signature = info.toc_node_count, info.toc_list_signature
     book.chapters = mergeChapterState(previous_chapters, toc)
     markTocSuccess(book, previous_chapters, toc)
     book.chapter_count = #book.chapters
@@ -738,7 +766,7 @@ function BookService:ensureToc(book, progress_callback)
     clearInlineResponseFields(book)
     if info ~= book then clearInlineResponseFields(info) end
     book.updated_at = os.time()
-    report(2, "保存目录")
+    report(80, "保存目录")
     local runtime_ok = Storage:saveSourceRuntime(source)
     if runtime_ok == true then book.candidate_source_runtime = nil end
     Storage:saveBook(book, { save_progress = false, skip_summary = not Storage:isInLibrary(book.id) })
@@ -762,9 +790,11 @@ local function candidateTocFallbackAllowed(err)
     return code == 400 or code == 404 or code == 405
 end
 
-resolveCandidateInfo = function(source, result)
+resolveCandidateInfo = function(source, result, options)
+    options = options or {}
     local info, info_err = LegadoSource:getBookInfo(source, result, {
         cache_read = true, cache_write = false, save_runtime = false,
+        on_progress = options.on_progress,
     })
     if info then return info end
 
@@ -788,7 +818,7 @@ resolveCandidateInfo = function(source, result)
 end
 
 function BookService:prepareSearchResult(result, progress_callback)
-    local function report(value, text) if progress_callback then progress_callback(value, text) end end
+    local function report(value, text) if progress_callback then progress_callback(value, text, 100) end end
     local source = sourceForCandidate(result)
     if not source then return nil, "书源不存在" end
     applyCandidateRuntime(source, result)
@@ -796,21 +826,21 @@ function BookService:prepareSearchResult(result, progress_callback)
     -- preparation, following the validated search-detail-TOC path. The removed direct-TOC
     -- fast path confused candidate provenance with resolved book metadata and
     -- was the shared regression behind normal search-open and source switching.
-    report(0, "获取书籍详情")
-    local info, info_err = resolveCandidateInfo(source, result)
+    report(5, "获取书籍详情")
+    local info, info_err = resolveCandidateInfo(source, result, {
+        on_progress = rangedProgress(progress_callback, 5, 15, "获取书籍详情"),
+    })
     if not info then return nil, info_err end
-    if tostring(info.title or "") ~= "" and not BookIdentity:sameTitle(result.title, info.title) then
-        Storage:releaseSourceSettings()
-        return nil, "书源详情页返回了另一部书，已阻止错误结果"
-    end
+    local identity_warning = detailIdentityWarning(result, info)
     info.detail_resolved = true
-    report(1, "获取章节目录")
+    report(25, "获取章节目录")
     local toc, toc_err = LegadoSource:getToc(source, info, {
         cache_read = true, cache_write = false, save_runtime = false,
+        on_progress = rangedProgress(progress_callback, 25, 50, "获取章节目录"),
     })
     if not toc then return nil, "目录请求失败：" .. tostring(toc_err or "未知错误") end
     if #toc == 0 then return nil, "目录为空" end
-    report(2, "保存试读信息")
+    report(80, "保存试读信息")
 
     local resolved_book_url = info.book_url or result.book_url
     local book_id = "net-" .. Util.hashId(source.id .. "\n" .. tostring(resolved_book_url))
@@ -822,7 +852,7 @@ function BookService:prepareSearchResult(result, progress_callback)
             and #(existing.chapters or {}) > 0 then
         existing.in_library = in_library
         existing.not_shelf = not in_library
-        report(3, "沿用已选择的内容源")
+        report(95, "沿用已选择的内容源")
         return existing
     end
     local position = existing and existing.position or { chapter = 1, paragraph = 1, char = 1 }
@@ -863,6 +893,7 @@ function BookService:prepareSearchResult(result, progress_callback)
         last_read_at = existing and existing.last_read_at or 0,
         position = position,
         chapters = mergeChapterState(previous_chapters, toc),
+        toc_node_count = info.toc_node_count, toc_list_signature = info.toc_list_signature,
         _toc_dirty = true,
         content_source_profiles = existing and existing.content_source_profiles or {},
         in_library = in_library,
@@ -873,8 +904,8 @@ function BookService:prepareSearchResult(result, progress_callback)
     Storage:saveBook(book)
     clearInlineResponseFields(info)
     pcall(Storage.saveSourceRuntime, Storage, source)
-    report(3, "试读信息已准备")
-    return book
+    report(95, "试读信息已准备")
+    return book, nil, identity_warning
 end
 
 -- Backward-compatible name used by older callers.
@@ -917,6 +948,8 @@ function BookService:currentContentCandidate(book)
         source_id = book.source_id, source_name = book.source_name,
         book_url = book.book_url, toc_url = book.toc_url,
         cover = book.content_cover or book.cover, variables = book.variables,
+        _source_record = book.source_record,
+        _source_runtime = book.candidate_source_runtime,
         is_current_content = true,
     }
 end
@@ -931,6 +964,8 @@ function BookService:currentCoverCandidate(book)
         source_name = book.cover_source_name or book.source_name,
         book_url = book.cover_book_url or book.book_url,
         cover = cover, variables = book.cover_variables or book.variables,
+        _source_record = book.cover_source_record or book.source_record,
+        _source_runtime = not book.cover_source_id and book.candidate_source_runtime or nil,
         is_current_cover = true,
     }
 end
@@ -993,13 +1028,12 @@ function BookService:resolveCoverCandidates(book, results, progress_callback)
             local source = sourceForCandidate(candidate)
             if source then
                 local info, err = LegadoSource:getBookInfo(source, candidate)
-                if info and sameBookIdentity(book, info) then
+                if info then
                     info.source_id = source.id
                     info.source_name = source.name
                     info.author_mismatch = BookIdentity:authorDiffers(book.author, info.author)
+                    info.title_mismatch = not sameBookIdentity(book, info)
                     candidate = info
-                elseif info then
-                    errors[#errors + 1] = tostring(source.name) .. ": 详情页书名与当前书籍不一致"
                 elseif err then
                     errors[#errors + 1] = tostring(source.name) .. ": " .. tostring(err)
                 end
@@ -1066,24 +1100,23 @@ function BookService:switchContentSource(book, result, progress_callback, option
     -- Switching sources consumes the same unresolved search-candidate type as
     -- normal opening. Resolve it through ruleBookInfo first; never commit or
     -- preflight a candidate tocUrl directly.
-    if progress_callback then progress_callback(0, "获取目标书源详情") end
-    local info, info_err, detail_warning = resolveCandidateInfo(source, result)
+    local function phaseProgress(first, span, fallback)
+        return rangedProgress(progress_callback, first, span, fallback)
+    end
+    if progress_callback then progress_callback(5, "获取目标书源详情", 100) end
+    local info, info_err, detail_warning = resolveCandidateInfo(source, result, {
+        on_progress = phaseProgress(5, 15, "获取目标书源详情"),
+    })
     if not info then return fail(info_err) end
     info.detail_resolved = true
 
-    local identity_warning = detail_warning
-    if not sameBookIdentity(book, info) then
-        return fail("目标源返回的书名与当前书籍不一致")
-    end
-    if BookIdentity:authorDiffers(book.author, info.author) then
-        local author_warning = "提示：目标源的作者标注与当前记录不同；书名一致，已允许换源。"
-        identity_warning = identity_warning and (identity_warning .. "\n" .. author_warning) or author_warning
-    end
-    if progress_callback then progress_callback(1, "读取目标目录") end
+    local identity_warning = detailIdentityWarning(book, info) or detail_warning
+    if progress_callback then progress_callback(25, "读取目标目录", 100) end
     local toc, toc_err = LegadoSource:getToc(source, info, {
         cache_read = true,
         cache_write = false,
         save_runtime = false,
+        on_progress = phaseProgress(25, 50, "读取目标目录"),
     })
     if not toc or #toc == 0 then
         return fail("目录请求失败：" .. tostring(toc_err or "目标目录为空"))
@@ -1139,6 +1172,7 @@ function BookService:switchContentSource(book, result, progress_callback, option
     -- because the target source has no cover rule or returned an empty value.
     -- The persisted local cover_path remains authoritative when present; this
     -- fallback also keeps remote-cover reload available for trial books.
+    candidate.toc_node_count, candidate.toc_list_signature = info.toc_node_count, info.toc_list_signature
     candidate.content_cover = boundedCover(info.cover)
         or boundedCover(result.cover)
         or boundedCover(book.content_cover) or boundedCover(book.cover)
@@ -1155,7 +1189,7 @@ function BookService:switchContentSource(book, result, progress_callback, option
     local target_file_rollback
     if options.prepare_chapter == true then
         local inline_response_consumed = false
-        if progress_callback then progress_callback(2, "验证目标源当前章节") end
+        if progress_callback then progress_callback(80, "验证目标源当前章节", 100) end
         local current = new_chapters[new_index]
         if not current then return fail("目标目录没有可读取章节") end
         local exists, path = chapterOnDisk(candidate, new_index)
@@ -1169,7 +1203,9 @@ function BookService:switchContentSource(book, result, progress_callback, option
         else
             target_file_rollback = { path = path, existed = false }
         end
-        local content, content_err, consumed = LegadoSource:getContent(source, candidate, current)
+        local content, content_err, consumed = LegadoSource:getContent(source, candidate, current, {
+            on_progress = phaseProgress(80, 15, "验证目标源当前章节"),
+        })
         if not content then
             return fail("目标源当前章节读取失败：" .. tostring(content_err or "未知错误"))
         end
@@ -1228,6 +1264,8 @@ function BookService:switchContentSource(book, result, progress_callback, option
         book.detail_resolved = true
         book.variables = candidate.variables
         book._search_base_url = candidate._search_base_url
+        book.toc_node_count, book.toc_list_signature = candidate.toc_node_count, candidate.toc_list_signature
+        book.toc_pending, book.toc_pending_added = nil, nil
         book.content_cover = candidate.content_cover
         book.cover = candidate.cover
         book.chapters = candidate.chapters
@@ -1277,8 +1315,8 @@ function BookService:switchContentSource(book, result, progress_callback, option
     end
     Storage:releaseSourceSettings()
     if progress_callback then
-        progress_callback(options.prepare_chapter == true and 3 or 2,
-            options.prepare_chapter == true and "内容源与当前章节已切换" or "内容源已切换")
+        progress_callback(95,
+            options.prepare_chapter == true and "内容源与当前章节已切换" or "内容源已切换", 100)
     end
     return book, nil, identity_warning
 end
@@ -1311,7 +1349,40 @@ function BookService:setCoverFromSearchResult(book, result, source_override)
     end, source_override)
 end
 
-function BookService:refreshToc(book)
+function BookService:checkToc(book, progress_callback)
+    if not book.toc_node_count or not book.toc_list_signature then
+        if #(book.chapters or {}) == 0 then book.chapters = Storage:loadBookToc(book.id) or {} end
+        return self:refreshToc(book, progress_callback)
+    end
+    local source = sourceForBook(self, book)
+    if not source then return nil, "书源不存在" end
+    local probe, err = LegadoSource:getToc(source, book, {
+        check_only=true, prepare_update=true, cache_read=false, cache_write=false, run_per_js=true,
+        existing_chapters=function()
+            if #(book.chapters or {}) == 0 then book.chapters = Storage:loadBookToc(book.id) or {} end
+            return book.chapters
+        end,
+        on_progress=rangedProgress(progress_callback, 10, 75, "检查目录变化"),
+    })
+    if not probe then persistTocFailure(book, err); return nil, err end
+    if probe.chapters then
+        -- The check already fetched and parsed this exact remote catalogue.
+        -- Commit it once here; opening the book now consumes the local TOC.
+        if #(book.chapters or {}) == 0 then book.chapters = Storage:loadBookToc(book.id) or {} end
+        return self:refreshToc(book, progress_callback, probe)
+    end
+    local changed = probe.count ~= book.toc_node_count or probe.signature ~= book.toc_list_signature
+    local added = changed and math.max(0, probe.count - book.toc_node_count) or 0
+    book.toc_update_count = math.max(0, (book.toc_update_count or 0) - (book.toc_pending_added or 0)) + added
+    book.toc_pending, book.toc_pending_added = changed or nil, added
+    book.toc_checked_at, book.toc_check_attempted_at = os.time(), os.time()
+    book.toc_check_status, book.toc_check_error = "ok", nil
+    local saved, save_err = Storage:saveBook(book, {save_toc=false, save_progress=false})
+    if not saved then return nil, tostring(save_err or "检查结果保存失败") end
+    return book, nil, {new_count=added, changed=changed, checked_at=book.toc_checked_at}
+end
+
+function BookService:refreshToc(book, progress_callback, prepared)
     if not book.source_id then
         persistTocFailure(book, "本地书籍没有远程目录")
         return nil, "本地书籍没有远程目录"
@@ -1329,9 +1400,26 @@ function BookService:refreshToc(book)
     -- WebBook.getChapterListAwait(..., runPerJs = true).  Keep the lower
     -- parser opt-in explicit, but do not omit the production preUpdateJs hook
     -- from this foreground refresh path.
-    local new_chapters, err = LegadoSource:getToc(source, book, {
+    local old_state = {}
+    for _, key in ipairs({"toc_node_count", "toc_list_signature", "toc_pending", "toc_pending_added",
+        "toc_update_count", "toc_checked_at", "toc_check_attempted_at", "toc_check_status",
+        "toc_check_error", "toc_last_new_count", "toc_update_latest_title", "updated_at"}) do
+        if book[key] == nil then old_state[key] = false else old_state[key] = book[key] end
+    end
+    local old_toc_bytes = type(Storage.getBookTocPath) == "function"
+        and Util.readFile(Storage:getBookTocPath(book.id), true) or nil
+    local new_chapters, err
+    if prepared then
+        new_chapters = prepared.chapters
+        book.toc_node_count, book.toc_list_signature = prepared.count, prepared.signature
+    else
+    new_chapters, err = LegadoSource:getToc(source, book, {
+        cache_read = false, cache_write = false, reuse_inline_response = false,
+        force_toc_parse = true,
         run_per_js = true,
+        on_progress = rangedProgress(progress_callback, 10, 75, "刷新章节目录"),
     })
+    end
     if not new_chapters then
         persistTocFailure(book, err)
         return nil, err
@@ -1348,6 +1436,8 @@ function BookService:refreshToc(book)
         old_position_id = book.chapters[book.position.chapter].id
     end
     book.chapters = mergeChapterState(old_chapters, new_chapters)
+    book.toc_update_count = math.max(0, (book.toc_update_count or 0) - (book.toc_pending_added or 0))
+    book.toc_pending, book.toc_pending_added = nil, nil
     local new_count, latest_title = markTocSuccess(book, old_chapters, new_chapters)
     book._toc_dirty = true
     book.updated_at = os.time()
@@ -1375,7 +1465,7 @@ function BookService:refreshToc(book)
         book.chapter_count = #old_chapters
         book.toc_ready = #old_chapters > 0
         book.position = old_position
-        for key, value in pairs(old_state) do book[key] = value end
+        for key, value in pairs(old_state) do book[key] = value ~= false and value or nil end
         if old_toc_bytes and type(Storage.getBookTocPath) == "function" then
             pcall(Util.writeFile, Storage:getBookTocPath(book.id), old_toc_bytes, true)
         end
@@ -1386,6 +1476,7 @@ function BookService:refreshToc(book)
         new_count = new_count,
         latest_title = latest_title,
         checked_at = book.toc_checked_at,
+        changed = prepared ~= nil and true or nil,
     }
 end
 
@@ -1408,7 +1499,9 @@ function BookService:ensureChapter(book, chapter_index, options)
     local source = sourceForBook(self, book)
     if not source then return nil, "书源不存在" end
     hydrateInlineResponse(book)
-    local content, err, inline_response_consumed = LegadoSource:getContent(source, book, chapter)
+    local content, err, inline_response_consumed = LegadoSource:getContent(source, book, chapter, {
+        on_progress = options.on_progress,
+    })
     if not content then return nil, err end
     local ok, save_err = Storage:saveChapter(book, chapter_index, content, {
         persist_metadata = false,
@@ -1432,16 +1525,20 @@ end
 -- subprocess downloads/writes the chapter, but deliberately does not build the
 -- paragraph/page model; that keeps the pipe tiny and avoids duplicating a large
 -- Lua model in both parent and child.
-function BookService:prepareReading(book, chapter_index)
+function BookService:prepareReading(book, chapter_index, progress_callback)
     if not book then return nil, "book required" end
-    local ready_book, toc_err = self:ensureToc(book)
+    if progress_callback then progress_callback(2, "检查书籍详情与目录", 100) end
+    local ready_book, toc_err = self:ensureToc(book, progress_callback)
     if not ready_book then return nil, toc_err end
     book = ready_book
     local count = #(book.chapters or {})
     if count == 0 then return nil, "目录为空" end
     chapter_index = math.max(1, math.min(count, tonumber(chapter_index
         or (book.position and book.position.chapter) or 1) or 1))
-    local content, err = self:ensureChapter(book, chapter_index)
+    if progress_callback then progress_callback(82, "准备当前章节", 100) end
+    local content, err = self:ensureChapter(book, chapter_index, {
+        on_progress = rangedProgress(progress_callback, 82, 13, "准备当前章节"),
+    })
     if not content then return nil, err end
     local chapter = book.chapters[chapter_index]
     local previous = Util.positionCopy(book.position)
@@ -1461,7 +1558,10 @@ function BookService:prepareReading(book, chapter_index)
     }
     -- Entering the reader only prepares memory. The reader persists the
     -- position once when its page is closed, avoiding flash writes here.
-    return book
+    if progress_callback then progress_callback(95, "当前章节已准备", 100) end
+    local warning = book._identity_warning
+    book._identity_warning = nil
+    return book, nil, warning
 end
 
 local function buildChapterModel(service, book, chapter_index, content)

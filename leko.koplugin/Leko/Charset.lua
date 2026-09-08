@@ -93,6 +93,10 @@ local function utf8Codes(text)
             if not b or b < 0x80 or b > 0xBF then return start, nil, "invalid UTF-8" end
             code = code * 0x40 + (b - 0x80); index = index + 1
         end
+        if (needed == 2 and code < 0x800) or (needed == 3 and code < 0x10000)
+                or code > 0x10FFFF or (code >= 0xD800 and code <= 0xDFFF) then
+            return start, nil, "invalid UTF-8"
+        end
         return start, code
     end
 end
@@ -123,23 +127,28 @@ local function gb18030Codepoint(b1, b2, b3, b4)
     return nil
 end
 
-local function decodeLegacyCn(value, charset)
+local function decodeLegacyCn(value, charset, replacement)
     if not loadLegacyCnData() then return nil, "legacy Chinese mapping unavailable" end
     local out, index = {}, 1
     while index <= #value do
         local b1 = value:byte(index)
         if b1 < 0x80 then out[#out + 1] = string.char(b1); index = index + 1
+        elseif replacement and b1 == 0x80 then
+            out[#out + 1] = utf8Char(0x20AC); index = index + 1
         else
             local b2 = value:byte(index + 1)
             if charset == "GB18030" and b2 and b2 >= 0x30 and b2 <= 0x39 then
                 local b3, b4 = value:byte(index + 2), value:byte(index + 3)
                 local cp = b3 and b4 and gb18030Codepoint(b1, b2, b3, b4)
-                if not cp then return nil, "invalid GB18030 sequence at byte " .. tostring(index) end
-                out[#out + 1] = utf8Char(cp); index = index + 4
+                if not cp and not replacement then return nil, "invalid GB18030 sequence at byte " .. tostring(index) end
+                out[#out + 1] = utf8Char(cp or 0xFFFD)
+                index = index + (cp and 4 or 1)
             else
                 local cp = b2 and gbkCodepoint(b1, b2)
-                if not cp then return nil, "invalid " .. tostring(charset) .. " sequence at byte " .. tostring(index) end
-                out[#out + 1] = utf8Char(cp); index = index + 2
+                if not cp and not replacement then return nil, "invalid " .. tostring(charset) .. " sequence at byte " .. tostring(index) end
+                out[#out + 1] = utf8Char(cp or 0xFFFD)
+                -- Reconsume ASCII syntax after an invalid lead byte.
+                index = index + (cp and 2 or (b2 and b2 >= 0x80 and 2 or 1))
             end
         end
     end
@@ -305,6 +314,22 @@ function Charset:decode(value, charset)
         return tostring(value or ""):gsub("^\239\187\191", "")
     end
     return self:convert(value, charset, "UTF-8")
+end
+
+-- Web responses use replacement decoding; explicit rule conversions stay strict.
+function Charset:decodeResponse(value, charset)
+    local normalized = self:normalize(charset)
+    if not legacy_cn_candidates[normalized] then return self:decode(value, charset) end
+    value = tostring(value or "")
+    local decoded = self:decode(value, charset)
+    if decoded then return decoded end
+    -- A mislabeled UTF-8 response must not be turned into damaged GB text.
+    local valid = true
+    for _, cp, utf8_err in utf8Codes(value) do
+        if utf8_err or not cp or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then valid = false; break end
+    end
+    if valid then return self:decode(value, "UTF-8") end
+    return decodeLegacyCn(value, "GB18030", true)
 end
 
 function Charset:encode(value, charset)

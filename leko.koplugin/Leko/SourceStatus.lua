@@ -22,7 +22,6 @@ function SourceStatus:friendlyReason(reason)
         return "需要浏览器交互，Kindle 上暂时无法完成"
     end
     if text:find("登录", 1, true) then return "包含可选的登录功能" end
-    if lower:find("rsa", 1, true) then return "需要当前版本尚未提供的加密功能" end
     if text:find("构造器", 1, true) or lower:find("java.", 1, true) then
         return "需要当前版本尚未提供的 JavaScript 功能"
     end

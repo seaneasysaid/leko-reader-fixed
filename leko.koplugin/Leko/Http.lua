@@ -44,8 +44,12 @@ local function normalizeUrl(value)
     value = tostring(value or "")
     local parsed = socket_url.parse(value)
     if parsed then
-        if parsed.path then parsed.path = koreader_util.urlEncode(parsed.path, "/%%") end
-        if parsed.query then parsed.query = koreader_util.urlEncode(parsed.query, "=&%%+;,:@/?") end
+        -- A received URL is already structured, often signed by a CDN. Keep
+        -- RFC 3986 pchar/sub-delims intact: rewriting ':' in a template path
+        -- as '%3A' can invalidate its signature even though the text endpoint
+        -- accepts the same extra escaping. Still encode spaces and UTF-8.
+        if parsed.path then parsed.path = koreader_util.urlEncode(parsed.path, "/%%:@!$&'()*+,;=") end
+        if parsed.query then parsed.query = koreader_util.urlEncode(parsed.query, "=&%%+;,:@/?!$'()*") end
         value = socket_url.build(parsed)
     end
     return value

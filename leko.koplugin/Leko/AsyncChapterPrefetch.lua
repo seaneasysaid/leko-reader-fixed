@@ -11,7 +11,8 @@ local SubprocessPayload = require("Leko/SubprocessPayload")
 local AsyncChapterPrefetch = {
     poll_interval = 0.18,
     reap_interval = 0.25,
-    hard_timeout = 24,
+    hard_timeout = 45, -- inactivity, matching foreground chapter requests
+    max_timeout = 5 * 60,
     process_priority = 10,
     result_payload_limit = 1024 * 1024,
 }
@@ -51,6 +52,10 @@ end
 
 
 local function releaseBudget(worker)
+    if worker and worker.activity_path then
+        os.remove(worker.activity_path)
+        os.remove(worker.activity_path .. ".new")
+    end
     if worker and worker.budget_ticket then
         ProcessBudget:release(worker.budget_ticket)
         worker.budget_ticket = nil
@@ -112,7 +117,17 @@ function AsyncChapterPrefetch:_poll(worker)
         self:_finish(worker)
         return
     end
-    if socket.gettime() - worker.started_at >= worker.timeout_seconds then
+    local activity = worker.activity_path and io.open(worker.activity_path, "rb")
+    if activity then
+        local value = tonumber(activity:read("*a"))
+        activity:close()
+        if value and value > (worker.last_activity_at or worker.started_at) then
+            worker.last_activity_at = math.min(value, socket.gettime())
+        end
+    end
+    local now = socket.gettime()
+    if now - (worker.last_activity_at or worker.started_at) >= worker.timeout_seconds
+            or now - worker.started_at >= worker.max_timeout_seconds then
         worker.finished = true
         ffiutil.terminateSubProcess(worker.pid)
         local function reap()
@@ -122,7 +137,7 @@ function AsyncChapterPrefetch:_poll(worker)
                 removeArtifacts(worker)
                 if not worker.cancelled then
                     dispatchCallback(worker, false,
-                        "后台下载相邻章节超时（" .. tostring(worker.timeout_seconds) .. "秒）",
+                        "后台章节下载超时（连续无进展或达到总时限）",
                         { timed_out = true })
                 end
             else
@@ -153,6 +168,7 @@ function AsyncChapterPrefetch:start(job, callback)
         finished = false,
         pending = true,
         timeout_seconds = math.max(8, tonumber(job.timeout_seconds or self.hard_timeout) or self.hard_timeout),
+        max_timeout_seconds = math.max(8, tonumber(job.max_timeout_seconds) or self.max_timeout),
     }
 
     local function spawn(budget_ticket)
@@ -165,6 +181,7 @@ function AsyncChapterPrefetch:start(job, callback)
         end
         local result_payload_path = SubprocessPayload:newPath("chapter-prefetch-" .. tostring(book.id or ""),
             tostring(final_path):match("^(.*)/[^/]+$") or "/tmp")
+        worker.activity_path = result_payload_path .. ".activity"
         local pid, result_fd_or_err = ffiutil.runInSubProcess(function(child_pid, write_fd)
         local temp_path = final_path .. ".prefetch-" .. tostring(child_pid)
         local result = {
@@ -172,7 +189,19 @@ function AsyncChapterPrefetch:start(job, callback)
             chapter_index = chapter_index,
         }
         local ok, err = xpcall(function()
-            local content, fetch_err = LegadoSource:getContent(source, book, chapter)
+            local last_written = 0
+            local content, fetch_err = LegadoSource:getContent(source, book, chapter, {
+                on_progress = function()
+                    local now = socket.gettime()
+                    if now - last_written < 0.5 then return end
+                    local file = io.open(worker.activity_path .. ".new", "wb")
+                    if not file then return end
+                    file:write(string.format("%.6f", now)); file:close()
+                    os.remove(worker.activity_path)
+                    os.rename(worker.activity_path .. ".new", worker.activity_path)
+                    last_written = now
+                end,
+            })
             if not content then
                 result.error = tostring(fetch_err or "正文下载失败")
                 return
@@ -205,6 +234,7 @@ function AsyncChapterPrefetch:start(job, callback)
         worker.result_fd = result_fd_or_err
         worker.result_payload_path = result_payload_path
         worker.started_at = socket.gettime()
+        worker.last_activity_at = worker.started_at
         UIManager:scheduleIn(self.poll_interval, function() self:_poll(worker) end)
     end
 

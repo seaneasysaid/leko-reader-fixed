@@ -193,10 +193,18 @@ local function sourceRuntimePayload(source)
     return {
         cookies = type(source.cookies) == "table" and source.cookies or {},
         variables = type(source.variables) == "table" and source.variables or {},
+        -- loginUi fields are runtime state: a configured aggregate source must
+        -- continue to work after its source record is reloaded or KOReader is
+        -- restarted, without putting credentials in the source catalogue.
+        login_info = type(source.login_info) == "table" and source.login_info or {},
         -- Legado JS may call source.putLoginHeader() during search and consume
         -- it in ruleBookInfo/ruleToc. It is runtime state just like Cookie and
         -- source variables, so subprocess boundaries must preserve it.
         login_header = source.login_header,
+        -- Compact, non-sensitive loginUi capability verdicts.  The signature
+        -- includes the source definitions and host capability version.
+        action_capability_cache = type(source.action_capability_cache) == "table"
+            and source.action_capability_cache or nil,
     }
 end
 
@@ -674,6 +682,17 @@ function Storage:listSourceSummaries()
         if resolved then result[#result + 1] = resolved end
     end
     return sortSourceSummaries(result)
+end
+
+function Storage:getSourceCatalogRevision()
+    if not self._source_catalog_cache then
+        local summaries = self:listSourceSummaries()
+        if not summaries then return nil end
+    end
+    local catalog = self._source_catalog_cache or {}
+    return table.concat({ tostring(catalog.records_file or ""),
+        tostring(catalog.source_compatibility_version or ""),
+        tostring(catalog.builtin_sources_version or "") }, ":")
 end
 
 
@@ -1736,7 +1755,11 @@ function Storage:hydrateSourceRuntime(source)
     local runtime = LuaSettings:open(path).data or {}
     if type(runtime.cookies) == "table" then source.cookies = runtime.cookies end
     if type(runtime.variables) == "table" then source.variables = runtime.variables end
+    if type(runtime.login_info) == "table" then source.login_info = runtime.login_info end
     if runtime.login_header ~= nil then source.login_header = runtime.login_header end
+    if type(runtime.action_capability_cache) == "table" then
+        source.action_capability_cache = runtime.action_capability_cache
+    end
     local payload = sourceRuntimePayload(source)
     self._runtime_source_signatures[tostring(source.id)] = stableStateSignature(payload)
     return source

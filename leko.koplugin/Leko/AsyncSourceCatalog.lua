@@ -14,6 +14,11 @@ local AsyncSourceCatalog = {
     budget_ticket = nil,
     process_priority = 35,
     pipe_payload_limit = 4 * 1024,
+    -- A cancelled child still owns its process ticket until the kernel reports
+    -- it dead.  The slower retry cadence is diagnostic/backoff only: reaping
+    -- remains armed, so a stuck child can never be mistaken for a free slot.
+    reap_diagnostic_every = 12,
+    reap_stalled_delay = 1.0,
     tickets = {},
 }
 
@@ -78,27 +83,46 @@ function AsyncSourceCatalog:_finish(worker)
     end
 end
 
-function AsyncSourceCatalog:_timeout(worker)
-    if self.worker ~= worker or worker.finished then return end
-    worker.finished = true
-    self.worker = nil
-    safeTerminate(worker.pid)
-    self:_notify(false, "准备书源列表超时")
+function AsyncSourceCatalog:_reap(worker, on_dead)
+    if not worker or worker.reaping then return end
+    worker.reaping = true
+    worker.reap_attempts = 0
     local function reap()
-        if ffiutil.isSubProcessDone(worker.pid) then
-            closeResultPipe(worker)
-            if worker.budget_ticket then ProcessBudget:release(worker.budget_ticket); worker.budget_ticket = nil end
-            self.budget_ticket = nil
-            self:_restartAfterReap()
-        else
-            UIManager:scheduleIn(self.reap_interval, reap)
+        local done = false
+        local ok, value = pcall(ffiutil.isSubProcessDone, worker.pid)
+        if ok then done = value == true end
+        if done then
+            worker.reaping = false
+            on_dead()
+            return
         end
+        worker.reap_attempts = (worker.reap_attempts or 0) + 1
+        safeTerminate(worker.pid)
+        local delay = self.reap_interval
+        if worker.reap_attempts >= (self.reap_diagnostic_every or 12) then
+            worker.reap_attempts = 0
+            delay = self.reap_stalled_delay or 1.0
+        end
+        UIManager:scheduleIn(delay, reap)
     end
     UIManager:scheduleIn(self.reap_interval, reap)
 end
 
-function AsyncSourceCatalog:_poll(worker)
+function AsyncSourceCatalog:_timeout(worker)
     if self.worker ~= worker or worker.finished then return end
+    safeTerminate(worker.pid)
+    self:_reap(worker, function()
+        worker.finished = true
+        self.worker = nil
+        closeResultPipe(worker)
+        if worker.budget_ticket then ProcessBudget:release(worker.budget_ticket); worker.budget_ticket = nil end
+        self.budget_ticket = nil
+        self:_notify(false, "准备书源列表超时")
+    end)
+end
+
+function AsyncSourceCatalog:_poll(worker)
+    if self.worker ~= worker or worker.finished or worker.reaping then return end
     if ffiutil.isSubProcessDone(worker.pid) then
         self:_finish(worker)
     elseif socket.gettime() - worker.started_at >= self.hard_timeout then
@@ -165,22 +189,15 @@ end
 function AsyncSourceCatalog:_preempt()
     local worker = self.worker
     if not worker or worker.finished then return end
-    worker.finished = true
-    self.worker = nil
     safeTerminate(worker.pid)
-    local function reap()
-        if ffiutil.isSubProcessDone(worker.pid) then
-            closeResultPipe(worker)
-            if worker.budget_ticket then ProcessBudget:release(worker.budget_ticket); worker.budget_ticket = nil end
-            self.budget_ticket = nil
-            -- Keep waiting callers. Rebuild later after the foreground task has
-            -- released the global process slot.
-            self:_restartAfterReap()
-        else
-            UIManager:scheduleIn(self.reap_interval, reap)
-        end
-    end
-    UIManager:scheduleIn(self.reap_interval, reap)
+    self:_reap(worker, function()
+        worker.finished = true
+        self.worker = nil
+        closeResultPipe(worker)
+        if worker.budget_ticket then ProcessBudget:release(worker.budget_ticket); worker.budget_ticket = nil end
+        self.budget_ticket = nil
+        self:_restartAfterReap()
+    end)
 end
 
 function AsyncSourceCatalog:_start()
@@ -234,21 +251,16 @@ function AsyncSourceCatalog:cancel(ticket)
     end
     if not self.worker then return end
     local worker = self.worker
-    self.worker = nil
-    worker.finished = true
     safeTerminate(worker.pid)
     self.tickets = {}
-    local function reap()
-        if ffiutil.isSubProcessDone(worker.pid) then
-            closeResultPipe(worker)
-            if worker.budget_ticket then ProcessBudget:release(worker.budget_ticket); worker.budget_ticket = nil end
-            self.budget_ticket = nil
-            self:_restartAfterReap()
-        else
-            UIManager:scheduleIn(self.reap_interval, reap)
-        end
-    end
-    UIManager:scheduleIn(self.reap_interval, reap)
+    self:_reap(worker, function()
+        worker.finished = true
+        self.worker = nil
+        closeResultPipe(worker)
+        if worker.budget_ticket then ProcessBudget:release(worker.budget_ticket); worker.budget_ticket = nil end
+        self.budget_ticket = nil
+        self:_restartAfterReap()
+    end)
 end
 
 return AsyncSourceCatalog

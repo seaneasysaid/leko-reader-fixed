@@ -327,10 +327,19 @@ function SourceView:init()
                 menu:updateItems()
                 UIManager:show(Notification:new{ text = source.name .. "：" .. label .. "；下次搜索生效" })
             end
+            -- The only configuration entry is deliberately on the source
+            -- long-press menu. Loading the full source here is a data read;
+            -- it does not scan, compile, or evaluate jsLib/loginUrl/actions.
+            local full_source = Storage:getSource(source.id) or source
             dialog = ButtonDialog:new{
                 modal = true,
                 title = source.name,
                 buttons = {
+                    {{ text = "配置书源", callback = function()
+                        UIManager:close(dialog)
+                        local SourceLoginView = require("Leko/SourceLoginView")
+                        SourceLoginView.open{ owner = menu, source = full_source }
+                    end }},
                     {{ text = "↑ 优先搜索", callback = function()
                         setPriority(SourcePreference.PRIORITY, "已设为优先搜索")
                     end }},

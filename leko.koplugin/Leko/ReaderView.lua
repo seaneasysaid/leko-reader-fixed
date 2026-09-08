@@ -2,6 +2,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local Event = require("ui/event")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
@@ -23,7 +24,9 @@ local Screen = Device.screen
 
 local BookService = require("Leko/BookService")
 local FontSelectionView = require("Leko/FontSelectionView")
+local KOReaderStatisticsBridge = require("Leko/KOReaderStatisticsBridge")
 local Paginator = require("Leko/Paginator")
+local ReaderMargins = require("Leko/ReaderMargins")
 local ReaderFooter = require("Leko/ReaderFooter")
 local Storage = require("Leko/Storage")
 local TocView = require("Leko/TocView")
@@ -139,6 +142,8 @@ function ReaderView:init()
     if not page then page = self:errorPage(position, err) end
     self:consumeFontFallbackNotice()
     self:setPage(page, "full")
+    self.statistics_bridge = KOReaderStatisticsBridge:new{}
+    self.statistics_bridge:start(self.book, self:_statisticsVirtualPage())
     if self._swipe_refresh_load_error then
         local message = "动画效果模块加载失败，已回退普通刷新。请完全退出并重新打开 KOReader 后，重新复制完整的 leko.koplugin 文件夹。"
         logger.warn("Leko transition coordinator disabled:", self._swipe_refresh_load_error)
@@ -152,6 +157,80 @@ function ReaderView:init()
             UIManager:show(Notification:new{ text = message })
         end
     end
+end
+
+local function clamp01(value)
+    return math.max(0, math.min(1, tonumber(value) or 0))
+end
+
+function ReaderView:_progressMetrics(use_page_end)
+    if not self.page or not self.book then return nil end
+    local chapter_index = math.max(1, tonumber(self.page.chapter_index) or 1)
+    local chapter_count = #(self.book.chapters or {})
+    local model = self.page.chapter_model or BookService:loadChapterModel(self.book, chapter_index)
+    local position = use_page_end and (self.page.next_position or self.page.start_position) or self.page.start_position
+    local chapter_progress = model and ReaderFooter:percentage(model, position, chapter_index,
+        self.page.at_end and use_page_end) or 0
+    chapter_progress = clamp01(chapter_progress)
+    return {
+        chapter_index = chapter_index, chapter_count = chapter_count, model = model,
+        chapter_progress = chapter_progress,
+        book_progress = chapter_count > 0 and clamp01(((chapter_index - 1) + chapter_progress) / chapter_count) or 0,
+    }
+end
+
+function ReaderView:_statisticsVirtualPage()
+    local metrics = self:_progressMetrics(false)
+    if not metrics then return 1 end
+    local count = KOReaderStatisticsBridge.VIRTUAL_PAGE_COUNT
+    return math.max(1, math.min(count, math.floor(metrics.book_progress * (count - 1)) + 1))
+end
+
+function ReaderView:_chapterPageMetrics()
+    if not self.page or not self.book then return nil, nil end
+    local chapter = tonumber(self.page.chapter_index) or 1
+    local cache = self._public_page_metrics
+    local signature = tostring(chapter) .. "\0" .. tostring(self.style and self.style.body_font_size or "")
+        .. "\0" .. tostring(self.style and self.style.line_spacing or "")
+    if not cache or cache.signature ~= signature then
+        cache = { signature = signature, starts = {}, total = 0 }
+        local position, safety = { chapter = chapter, paragraph = 1, char = 1 }, 0
+        while safety < 20000 do
+            safety = safety + 1
+            local generated = Paginator:makePage(self.book, position, self.style)
+            if not generated then break end
+            local start = generated.start_position or {}
+            local key = table.concat({ tostring(start.chapter or 1), tostring(start.paragraph or 1), tostring(start.char or 1) }, ":")
+            cache.total = cache.total + 1
+            cache.starts[key] = cache.total
+            local next_position = generated.next_position
+            if generated.at_end or not next_position or tonumber(next_position.chapter) ~= chapter
+                    or Util.positionEqual(next_position, start) then break end
+            position = next_position
+        end
+        self._public_page_metrics = cache
+    end
+    local current = self.page.start_position or {}
+    local key = table.concat({ tostring(current.chapter or 1), tostring(current.paragraph or 1), tostring(current.char or 1) }, ":")
+    return cache.starts[key], cache.total > 0 and cache.total or nil
+end
+
+function ReaderView:getCurrentReadingContext()
+    local metrics = self:_progressMetrics(true)
+    if self._closing or not metrics or not self.book or not self.page then return { api_version = 1, active = false } end
+    local chapter = self.book.chapters and self.book.chapters[metrics.chapter_index]
+    local chapter_page, chapter_pages = self:_chapterPageMetrics()
+    local cover_path = tostring(self.book.cover_path or "")
+    if cover_path == "" then cover_path = nil end
+    return {
+        api_version = 1, active = true, book_id = tostring(self.book.id),
+        title = tostring(self.book.title or ""), author = tostring(self.book.author or ""),
+        cover_path = cover_path, chapter_title = tostring((chapter and chapter.title) or self.page.chapter_title or ""),
+        chapter_index = metrics.chapter_index, chapter_count = metrics.chapter_count,
+        chapter_page = chapter_page, chapter_pages = chapter_pages,
+        chapter_progress = metrics.chapter_progress, book_progress = metrics.book_progress,
+        statistics_id = self.statistics_bridge and self.statistics_bridge.statistics_id or nil,
+    }
 end
 
 function ReaderView:consumeFontFallbackNotice()
@@ -362,13 +441,27 @@ function ReaderView:buildReadingPage(page)
     table.insert(group, UI.vspace(geometry.body_top or geometry.top))
 
     if page.show_header then
-        table.insert(group, CenterContainer:new{
-            dimen = Geom:new{ w = geometry.screen_width, h = geometry.header_height },
-            TextWidget:new{
-                text = page.chapter_title or self.book.title,
-                face = geometry.chrome_face,
-                padding = 0,
-                max_width = geometry.content_width,
+        local status = os.date("%H:%M")
+        local status_widget = TextWidget:new{
+            text = status, face = geometry.chrome_face, padding = 0,
+        }
+        local status_width = status_widget:getSize().w
+        local gap = Screen:scaleBySize(10)
+        local title_width = math.max(1, geometry.content_width - status_width - gap)
+        table.insert(group, HorizontalGroup:new{
+            HorizontalSpan:new{ width = geometry.left },
+            LeftContainer:new{
+                dimen = Geom:new{ w = title_width, h = geometry.header_height },
+                TextWidget:new{
+                    text = page.chapter_title or self.book.title,
+                    face = geometry.chrome_face, padding = 0,
+                    max_width = title_width,
+                },
+            },
+            HorizontalSpan:new{ width = gap },
+            RightContainer:new{
+                dimen = Geom:new{ w = status_width, h = geometry.header_height },
+                status_widget,
             },
         })
     end
@@ -398,19 +491,23 @@ function ReaderView:buildReadingPage(page)
         elseif element.type == "gap" then
             table.insert(group, UI.vspace(element.height))
         elseif element.type == "line" then
+            -- v0.15.48's single-line drawing path: paint the fitted text once.
+            local body_widget = TextWidget:new{
+                text = element.text,
+                face = geometry.body_face,
+                padding = 0,
+                line_height = self.style.line_spacing or 0.28,
+                lang = "zh-CN",
+                bold = false,
+                alignment = "left",
+                alignment_strict = true,
+            }
             table.insert(group, HorizontalGroup:new{
                 align = "center",
                 HorizontalSpan:new{ width = geometry.left },
                 LeftContainer:new{
                     dimen = Geom:new{ w = geometry.content_width, h = element.height },
-                    TextWidget:new{
-                        text = element.text,
-                        face = geometry.body_face,
-                        padding = 0,
-                        line_height = self.style.line_spacing or 0.28,
-                        lang = "zh-CN",
-                        bold = false,
-                    },
+                    body_widget,
                 },
             })
         end
@@ -455,7 +552,7 @@ function ReaderView:buildMenuOverlay()
         { text = "目录", bold = true, callback = function() self:showToc() end },
         { text = "上一章", callback = function() self:jumpChapter(-1) end },
         { text = "下一章", callback = function() self:jumpChapter(1) end },
-        { text = "排版", callback = function() self:showLayoutMenu() end },
+        { text = "阅读设置", font_size = 16, callback = function() self:showLayoutMenu() end },
         { text = "刷新本章", font_size = 16, callback = function() self:reloadCurrentChapter() end },
     })
     local bottom = FrameContainer:new{
@@ -587,6 +684,7 @@ function ReaderView:setChapterCleanWaveEnabled(enabled)
 end
 
 function ReaderView:_nextPageGeneration()
+    self._pending_history = nil
     self.page_generation = (self.page_generation or 0) + 1
     return self.page_generation
 end
@@ -597,6 +695,15 @@ end
 
 function ReaderView:setPage(page, refresh_type, direction, generation)
     if generation and not self:isPageGenerationCurrent(generation) then return false end
+    local pending = self._pending_history
+    if pending and pending.generation == generation then
+        if pending.forward then
+            table.insert(self.history, pending.position)
+        elseif self.history[#self.history] == pending.position then
+            table.remove(self.history)
+        end
+        self._pending_history = nil
+    end
     local previous_chapter = self.page and self.page.chapter_index
     local chapter_changed = previous_chapter ~= nil and previous_chapter ~= page.chapter_index
     if not direction then self:_cancelSwipeRefresh() end
@@ -610,6 +717,7 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
     -- lets the footer show the existing unfinished cached/total state on the
     -- first paint of a page turn, instead of waiting for a later event.
     BookService:requestPrefetch(self.book, page.chapter_index, BookService.prefetch_window)
+    if self.statistics_bridge then self.statistics_bridge:onPageChanged(self:_statisticsVirtualPage()) end
     self:_syncPrefetchState()
     if direction and self:isSwipeAnimationEnabled() and self.swipe_refresh then
         self.menu_visible = false
@@ -754,13 +862,15 @@ function ReaderView:nextPage()
         end
         return true
     end
-    table.insert(self.history, Util.positionCopy(self.page.start_position))
     local generation = self:_nextPageGeneration()
+    self._pending_history = { generation = generation, forward = true,
+        position = Util.positionCopy(self.page.start_position) }
     self:loadPage(self.page.next_position, "partial", SwipeRefresh.FORWARD, generation)
     return true
 end
 
 function ReaderView:_showPreviousPage(target_position, refresh_type, generation)
+    if generation and not self:isPageGenerationCurrent(generation) then return false end
     local page, err = Paginator:findPreviousPage(self.book, target_position, self.style)
     if not page then return nil, tostring(err or "已经是第一页") end
     self.menu_visible = false
@@ -768,16 +878,17 @@ function ReaderView:_showPreviousPage(target_position, refresh_type, generation)
 end
 
 function ReaderView:previousPage()
-    local target = table.remove(self.history)
+    local target = self.history[#self.history]
     if target then
         local generation = self:_nextPageGeneration()
+        self._pending_history = { generation = generation, position = target }
         self:loadPage(target, "partial", SwipeRefresh.BACKWARD, generation)
         return true
     end
 
     local current = self.page.start_position
     local generation = self:_nextPageGeneration()
-    local crosses_chapter = current.paragraph == 1 and current.char == 1 and current.chapter > 1
+    local crosses_chapter = current.chapter > 1 and Paginator:isChapterStart(self.book, current)
     local previous_chapter = crosses_chapter and (current.chapter - 1) or nil
     if previous_chapter and not BookService:isChapterDownloaded(self.book, previous_chapter) then
         if type(self.onPrepareChapter) ~= "function" then
@@ -831,13 +942,22 @@ end
 function ReaderView:showToc()
     self:_settleSwipeRefresh()
     self.menu_visible = false
-    self:rebuild("ui")
+    self:onReadingPaused()
+    -- The full-screen TOC covers this page. Re-shaping the body here delays
+    -- the tap response and paints a page the user never needs to see.
     return UI.showLater(self, "toc", function()
         return TocView:new{
             book = self.book,
             current_chapter = self.page.chapter_index,
-            onChapterSelected = function(chapter_index) self:jumpToChapter(chapter_index) end,
-            on_return = function() self:_scheduleFooterRefresh(true) end,
+            onChapterSelected = function(chapter_index)
+                self:onReadingResumed()
+                self:jumpToChapter(chapter_index)
+            end,
+            on_return = function()
+                self:onReadingResumed()
+                self:rebuild("ui")
+                self:_scheduleFooterRefresh(true)
+            end,
         }
     end, "full")
 end
@@ -845,6 +965,7 @@ end
 function ReaderView:showBookInfo()
     self:_settleSwipeRefresh()
     self.menu_visible = false
+    self:onReadingPaused()
     self:rebuild("ui")
     return UI.defer(self, "book_info", function()
         if self.onShowBookInfo then self.onShowBookInfo(self.book, self) end
@@ -976,8 +1097,8 @@ end
 function ReaderView:makeLayoutMenuButtons()
     local line_values = { 0.12, 0.20, 0.28, 0.38, 0.50 }
     local line_labels = { "最窄", "窄", "中", "宽", "最宽" }
-    local margin_values = { 12, 20, 28, 36, 48 }
-    local margin_labels = { "最窄", "窄", "中", "宽", "最宽" }
+    local margin_values = ReaderMargins.values
+    local margin_labels = ReaderMargins.labels
     local paragraph_values = { 0, 6, 10, 16, 24 }
     local paragraph_labels = { "无", "0.25 行", "0.5 行", "0.75 行", "一行" }
     local font_values = { 18, 22, 27, 32, 38, 44 }
@@ -1016,7 +1137,7 @@ function ReaderView:makeLayoutMenuButtons()
         self:showFontSelection()
     end
 
-    return {
+    local buttons = {
         {
             { text = "字体", callback = chooseFont },
             { text = "字号：" .. choiceLabel(font_values, font_labels, self.style.body_font_size), callback = function() apply(function(s)
@@ -1056,8 +1177,24 @@ function ReaderView:makeLayoutMenuButtons()
                 self:setChapterCleanWaveEnabled(not self:isChapterCleanWaveEnabled())
             end },
         },
-        { { text = "关闭", callback = close } },
     }
+    if self:hasFrontlightControl() then
+        buttons[#buttons + 1] = { {
+            text = "屏幕亮度",
+            callback = function()
+                close()
+                UIManager:broadcastEvent(Event:new("ShowFlDialog"))
+            end,
+        } }
+    end
+    buttons[#buttons + 1] = { { text = "关闭", callback = close } }
+    return buttons
+end
+
+function ReaderView:hasFrontlightControl()
+    if type(Device.hasFrontlight) ~= "function" then return false end
+    local ok, available = pcall(Device.hasFrontlight, Device)
+    return ok and available == true
 end
 
 function ReaderView:showFontSelection()
@@ -1087,9 +1224,9 @@ function ReaderView:showLayoutMenu()
     end
     return UI.showModalLater(self, "layout_menu", function()
         local dialog = ButtonDialog:new{
-            title = "排版设置",
+            title = "阅读设置",
             modal = true,
-            rows_per_page = 6,
+            rows_per_page = self:hasFrontlightControl() and 7 or 6,
             buttons = self:makeLayoutMenuButtons(),
             tap_close_callback = function()
                 self._layout_dialog = nil
@@ -1103,10 +1240,19 @@ end
 
 function ReaderView:routeTap(ges)
     local x = ges and ges.pos and ges.pos.x or self.dimen.w / 2
+    local y = ges and ges.pos and ges.pos.y or self.dimen.h / 2
     if self.menu_visible then return self:toggleMenu(false) end
-    if x < self.dimen.w * 0.27 then return self:previousPage() end
-    if x > self.dimen.w * 0.73 then return self:nextPage() end
-    return self:toggleMenu(true)
+    local width, height = self.dimen.w, self.dimen.h
+    -- Kindle/KOReader-style tap map: narrow left gutter goes backward, most
+    -- of the page goes forward, and only a compact centre target
+    -- open controls. Keep this in one router so registered and fallback touch
+    -- paths always share exactly the same geometry.
+    if x >= width * 0.38 and x <= width * 0.62
+            and y >= height * 0.36 and y <= height * 0.64 then
+        return self:toggleMenu(true)
+    end
+    if x < width * 0.16 then return self:previousPage() end
+    return self:nextPage()
 end
 
 function ReaderView:routeSwipe(ges)
@@ -1135,13 +1281,27 @@ function ReaderView:onFlushSettings()
             self._progress_dirty = true
         end
     end
+    if self.statistics_bridge then self.statistics_bridge:checkpoint() end
 end
 
 function ReaderView:onSuspend()
     self:_settleSwipeRefresh()
+    if self.statistics_bridge then self.statistics_bridge:pause() end
     -- Power/suspend is the other safe persistence boundary. Do not write on
     -- every page turn; save the latest in-memory cursor before sleep.
     self:onFlushSettings()
+end
+
+function ReaderView:onResume()
+    if self.statistics_bridge then self.statistics_bridge:resume(self:_statisticsVirtualPage()) end
+end
+
+function ReaderView:onReadingPaused()
+    if self.statistics_bridge then self.statistics_bridge:pause() end
+end
+
+function ReaderView:onReadingResumed()
+    if self.statistics_bridge then self.statistics_bridge:resume(self:_statisticsVirtualPage()) end
 end
 
 -- Rotation actions are dispatched by the host before the screen geometry is
@@ -1175,6 +1335,7 @@ function ReaderView:closeReaderNow()
 
     BookService:cancelPrefetch(self.book.id)
     BookService:unobservePrefetch(self.book.id, self)
+    if self.statistics_bridge then self.statistics_bridge:close() end
     self:onFlushSettings()
 
     -- Rebuild the covered bookshelf before removing the reader. UIManager will
@@ -1206,6 +1367,7 @@ function ReaderView:requestExit()
         if UIManager.isWidgetShown and UIManager:isWidgetShown(self._exit_dialog) then return true end
         self._exit_dialog = nil
     end
+    self:onReadingPaused()
     return UI.showModalLater(self, "exit_dialog", function()
         local dialog
         dialog = ButtonDialog:new{
@@ -1224,10 +1386,11 @@ function ReaderView:requestExit()
                     end },
                     { text = "继续阅读", callback = function()
                         UIManager:close(dialog); self._exit_dialog = nil
+                        self:onReadingResumed()
                     end },
                 },
             },
-            tap_close_callback = function() self._exit_dialog = nil end,
+            tap_close_callback = function() self._exit_dialog = nil; self:onReadingResumed() end,
         }
         self._exit_dialog = dialog
         return dialog
@@ -1240,6 +1403,7 @@ function ReaderView:onClose()
 end
 function ReaderView:onCloseWidget()
     self:_cancelSwipeRefresh()
+    if self.statistics_bridge then self.statistics_bridge:close() end
     self:onFlushSettings()
 end
 

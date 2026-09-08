@@ -443,8 +443,8 @@ function ExecutionTrace:contentMedia(source, contract)
         })
     end
     local current = trace.content_media or {
-        rendering = "unsupported-placeholder",
-        placeholder = "[image]",
+        rendering = "omitted",
+        placeholder = "",
         base_url = contract.base_url or "",
         pages = 0,
         count = 0,

@@ -4,6 +4,7 @@ local TextWidget = require("ui/widget/textwidget")
 local Screen = require("device").screen
 local BookService = require("Leko/BookService")
 local Util = require("Leko/Util")
+local ReaderMargins = require("Leko/ReaderMargins")
 
 local Paginator = {}
 
@@ -11,8 +12,8 @@ local Paginator = {}
 -- vertical gaps belong to the reader chrome: keep the header/footer close to
 -- the edges regardless of legacy margin_top/margin_bottom fields in a saved
 -- style.
-local READER_CHROME_TOP_GAP = 14
-local READER_CHROME_BOTTOM_GAP = 12
+local READER_CHROME_TOP_GAP = 5
+local READER_CHROME_BOTTOM_GAP = 5
 -- When the header is hidden, keep the body away from the physical top edge.
 -- This preserves the 0.15.39-sized reading inset without making the visible
 -- header's own outer gap as large as the legacy user margin.
@@ -94,7 +95,9 @@ local function bodyMetrics(style)
         bold = false,
         for_measurement_only = true,
     }
-    return face, probe.line_height_px
+    local height = probe.line_height_px
+    if probe.free then probe:free() end
+    return face, height
 end
 
 local function measuredHeight(widget)
@@ -117,12 +120,34 @@ function Paginator:getGeometry(style)
     local content_width = math.max(Screen:scaleBySize(120), screen_width - left - right)
 
     local body_face, body_line_height = bodyMetrics(style)
-    local chrome_face = Font:getFace("smallinfofont", math.max(14, math.floor((style.body_font_size or 27) * 0.58)))
+    -- Whole Chinese glyphs can leave unused space at the end of every full
+    -- line. Share that remainder between the margins instead of putting all
+    -- of it on the right. Use the renderer's measured advance, not font size.
+    local width_probe = TextWidget:new{ text = "测", face = body_face, padding = 0,
+        lang = "zh-CN", bold = false }
+    local cell_width = width_probe:getSize().w
+    if width_probe.free then width_probe:free() end
+    if cell_width and cell_width > 0 and cell_width <= content_width then
+        local fitted_width = math.floor(content_width / cell_width) * cell_width
+        if (style.margin_left or 28) == (style.margin_right or 28) then
+            local preset = ReaderMargins:index(style.margin_left or 28)
+            if preset then
+                fitted_width = ReaderMargins:columns(preset, screen_width, cell_width,
+                    function(value) return Screen:scaleBySize(value) end) * cell_width
+            end
+        end
+        local remainder = content_width - fitted_width
+        local left_extra = math.floor(remainder / 2)
+        left = left + left_extra
+        right = right + remainder - left_extra
+        content_width = fitted_width
+    end
+    local chrome_face = Font:getFace("smallinfofont", 12)
     local chrome_height = smallTextHeight(chrome_face)
-    local header_height = style.show_header and chrome_height + Screen:scaleBySize(5) or 0
+    local header_height = style.show_header and chrome_height + Screen:scaleBySize(2) or 0
     -- The reading menu is an overlay, not a permanent button bar. Reserve only
     -- a compact optional status footer so the text area behaves like a reader.
-    local footer_height = style.show_footer and (chrome_height + Screen:scaleBySize(5)) or 0
+    local footer_height = style.show_footer and (chrome_height + Screen:scaleBySize(2)) or 0
     local control_height = 0
     local body_top = style.show_header and top or Screen:scaleBySize(READER_BODY_TOP_GAP)
     local content_height = screen_height - body_top - bottom - header_height - footer_height
@@ -151,7 +176,22 @@ local function paragraphLength(model, paragraph_index)
     model._utf8_lengths = model._utf8_lengths or {}
     local cached = model._utf8_lengths[paragraph_index]
     if cached ~= nil then return cached end
-    local length = Util.utf8Length(model.paragraphs[paragraph_index] or "")
+    local paragraph = model.paragraphs[paragraph_index] or ""
+    local length = Util.utf8Length(paragraph)
+    -- Whitespace at the end has no visible reading position. Keep the source
+    -- text intact and its character offsets stable, but do not paginate an
+    -- ideographic-space-only paragraph (or the tail of a long paragraph).
+    local last = #paragraph
+    while last > 0 do
+        local first = last
+        while first > 1 and paragraph:byte(first) >= 128 and paragraph:byte(first) < 192 do
+            first = first - 1
+        end
+        local char = paragraph:sub(first, last)
+        if not char:match("^%s$") and char ~= IDEOGRAPHIC_SPACE and char ~= NO_BREAK_SPACE
+                and char ~= "\u{200B}" and char ~= "\u{FEFF}" then break end
+        length, last = length - 1, first - 1
+    end
     model._utf8_lengths[paragraph_index] = length
     return length
 end
@@ -168,6 +208,27 @@ local function makePosition(book, chapter_index, paragraph_index, char_index)
         paragraph = paragraph_index,
         char = char_index,
     }
+end
+
+-- Resolve a page boundary inside the already loaded chapter only. In
+-- particular, a full last text row followed by blank paragraphs is the last
+-- page, not a promise to render another empty screen on the next tap.
+local function finishPage(book, model, page)
+    local next_position = page.next_position
+    if not next_position or next_position.chapter ~= page.chapter_index then return page end
+    while next_position.paragraph <= #model.paragraphs do
+        if next_position.char <= paragraphLength(model, next_position.paragraph) then return page end
+        next_position.paragraph = next_position.paragraph + 1
+        next_position.char = 1
+    end
+    if page.chapter_index < #book.chapters then
+        page.next_position = makePosition(book, page.chapter_index + 1, 1, 1)
+    else
+        page.next_position = makePosition(book, page.chapter_index, #model.paragraphs,
+            paragraphLength(model, #model.paragraphs) + 1)
+        page.at_end = true
+    end
+    return page
 end
 
 local function normalizePosition(book, position)
@@ -228,6 +289,33 @@ local function makeMeasureWidget(text, face, width, line_spacing, alignment, bol
     }
 end
 
+-- Use the same single-line fitter and renderer as TextWidget. In contrast to
+-- TextBoxWidget paragraph wrapping, makeLine(..., true) fills the available
+-- width instead of moving otherwise fitting glyphs to obey break preferences.
+-- One bounded window is measured once; no paragraph/glyph records survive it.
+local function fitBodyLines(text, chars, face, width)
+    local probe = TextWidget:new{ text = text, face = face, padding = 0,
+        lang = "zh-CN", bold = false }
+    probe:getSize()
+    local lines, offset = {}, 1
+    while offset <= #chars do
+        local last
+        if probe._xtext then
+            local line = probe._xtext:makeLine(offset, width, true)
+            last = line.end_offset
+        else
+            local RenderText = require("ui/rendertext")
+            local fitted = RenderText:getSubTextByWidth(table.concat(chars, "", offset), face, width, true, false)
+            last = offset + Util.utf8Length(fitted) - 1
+        end
+        last = math.min(#chars, math.max(offset, tonumber(last) or offset))
+        lines[#lines + 1] = { offset = offset, end_offset = last }
+        offset = last + 1
+    end
+    if probe.free then probe:free() end
+    return lines
+end
+
 function Paginator:makePage(book, requested_position, style)
     local position, err, model = self:_advanceToValid(book, requested_position)
     if not position then return nil, err end
@@ -235,7 +323,7 @@ function Paginator:makePage(book, requested_position, style)
 
     local geometry = self:getGeometry(style)
     local at_chapter_start = position.paragraph == 1 and position.char == 1
-    local show_header = style.show_header and not at_chapter_start
+    local show_header = style.show_header
     if not show_header and geometry.header_height > 0 then
         geometry.content_height = geometry.content_height + geometry.header_height
         geometry.header_height = 0
@@ -267,6 +355,7 @@ function Paginator:makePage(book, requested_position, style)
         local title_measure = makeMeasureWidget(model.title, title_face, geometry.content_width,
             0.18, "left", title_bold)
         local title_height = measuredHeight(title_measure)
+        if title_measure.free then title_measure:free() end
         local top_gap, bottom_gap
         if (tonumber(style.layout_version or 2) or 2) >= 2 then
             -- The opening is a proportion of the physical page, not a Kindle
@@ -316,6 +405,7 @@ function Paginator:makePage(book, requested_position, style)
 
     while chapter_index == position.chapter and paragraph_index <= #model.paragraphs do
         local paragraph = model.paragraphs[paragraph_index]
+        local paragraph_length = paragraphLength(model, paragraph_index)
         local paragraph_done = false
         while not paragraph_done do
             local prefix = ""
@@ -328,13 +418,16 @@ function Paginator:makePage(book, requested_position, style)
                     prefix_length = 2
                 end
             end
+            if content_char_index > paragraph_length then
+                paragraph_done = true
+                break
+            end
             local hint = model._utf8_hints[paragraph_index]
             local window_text, window_count, has_more, next_byte = Util.utf8Window(
-                paragraph, content_char_index, max_measure_chars,
+                paragraph, content_char_index, math.min(max_measure_chars, paragraph_length - content_char_index + 1),
                 hint and hint.char, hint and hint.byte)
+            has_more = content_char_index + window_count <= paragraph_length
             if window_count <= 0 then
-                model._utf8_lengths = model._utf8_lengths or {}
-                model._utf8_lengths[paragraph_index] = math.max(0, content_char_index - 1)
                 paragraph_done = true
                 break
             end
@@ -342,9 +435,13 @@ function Paginator:makePage(book, requested_position, style)
             -- This table is now strictly bounded instead of mirroring the full
             -- chapter-sized paragraph.
             local layout_chars = Util.utf8Chars(layout_text)
-            local measure = makeMeasureWidget(layout_text, geometry.body_face,
-                geometry.content_width, style.line_spacing or 0.28, "left")
-            local lines = measure.vertical_string_list or {}
+            local lines = fitBodyLines(layout_text, layout_chars, geometry.body_face, geometry.content_width)
+            if has_more and #lines > 1 then
+                -- Refill the final window row before painting it.
+                local tail = table.remove(lines)
+                window_count = tail.offset - 1 - prefix_length
+                next_byte = next_byte - #table.concat(layout_chars, "", tail.offset)
+            end
 
             for line_index, line in ipairs(lines) do
                 if line.end_offset and line.end_offset >= line.offset then
@@ -352,14 +449,12 @@ function Paginator:makePage(book, requested_position, style)
                         local next_layout_offset = line.offset
                         local next_char = content_char_index + math.max(0, next_layout_offset - prefix_length - 1)
                         page.next_position = makePosition(book, chapter_index, paragraph_index, next_char)
-                        return page
+                        return finishPage(book, model, page)
                     end
 
-                    -- TextBoxWidget uses an XText userdata as charlist when shaping is enabled,
-                    -- so do not call its private _getLineText() (which expects a Lua table).
                     local text = table.concat(layout_chars, "", line.offset, line.end_offset)
                     local next_line = lines[line_index + 1]
-                    local next_layout_offset = next_line and next_line.offset or (#layout_chars + 1)
+                    local next_layout_offset = next_line and next_line.offset or (prefix_length + window_count + 1)
                     local next_char = content_char_index + math.max(0, next_layout_offset - prefix_length - 1)
                     local is_last_line = line_index == #lines
 
@@ -378,27 +473,28 @@ function Paginator:makePage(book, requested_position, style)
 
                     if not is_last_line and remaining_height < geometry.body_line_height then
                         page.next_position = makePosition(book, chapter_index, paragraph_index, next_char)
-                        return page
+                        return finishPage(book, model, page)
                     end
                 end
             end
 
             if has_more then
                 char_index = content_char_index + window_count
-                model._utf8_hints[paragraph_index] = { char = char_index, byte = next_byte }
+                model._utf8_hints[paragraph_index] = next_byte and { char = char_index, byte = next_byte } or nil
                 if remaining_height < geometry.body_line_height then
                     page.next_position = makePosition(book, chapter_index, paragraph_index, char_index)
-                    return page
+                    return finishPage(book, model, page)
                 end
             else
-                model._utf8_lengths = model._utf8_lengths or {}
-                model._utf8_lengths[paragraph_index] = content_char_index + window_count - 1
                 paragraph_done = true
             end
         end
 
         paragraph_index = paragraph_index + 1
         char_index = 1
+        while paragraph_index <= #model.paragraphs and paragraphLength(model, paragraph_index) == 0 do
+            paragraph_index = paragraph_index + 1
+        end
         if paragraph_index <= #model.paragraphs then
             if paragraph_gap + geometry.body_line_height <= remaining_height then
                 table.insert(page.elements, { type = "gap", height = paragraph_gap })
@@ -406,7 +502,7 @@ function Paginator:makePage(book, requested_position, style)
                 remaining_height = remaining_height - paragraph_gap
             elseif added_line then
                 page.next_position = makePosition(book, chapter_index, paragraph_index, 1)
-                return page
+                return finishPage(book, model, page)
             end
         end
     end
@@ -419,6 +515,12 @@ function Paginator:makePage(book, requested_position, style)
         page.at_end = true
     end
     return page
+end
+
+function Paginator:isChapterStart(book, position)
+    if position.paragraph == 1 and position.char == 1 then return true end
+    local first = self:_advanceToValid(book, makePosition(book, position.chapter, 1, 1))
+    return first and Util.positionEqual(first, position) or false
 end
 
 local function previousSearchStart(book, target_position)
@@ -447,6 +549,25 @@ end
 
 function Paginator:findPreviousPage(book, target_position, style)
     target_position = normalizePosition(book, target_position)
+    if self:isChapterStart(book, target_position) then
+        if target_position.chapter <= 1 then return nil, "已经是第一页" end
+        -- Recover the actual last page using the same boundaries as forward
+        -- reading. Starting at a trailing blank paragraph advances straight
+        -- back into the current chapter and used to look like a no-op.
+        local cursor = makePosition(book, target_position.chapter - 1, 1, 1)
+        local previous
+        while cursor.chapter < target_position.chapter do
+            local page, err = self:makePage(book, cursor, style)
+            if not page then return nil, err end
+            if page.chapter_index >= target_position.chapter then break end
+            previous = page
+            if not Util.positionLess(cursor, page.next_position) then
+                return nil, "上一章分页未能前进"
+            end
+            cursor = page.next_position
+        end
+        return previous, previous and nil or "上一章没有可显示的正文"
+    end
     local cursor, start_err = previousSearchStart(book, target_position)
     if not cursor then return nil, start_err end
 

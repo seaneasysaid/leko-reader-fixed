@@ -25,6 +25,7 @@ function SourceSearchController:start()
         mode = options.mode,
         keyword = options.keyword,
         max_results = options.max_results,
+        force_refresh = options.force_refresh,
         on_batch = function(batch)
             if self.cancelled or generation ~= self.generation then return end
             -- AsyncSourceSearch guarantees that executable candidate state was

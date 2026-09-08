@@ -4,9 +4,23 @@
 local Digest = require("Leko/Digest")
 
 local CryptoCompat = {}
-local unpack = table.unpack or unpack
+local mime_ok, mime = pcall(require, "mime")
 
 local BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+-- LuaSocket variants bundled by readers have not always exposed identical
+-- wrappers around mime.core.  Accept the native path only after a tiny
+-- conformance check, and normalize wrapped output before it reaches a data:
+-- URI or an aggregate authentication header.
+local native_b64, native_unb64
+if mime_ok and mime and type(mime.b64) == "function" and type(mime.unb64) == "function" then
+    local ok_encode, encoded = pcall(mime.b64, "Leko")
+    local ok_decode, decoded = pcall(mime.unb64, "TGVrbw==")
+    encoded = ok_encode and tostring(encoded or ""):gsub("%s+", "") or ""
+    if encoded == "TGVrbw==" and ok_decode and decoded == "Leko" then
+        native_b64, native_unb64 = mime.b64, mime.unb64
+    end
+end
 
 local function hex(value)
     return (tostring(value or ""):gsub(".", function(c) return string.format("%02x", c:byte()) end))
@@ -20,38 +34,50 @@ end
 
 local function base64Encode(data)
     data = tostring(data or "")
-    return ((data:gsub(".", function(x)
-        local byte, bits = x:byte(), ""
-        for i = 8, 1, -1 do bits = bits .. (byte % 2 ^ i - byte % 2 ^ (i - 1) > 0 and "1" or "0") end
-        return bits
-    end) .. "0000"):gsub("%d%d%d?%d?%d?%d?", function(x)
-        if #x < 6 then return "" end
-        local c = 0
-        for i = 1, 6 do if x:sub(i, i) == "1" then c = c + 2 ^ (6 - i) end end
-        return BASE64:sub(c + 1, c + 1)
-    end) .. ({ "", "==", "=" })[#data % 3 + 1])
+    if native_b64 then
+        local ok, encoded = pcall(native_b64, data)
+        if ok and encoded ~= nil then return (tostring(encoded):gsub("%s+", "")) end
+    end
+    -- Desktop source-lab builds do not ship LuaSocket's native mime module.
+    -- Keep a compact arithmetic fallback there; KOReader/Kindle uses mime.b64.
+    local output = {}
+    for index = 1, #data, 3 do
+        local a, b, c = data:byte(index, index + 2)
+        local value = a * 65536 + (b or 0) * 256 + (c or 0)
+        output[#output + 1] = BASE64:sub(math.floor(value / 262144) % 64 + 1, math.floor(value / 262144) % 64 + 1)
+        output[#output + 1] = BASE64:sub(math.floor(value / 4096) % 64 + 1, math.floor(value / 4096) % 64 + 1)
+        output[#output + 1] = b and BASE64:sub(math.floor(value / 64) % 64 + 1, math.floor(value / 64) % 64 + 1) or "="
+        output[#output + 1] = c and BASE64:sub(value % 64 + 1, value % 64 + 1) or "="
+    end
+    return table.concat(output)
 end
 
 local function base64Decode(data)
     -- java.util.Base64 decoders used by imported sources commonly receive
     -- URL-safe ciphertext as well as ordinary Base64.  Accept both alphabets;
     -- whitespace is still ignored just like Android's MIME-capable decoder.
-    data = tostring(data or ""):gsub("%-", "+"):gsub("_", "/")
+    data = tostring(data or ""):gsub("%-", "+"):gsub("_", "/"):gsub("%s", "")
     data = data:gsub("[^" .. BASE64 .. "=]", "")
-    return (data:gsub(".", function(x)
-        if x == "=" then return "" end
-        local f = BASE64:find(x, 1, true)
-        if not f then return "" end
-        f = f - 1
-        local bits = ""
-        for i = 6, 1, -1 do bits = bits .. (f % 2 ^ i - f % 2 ^ (i - 1) > 0 and "1" or "0") end
-        return bits
-    end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(x)
-        if #x ~= 8 then return "" end
-        local c = 0
-        for i = 1, 8 do if x:sub(i, i) == "1" then c = c + 2 ^ (8 - i) end end
-        return string.char(c)
-    end))
+    data = data:gsub("=+$", "")
+    local remainder = #data % 4
+    if remainder == 2 then data = data .. "==" elseif remainder == 3 then data = data .. "=" end
+    if native_unb64 then
+        local ok, decoded = pcall(native_unb64, data)
+        if ok and decoded ~= nil then return decoded end
+    end
+    local output = {}
+    for index = 1, #data, 4 do
+        local a = (BASE64:find(data:sub(index, index), 1, true) or 1) - 1
+        local b = (BASE64:find(data:sub(index + 1, index + 1), 1, true) or 1) - 1
+        local c_char, d_char = data:sub(index + 2, index + 2), data:sub(index + 3, index + 3)
+        local c = c_char == "=" and 0 or ((BASE64:find(c_char, 1, true) or 1) - 1)
+        local d = d_char == "=" and 0 or ((BASE64:find(d_char, 1, true) or 1) - 1)
+        local value = a * 262144 + b * 4096 + c * 64 + d
+        output[#output + 1] = string.char(math.floor(value / 65536) % 256)
+        if c_char ~= "=" and c_char ~= "" then output[#output + 1] = string.char(math.floor(value / 256) % 256) end
+        if d_char ~= "=" and d_char ~= "" then output[#output + 1] = string.char(value % 256) end
+    end
+    return table.concat(output)
 end
 
 CryptoCompat.hex = hex
@@ -92,13 +118,25 @@ if ffi_ok then
             typedef struct evp_md_ctx_st EVP_MD_CTX;
             typedef struct evp_pkey_ctx_st EVP_PKEY_CTX;
             typedef struct evp_md_st EVP_MD;
+            typedef struct rsa_st RSA;
             EVP_PKEY *d2i_AutoPrivateKey(EVP_PKEY **, const unsigned char **, long);
+            EVP_PKEY *d2i_PUBKEY(EVP_PKEY **, const unsigned char **, long);
             void EVP_PKEY_free(EVP_PKEY *);
+            RSA *EVP_PKEY_get1_RSA(EVP_PKEY *);
+            RSA *d2i_RSA_PUBKEY(RSA **, const unsigned char **, long);
+            RSA *d2i_RSAPublicKey(RSA **, const unsigned char **, long);
+            void RSA_free(RSA *);
+            int RSA_size(const RSA *);
+            int RSA_public_encrypt(int, const unsigned char *, unsigned char *, RSA *, int);
+            int RSA_private_decrypt(int, const unsigned char *, unsigned char *, RSA *, int);
+            int RSA_verify(int, const unsigned char *, unsigned int, const unsigned char *, unsigned int, RSA *);
             EVP_MD_CTX *EVP_MD_CTX_new(void);
             void EVP_MD_CTX_free(EVP_MD_CTX *);
             EVP_MD_CTX *EVP_MD_CTX_create(void);
             void EVP_MD_CTX_destroy(EVP_MD_CTX *);
             const EVP_MD *EVP_sha256(void);
+            const EVP_MD *EVP_sha1(void);
+            const EVP_MD *EVP_md5(void);
             int EVP_DigestSignInit(EVP_MD_CTX *, EVP_PKEY_CTX **, const EVP_MD *, ENGINE *, EVP_PKEY *);
             int EVP_DigestSignUpdate(EVP_MD_CTX *, const void *, size_t);
             int EVP_DigestSignFinal(EVP_MD_CTX *, unsigned char *, size_t *);
@@ -110,7 +148,7 @@ if ffi_ok then
                 if ok and loaded then candidates[#candidates + 1] = loaded end
             end
         end
-        for _, name in ipairs({ "crypto", "libcrypto.so", "libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so.57" }) do
+        for _, name in ipairs({ "crypto", "libcrypto.so", "libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so.57", "libcrypto-3-x64" }) do
             local ok, loaded = pcall(ffi.load, name)
             if ok and loaded then candidates[#candidates + 1] = loaded end
         end
@@ -160,6 +198,17 @@ local function cipherName(transformation, key_length)
         return "EVP_des_ede3_" .. mode:lower(), no_padding
     end
     return nil, nil, "unsupported cipher " .. algorithm
+end
+
+local function pureCipher(encrypt, transformation, input, key, iv)
+    local algorithm, mode, padding = normalizeTransformation(transformation)
+    local supported = algorithm == "AES" or algorithm == "DES" or algorithm == "DESEDE"
+        or algorithm == "3DES" or algorithm == "TRIPLEDES"
+    if not supported then return nil, "unsupported cipher " .. algorithm end
+    local ok, PureCrypto = pcall(require, "Leko/PureCrypto")
+    if not ok or not PureCrypto then return nil, "pure crypto fallback unavailable" end
+    if encrypt then return PureCrypto:encrypt(algorithm, input, key, iv, mode, padding) end
+    return PureCrypto:decrypt(algorithm, input, key, iv, mode, padding)
 end
 
 local function ffiCipher(transformation, key)
@@ -255,32 +304,41 @@ end
 local function crypt(encrypt, transformation, input, key, iv)
     input, key, iv = tostring(input or ""), tostring(key or ""), tostring(iv or "")
     local result, err
-    if libcrypto then
+    local algorithm, _, padding = normalizeTransformation(transformation)
+    -- EVP has no ZeroPadding switch. Keep that semantic, and all device
+    -- fallbacks, in one dependency-free implementation.
+    if padding == "ZEROPADDING" then
+        result, err = pureCipher(encrypt, transformation, input, key, iv)
+    elseif libcrypto then
         local native_ok, native_result, native_error = pcall(
             cryptFFI, encrypt, transformation, input, key, iv)
         if native_ok then result, err = native_result, native_error
         else err = "libcrypto ABI mismatch: " .. tostring(native_result) end
     end
-    -- Some Kindle/KOReader combinations ship a TLS libcrypto whose SONAME can
-    -- be loaded but whose EVP cipher symbols do not match the modern API above.
-    -- AES-dependent Legado rules must not depend on that
-    -- accidental system ABI, so retain a bounded in-process fallback.
-    local algorithm, mode, padding = normalizeTransformation(transformation)
-    if result == nil and algorithm == "AES" then
-        local ok, PureAES = pcall(require, "Leko/PureAES")
-        if ok and PureAES then
-            local use_padding = padding ~= "NOPADDING"
-            if encrypt then result, err = PureAES:encrypt(input, key, iv, mode, use_padding)
-            else result, err = PureAES:decrypt(input, key, iv, mode, use_padding) end
-        end
+    -- Older Kindle builds may expose AES but omit legacy DES symbols. The
+    -- unified fallback covers AES, DES and DESede instead of scattering a
+    -- separate implementation beside each bridge entrypoint.
+    if result == nil and (algorithm == "AES" or algorithm == "DES" or algorithm == "DESEDE"
+            or algorithm == "3DES" or algorithm == "TRIPLEDES") then
+        result, err = pureCipher(encrypt, transformation, input, key, iv)
     end
     if result == nil then result, err = cryptCLI(encrypt, transformation, input, key, iv) end
     return result, err
 end
 
-local function rsaSignFFI(private_der, data)
+local function digestForSignature(algorithm)
+    local normalized = tostring(algorithm or "SHA256WithRSA"):upper():gsub("[^A-Z0-9]", "")
+    if normalized:find("SHA1", 1, true) then return "sha1", "EVP_sha1", 64 end
+    if normalized:find("MD5", 1, true) then return "md5", "EVP_md5", 4 end
+    if normalized:find("SHA256", 1, true) then return "sha256", "EVP_sha256", 672 end
+    return nil, nil, nil, "unsupported RSA signature algorithm " .. tostring(algorithm)
+end
+
+local function rsaSignFFI(private_der, data, algorithm)
     if not libcrypto or not ffi_ok then return nil, "libcrypto unavailable" end
-    local required = { "d2i_AutoPrivateKey", "EVP_PKEY_free", "EVP_sha256", "EVP_DigestSignInit", "EVP_DigestSignUpdate", "EVP_DigestSignFinal" }
+    local _, digest_symbol, _, digest_error = digestForSignature(algorithm)
+    if not digest_symbol then return nil, digest_error end
+    local required = { "d2i_AutoPrivateKey", "EVP_PKEY_free", digest_symbol, "EVP_DigestSignInit", "EVP_DigestSignUpdate", "EVP_DigestSignFinal" }
     for _, name in ipairs(required) do
         local ok = pcall(function() return libcrypto[name] end)
         if not ok then return nil, "RSA symbol unavailable: " .. name end
@@ -303,7 +361,8 @@ local function rsaSignFFI(private_der, data)
     local function finish(value, err)
         free_ctx(ctx); libcrypto.EVP_PKEY_free(pkey); return value, err
     end
-    if libcrypto.EVP_DigestSignInit(ctx, nil, libcrypto.EVP_sha256(), nil, pkey) ~= 1 then
+    local digest = libcrypto[digest_symbol]()
+    if libcrypto.EVP_DigestSignInit(ctx, nil, digest, nil, pkey) ~= 1 then
         return finish(nil, "RSA sign init failed")
     end
     if libcrypto.EVP_DigestSignUpdate(ctx, data, #data) ~= 1 then
@@ -320,14 +379,16 @@ local function rsaSignFFI(private_der, data)
     return finish(ffi.string(output, tonumber(length[0])))
 end
 
-local function rsaSignCLI(private_der, data)
+local function rsaSignCLI(private_der, data, algorithm)
     if type(os.execute) ~= "function" or type(os.tmpname) ~= "function" then return nil, "openssl fallback unavailable" end
     local key_path, data_path, sig_path = os.tmpname(), os.tmpname(), os.tmpname()
     local key_file = io.open(key_path, "wb"); if not key_file then return nil, "temporary key unavailable" end
     key_file:write(private_der); key_file:close()
     local data_file = io.open(data_path, "wb"); if not data_file then os.remove(key_path); return nil, "temporary data unavailable" end
     data_file:write(data); data_file:close()
-    local command = table.concat({ "openssl dgst -sha256 -sign", shellQuote(key_path), "-keyform DER -out", shellQuote(sig_path), shellQuote(data_path), ">/dev/null 2>&1" }, " ")
+    local digest_name, _, _, digest_error = digestForSignature(algorithm)
+    if not digest_name then return nil, digest_error end
+    local command = table.concat({ "openssl dgst -" .. digest_name .. " -sign", shellQuote(key_path), "-keyform DER -out", shellQuote(sig_path), shellQuote(data_path), ">/dev/null 2>&1" }, " ")
     local ok = os.execute(command)
     local success = ok == true or ok == 0
     local result = success and readFile(sig_path) or nil
@@ -335,15 +396,145 @@ local function rsaSignCLI(private_der, data)
     return result, result and nil or "openssl RSA signing failed"
 end
 
-function CryptoCompat:rsaSignSha256(private_der, data)
+function CryptoCompat:rsaSign(private_der, data, algorithm)
     if type(private_der) == "table" then
         local bytes = {}; for index, value in ipairs(private_der) do bytes[index] = string.char((tonumber(value) or 0) % 256) end
         private_der = table.concat(bytes)
     end
     private_der, data = tostring(private_der or ""), tostring(data or "")
-    local result, err = rsaSignFFI(private_der, data)
-    if not result then result, err = rsaSignCLI(private_der, data) end
+    local result, err = rsaSignFFI(private_der, data, algorithm)
+    if not result then result, err = rsaSignCLI(private_der, data, algorithm) end
     return result, err
+end
+
+function CryptoCompat:rsaSignSha256(private_der, data)
+    return self:rsaSign(private_der, data, "SHA256WithRSA")
+end
+
+local function ffiBytes(value)
+    local input = ffi.new("unsigned char[?]", #value)
+    ffi.copy(input, value, #value)
+    local cursor = ffi.new("const unsigned char *[1]")
+    cursor[0] = ffi.cast("const unsigned char *", input)
+    return input, cursor
+end
+
+local function rsaFromPublicDer(public_der)
+    if not libcrypto or not ffi_ok then return nil, "libcrypto unavailable" end
+    local input, cursor = ffiBytes(public_der)
+    local ok_x509, rsa = pcall(function() return libcrypto.d2i_RSA_PUBKEY(nil, cursor, #public_der) end)
+    if ok_x509 and rsa ~= nil then return rsa, input end
+    input, cursor = ffiBytes(public_der)
+    local ok_pkcs1, pkcs1 = pcall(function() return libcrypto.d2i_RSAPublicKey(nil, cursor, #public_der) end)
+    if ok_pkcs1 and pkcs1 ~= nil then return pkcs1, input end
+    return nil, "invalid X509/PKCS1 RSA public key"
+end
+
+local function rsaFromPrivateDer(private_der)
+    if not libcrypto or not ffi_ok then return nil, "libcrypto unavailable" end
+    local input, cursor = ffiBytes(private_der)
+    local ok_decode, pkey = pcall(function()
+        return libcrypto.d2i_AutoPrivateKey(nil, cursor, #private_der)
+    end)
+    if not ok_decode or pkey == nil then return nil, "invalid PKCS8 RSA private key" end
+    local ok, rsa = pcall(function() return libcrypto.EVP_PKEY_get1_RSA(pkey) end)
+    libcrypto.EVP_PKEY_free(pkey)
+    if not ok or rsa == nil then return nil, "private key is not RSA" end
+    return rsa, input
+end
+
+local function derLength(length)
+    if length < 0x80 then return string.char(length) end
+    local bytes = {}
+    repeat table.insert(bytes, 1, string.char(length % 256)); length = math.floor(length / 256) until length == 0
+    return string.char(0x80 + #bytes) .. table.concat(bytes)
+end
+
+local function derInteger(value)
+    value = tostring(value or ""):gsub("^\0+", "")
+    if value == "" then value = "\0" end
+    if value:byte(1) >= 0x80 then value = "\0" .. value end
+    return string.char(0x02) .. derLength(#value) .. value
+end
+
+local function rsaPublicDerFromComponents(modulus, exponent)
+    local body = derInteger(modulus) .. derInteger(exponent)
+    return string.char(0x30) .. derLength(#body) .. body
+end
+
+local function rsaPadding(transformation)
+    local value = tostring(transformation or "RSA/ECB/PKCS1Padding"):upper()
+    if value == "RSA" then return 1, 11 end
+    if value:find("OAEP", 1, true) then
+        if value:find("SHA%-?256") then return nil, nil, "RSA OAEP SHA-256 is not supported by the narrow bridge" end
+        return 4, 42
+    end
+    if value:find("NOPADDING", 1, true) then return 3, 0 end
+    if value:find("PKCS1PADDING", 1, true) then return 1, 11 end
+    return nil, nil, "unsupported RSA padding"
+end
+
+local function rsaTransform(rsa, operation, value, transformation)
+    local padding, overhead, padding_error = rsaPadding(transformation)
+    if not padding then return nil, padding_error end
+    local size = tonumber(libcrypto.RSA_size(rsa)) or 0
+    if size <= 0 then return nil, "invalid RSA key size" end
+    if operation == "encrypt" and #value > size - overhead then return nil, "RSA plaintext is too long" end
+    if operation == "encrypt" and padding == 3 and #value ~= size then return nil, "RSA NoPadding input must match key size" end
+    if operation == "decrypt" and #value ~= size then return nil, "RSA ciphertext length does not match key" end
+    local output = ffi.new("unsigned char[?]", size)
+    local length
+    if operation == "encrypt" then
+        length = libcrypto.RSA_public_encrypt(#value, value, output, rsa, padding)
+    else
+        length = libcrypto.RSA_private_decrypt(#value, value, output, rsa, padding)
+    end
+    if tonumber(length) == nil or tonumber(length) < 0 then return nil, "RSA " .. operation .. " failed" end
+    return ffi.string(output, tonumber(length))
+end
+
+function CryptoCompat:rsaPublicEncrypt(public_der, data, transformation)
+    local rsa, keepalive = rsaFromPublicDer(tostring(public_der or ""))
+    if not rsa then return nil, keepalive end
+    local ok, result, err = pcall(rsaTransform, rsa, "encrypt", tostring(data or ""), transformation)
+    libcrypto.RSA_free(rsa)
+    if not ok then return nil, "RSA ABI mismatch: " .. tostring(result) end
+    return result, err
+end
+
+function CryptoCompat:rsaPublicEncryptComponents(modulus, exponent, data, transformation)
+    return self:rsaPublicEncrypt(rsaPublicDerFromComponents(modulus, exponent), data, transformation)
+end
+
+function CryptoCompat:rsaPrivateDecrypt(private_der, data, transformation)
+    local rsa, keepalive = rsaFromPrivateDer(tostring(private_der or ""))
+    if not rsa then return nil, keepalive end
+    local ok, result, err = pcall(rsaTransform, rsa, "decrypt", tostring(data or ""), transformation)
+    libcrypto.RSA_free(rsa)
+    if not ok then return nil, "RSA ABI mismatch: " .. tostring(result) end
+    return result, err
+end
+
+local function rsaVerifyWith(rsa, data, signature, algorithm)
+    local digest_name, _, nid, digest_error = digestForSignature(algorithm)
+    if not digest_name then return nil, digest_error end
+    local digest = Digest:digestBinary(data, digest_name)
+    local ok = libcrypto.RSA_verify(nid, digest, #digest, signature, #signature, rsa)
+    return tonumber(ok) == 1
+end
+
+function CryptoCompat:rsaVerify(public_der, data, signature, algorithm)
+    local rsa, keepalive = rsaFromPublicDer(tostring(public_der or ""))
+    if not rsa then return nil, keepalive end
+    local ok, verified, verify_error = pcall(
+        rsaVerifyWith, rsa, tostring(data or ""), tostring(signature or ""), algorithm)
+    libcrypto.RSA_free(rsa)
+    if not ok then return nil, "RSA ABI mismatch: " .. tostring(verified) end
+    return verified, verify_error
+end
+
+function CryptoCompat:rsaVerifyComponents(modulus, exponent, data, signature, algorithm)
+    return self:rsaVerify(rsaPublicDerFromComponents(modulus, exponent), data, signature, algorithm)
 end
 
 function CryptoCompat:toSignedByteArray(value)
@@ -384,24 +575,47 @@ function CryptoCompat:randomUUID()
 end
 
 function CryptoCompat:createSymmetricCrypto(transformation, key, iv)
+    local function binary(value)
+        if type(value) == "table" and rawget(value, "kind") == "java_byte_array" then
+            return rawget(value, "bytes") or ""
+        end
+        if type(value) == "table" and type(rawget(value, "value")) == "table" then value = rawget(value, "value") end
+        if type(value) == "table" then
+            local output, index = {}, 1
+            local position = (value[0] ~= nil or value["0"] ~= nil) and 0 or 1
+            while index <= 8 * 1024 * 1024 do
+                local item = value[position] or value[tostring(position)]
+                if item == nil then break end
+                output[index] = string.char((tonumber(item) or 0) % 256)
+                index, position = index + 1, position + 1
+            end
+            return table.concat(output)
+        end
+        return tostring(value or "")
+    end
     local crypto = {
         transformation = tostring(transformation or "AES/CBC/PKCS5Padding"),
-        key = type(key) == "table" and string.char(unpack(key)) or tostring(key or ""),
-        iv = type(iv) == "table" and string.char(unpack(iv)) or tostring(iv or ""),
+        key = binary(key),
+        iv = binary(iv),
     }
     crypto.encrypt = function(self, value)
-        local result, err = crypt(true, self.transformation, type(value) == "table" and string.char(unpack(value)) or tostring(value or ""), self.key, self.iv)
+        local result, err = crypt(true, self.transformation, binary(value), self.key, self.iv)
         if not result then error(err or "encryption failed") end
         return result
     end
     crypto.encryptBase64 = function(self, value) return base64Encode(self:encrypt(value)) end
     crypto.decrypt = function(self, value)
-        local input = type(value) == "table" and string.char(unpack(value)) or tostring(value or "")
+        local input = binary(value)
         local result, err = crypt(false, self.transformation, input, self.key, self.iv)
         if not result then error(err or "decryption failed") end
         return result
     end
     crypto.decryptStr = function(self, value)
+        -- Legado exposes decryptStr for both Base64 text and an already
+        -- decoded Java byte[].  The latter must stay binary: turning the
+        -- opaque byte-array handle into "table: 0x..." and decoding that text
+        -- corrupts aggregate responses after the compact byte bridge.
+        if type(value) == "table" then return self:decrypt(binary(value)) end
         local input = tostring(value or "")
         local decoded = base64Decode(input)
         -- Legado sources overwhelmingly pass Base64 here; when the input is not

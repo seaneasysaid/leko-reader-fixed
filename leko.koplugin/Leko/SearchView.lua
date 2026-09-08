@@ -19,9 +19,16 @@ local SearchResults = StreamingResultList:extend{
 function SearchResults:buildItems()
     local items = {}
     local count = #(self.results or {})
+    items[#items + 1] = {
+        text = "刷新本次搜索",
+        refresh_search = true,
+        separator = false,
+    }
     if self.searching then
         items[#items + 1] = {
-            text = SearchResultFormatter:progressText(self.scanned, self.total_sources, count),
+            text = self.total_sources > 0
+                and SearchResultFormatter:progressText(self.scanned, self.total_sources, count)
+                or tostring(self.search_stage or "正在准备书源……"),
             dim = true,
             separator = false,
         }
@@ -32,9 +39,23 @@ function SearchResults:buildItems()
         items[#items + 1] = formatted
     end
     if not self.searching and count == 0 then
-        items[1] = { text = "没有搜索结果", dim = true }
+        items[#items + 1] = {
+            text = self.search_stage and self.search_stage ~= "" and self.search_stage or "没有搜索结果",
+            dim = true,
+        }
     end
     return items
+end
+
+function SearchResults:_installMenuCallbacks()
+    StreamingResultList._installMenuCallbacks(self)
+    local select = self.onMenuSelect
+    self.onMenuSelect = function(menu, item)
+        if item.refresh_search then
+            return menu:requestManualRefresh()
+        end
+        return select(menu, item)
+    end
 end
 
 function SearchResults:_sortResultsIfNeeded()
@@ -103,12 +124,18 @@ function SearchResults:openResult(result, show_details)
     -- Details are an in-memory projection. Network/TOC/chapter work belongs to
     -- ReadingCoordinator and never to the list row callback.
     if self.foreground_loading then return true end
+    self._book_operation_generation = (tonumber(self._book_operation_generation or 0) or 0) + 1
+    local generation = self._book_operation_generation
+    local function isCurrent()
+        return generation == self._book_operation_generation
+    end
     self.opening_result = show_details and nil or result
     self:_setForegroundLoading(true)
     -- Paint the selected row before process cleanup or network work begins.
     -- The real cancellable progress layer follows on the next UI turn.
     if not show_details then self:refreshItems() end
     return UI.defer(self, "open_result", function()
+        if not isCurrent() then return end
         local resolved_result, context_err = SearchCandidateContext:hydrate(result)
         if not resolved_result then
             self.opening_result = nil
@@ -117,6 +144,7 @@ function SearchResults:openResult(result, show_details)
             return
         end
         local book, err = BookService:createSearchTrial(resolved_result)
+        if not isCurrent() then return end
         if not book then
             self.opening_result = nil
             self:_setForegroundLoading(false)
@@ -158,6 +186,8 @@ function SearchResults:openResult(result, show_details)
         elseif self.onReadBook then
             if self.onHeavyTaskStart then pcall(self.onHeavyTaskStart, "opening", result, book) end
             local function restoreSearch(err)
+                if not isCurrent() then return end
+                self._book_operation_task = nil
                 self.opening_result = nil
                 self:_setForegroundLoading(false)
                 if self.onHeavyTaskDone then pcall(self.onHeavyTaskDone, "opening", result, book) end
@@ -173,6 +203,8 @@ function SearchResults:openResult(result, show_details)
                 on_cancel = function() restoreSearch() end,
                 on_failure = function(open_err) restoreSearch(open_err) end,
                 on_reader_shown = function()
+                    if not isCurrent() then return end
+                    self._book_operation_task = nil
                     self.opening_result = nil
                     if self.onBeforeEnterReader then pcall(self.onBeforeEnterReader, result, book) end
                     -- Keep arrivals in the existing list while it is covered, but
@@ -180,12 +212,28 @@ function SearchResults:openResult(result, show_details)
                     self:_setForegroundLoading(false)
                 end,
             })
+            self._book_operation_task = task
             if not task then restoreSearch(err) end
         else
             self.opening_result = nil
             self:_setForegroundLoading(false)
         end
     end)
+end
+
+function SearchResults:cancelBookOperation()
+    self._book_operation_generation = (tonumber(self._book_operation_generation or 0) or 0) + 1
+    local task = self._book_operation_task
+    self._book_operation_task = nil
+    if task and type(task.cancel) == "function" then pcall(task.cancel, task) end
+    self.opening_result = nil
+    if self.foreground_loading then self:_setForegroundLoading(false) end
+    -- Incrementing the generation deliberately suppresses the asynchronous
+    -- task callback above. Resume the paused shared search explicitly here;
+    -- otherwise cancelling an opening attempt leaves new source batches in
+    -- memory but never lets the remaining source queue continue.
+    if task and self.onHeavyTaskDone then pcall(self.onHeavyTaskDone, "opening") end
+    return true
 end
 
 function SearchResults:releaseSearchMemory()
@@ -246,6 +294,7 @@ function SearchView:search(keyword, options)
             mode = "global",
             keyword = keyword,
             max_results = nil,
+            force_refresh = options.force_refresh == true,
         }
         local view = SearchResults:new{
             keyword = keyword,
@@ -296,6 +345,38 @@ function SearchView:search(keyword, options)
             end,
             onSourcePriorityChanged = function()
                 controller:applySourcePreference()
+            end,
+            onManualRefresh = function()
+                -- Register the replacement with the shared catalogue worker
+                -- before cancelling the old generation.  If the catalogue is
+                -- still being built, its child stays owned and is reused;
+                -- refresh never overlaps it with a second child on KT2.
+                local previous_controller = controller
+                local replacement = SourceSearchController:new{
+                    mode = "global",
+                    keyword = keyword,
+                    max_results = nil,
+                    force_refresh = true,
+                    view = view,
+                }
+                controller = replacement
+                -- Register a new catalogue waiter before cancelling the old
+                -- generation, then retire the old workers before releasing
+                -- their visible candidate sidecars.
+                replacement:start()
+                previous_controller:cancel()
+                if view._disposed then replacement:cancel(); return end
+                view:releaseResults()
+                view._arrival_sequence = 0
+                view.discovered_count = 0
+                view.overflow_count = 0
+                view._last_progress_paint = nil
+                view:_initializeResults()
+                view.searching = true
+                view.scanned = 0
+                view.total_sources = 0
+                view.search_stage = "正在清除本次缓存并重新搜索"
+                view:refreshItems()
             end,
             onCancelSearch = function() controller:cancel() end,
         }
