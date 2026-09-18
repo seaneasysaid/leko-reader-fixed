@@ -64,7 +64,7 @@ koreader/plugins/leko.koplugin/leko.koplugin/main.lua   ← 错误
 ## 上游关系
 
 - 上游项目：https://github.com/jnjnnjzch/leko-reader
-- 本增强分支：https://github.com/seaneasysaid/leko-reader
+- 本增强分支：https://github.com/seaneasysaid/leko-reader-fixed
 
 借鉴或合并上游后续修复时，会保留可追踪的提交说明，不通过改名或打乱代码结构隐藏来源。
 
