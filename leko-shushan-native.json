@@ -1,0 +1,40 @@
+{
+  "bookSourceName": "📚书山聚合（原生）",
+  "bookSourceGroup": "Leko 原生",
+  "bookSourceUrl": "leko://shushan",
+  "bookSourceType": 0,
+  "bookSourceComment": "纯 Lua 原生驱动，不执行书源里的任何 JavaScript。\n\n使用前请在「配置书源」里填写：\n1) 书山账号的邮箱与密码\n2) 本机在书山已登记的设备ID（16 位十六进制，可在手机阅读 App 的书山用户中心查看）\n填好后点「登录书山」拿密钥，再点「检测节点」选一台可用的镜像。",
+  "enabled": true,
+  "enabledExplore": false,
+  "enabledCookieJar": false,
+  "searchUrl": "leko://shushan/search?key={{key}}&page={{page}}",
+  "loginUi": "[{\"name\":\"邮箱\",\"type\":\"text\"},{\"name\":\"密码\",\"type\":\"password\"},{\"name\":\"设备ID\",\"type\":\"text\"},{\"name\":\"登录书山\",\"type\":\"button\",\"action\":\"shushan_login()\"},{\"name\":\"检测节点\",\"type\":\"button\",\"action\":\"shushan_check()\"}]",
+  "ruleSearch": {
+    "bookList": "$.results[*]",
+    "name": "$.name",
+    "author": "$.author",
+    "intro": "$.intro",
+    "coverUrl": "$.cover",
+    "kind": "$.kind",
+    "lastChapter": "$.lastChapter",
+    "wordCount": "$.wordCount",
+    "bookUrl": "$.bookUrl"
+  },
+  "ruleBookInfo": {
+    "init": "$",
+    "name": "$.name",
+    "author": "$.author",
+    "intro": "$.intro",
+    "coverUrl": "$.cover",
+    "kind": "$.kind",
+    "tocUrl": "$.tocUrl"
+  },
+  "ruleToc": {
+    "chapterList": "$.chapters[*]",
+    "chapterName": "$.title",
+    "chapterUrl": "$.url"
+  },
+  "ruleContent": {
+    "content": "#content@html"
+  }
+}

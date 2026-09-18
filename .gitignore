@@ -8,6 +8,9 @@
 !/LICENSE
 !/README.md
 
+# Shushan native book source for easy import.
+!/leko-shushan-native.json
+
 # Production KOReader plugin. Admit only its known file layout.
 !/leko.koplugin/
 /leko.koplugin/*
