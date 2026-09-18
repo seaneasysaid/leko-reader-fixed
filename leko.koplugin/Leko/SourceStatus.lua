@@ -1,8 +1,15 @@
+local BuiltinSources = require("Leko/BuiltinSources")
+
 local SourceStatus = {}
 
 function SourceStatus:capability(source)
     if type(source) ~= "table" then return "尚未分析" end
     if source.supported == false or source.searchable == false then return "包含暂不支持的功能" end
+    -- A native driver answers the rule engine itself, so the JavaScript profile
+    -- computed from the rule body says nothing useful about it.  Report what
+    -- actually runs instead of the generic "需要 JavaScript".
+    local native = BuiltinSources:nativeLabel(source)
+    if native then return native end
     local profile = tostring(source.capability_profile or source.compatibility_label or "基础规则")
     if profile == "标准规则" then return "基础规则" end
     if profile == "兼容运行时" then return "需要 JavaScript" end
@@ -22,7 +29,6 @@ function SourceStatus:friendlyReason(reason)
         return "需要浏览器交互，Kindle 上暂时无法完成"
     end
     if text:find("登录", 1, true) then return "包含可选的登录功能" end
-    if lower:find("rsa", 1, true) then return "需要当前版本尚未提供的加密功能" end
     if text:find("构造器", 1, true) or lower:find("java.", 1, true) then
         return "需要当前版本尚未提供的 JavaScript 功能"
     end

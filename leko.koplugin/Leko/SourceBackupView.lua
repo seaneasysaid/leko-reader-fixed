@@ -41,7 +41,11 @@ function SourceBackupView:_startRestore(backup)
         return
     end
     local worker
-    local progress = TaskProgress:new{
+    -- Declared before the constructor on purpose: a local's scope starts after
+    -- its declaration statement, so cancel_callback below would otherwise
+    -- capture a global `progress` (nil) and crash on an uninterruptible stage.
+    local progress
+    progress = TaskProgress:new{
         title = "恢复书源备份",
         total = 5,
         current = 0,

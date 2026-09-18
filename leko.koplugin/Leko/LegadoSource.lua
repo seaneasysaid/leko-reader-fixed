@@ -1,4 +1,6 @@
 local rapidjson = require("rapidjson")
+local Digest = require("Leko/Digest")
+local socket = require("socket")
 local koreader_util = require("util")
 local Charset = require("Leko/Charset")
 local DataUri = require("Leko/DataUri")
@@ -7,9 +9,11 @@ local BookIdentity = require("Leko/BookIdentity")
 local CookieJar = require("Leko/CookieJar")
 local Http = require("Leko/Http")
 local QuickJS = require("Leko/QuickJS")
+local AggregateActionCapability = require("Leko/AggregateActionCapability")
 local ExecutionTrace = require("Leko/ExecutionTrace")
 local Regex = require("Leko/Regex")
 local RuleEngine = require("Leko/RuleEngine")
+local TocReuse = require("Leko/TocReuse")
 local StageError = require("Leko/StageError")
 local Util = require("Leko/Util")
 
@@ -18,8 +22,12 @@ local unpack = table.unpack or unpack
 
 local LegadoSource = {
     max_toc_pages = 30,
-    max_content_pages = 20,
+    max_content_seconds = 5 * 60,
 }
+
+local function isRuleNode(value)
+    return type(RuleEngine.isNode) == "function" and RuleEngine:isNode(value) or false
+end
 
 local function stageError(code, source, message)
     if StageError:is(message) then return tostring(message) end
@@ -296,6 +304,9 @@ local function decodeLooseObject(value)
 end
 
 local function parseHeaders(value)
+    -- Executable header rules are not RFC header lines. Parsing their source
+    -- text created bogus quoted header names alongside the evaluated result.
+    if type(value) == "string" and diagnosticRuleType(value) == "js" then return {} end
     local headers = decodeLooseObject(value)
     local output = {}
     if type(headers) == "table" then
@@ -389,9 +400,12 @@ local function jsLibraryValueIsUrl(value)
     -- A jsLib entry may be a relative script URL.  Do not run arbitrary
     -- source code through Http:absolute: ordinary inline libraries such as
     -- `t=Date.now().toString()` are valid Legado scripts, not URL paths.
-    return text:match("^//") ~= nil
-        or text:match("^/") ~= nil
-        or text:match("^%.%.?/") ~= nil
+    -- A production jsLib commonly begins with `// comment`.  Only a single
+    -- line that actually looks like a network/path reference is a URL.
+    if text:find("[\r\n]", 1) then return false end
+    if text:match("^//[^%s/%?#]+([/%?#].*)?$") then return true end
+    if text:match("^/[^%s]+%.[%a%d]+([?#].*)?$") then return true end
+    return text:match("^%.%.?/.+%.[%a%d]+([?#].*)?$") ~= nil
 end
 
 local function sourceJsLibraryScript(source)
@@ -409,7 +423,6 @@ local function sourceJsLibraryScript(source)
         source._js_lib_script, source._js_lib_error = nil, nil
     end
     source._js_lib_signature = signature
-    if source._js_lib_error then return nil, source._js_lib_error end
     if source._js_lib_script ~= nil then return source._js_lib_script end
     if Util.trim(signature) == "" then
         source._js_lib_script = ""
@@ -428,18 +441,27 @@ local function sourceJsLibraryScript(source)
             script = value
         end
         if not script then
-            source._js_lib_error = "jsLib load failed (" .. tostring(entry.label) .. "): " .. tostring(err)
-            return nil, source._js_lib_error
+            -- Network/bridge failures are retryable.  Do not permanently
+            -- poison this source because one lazy load failed.
+            return nil, "jsLib load failed (" .. tostring(entry.label) .. "): " .. tostring(err)
         end
         scripts[#scripts + 1] = script
     end
     local result = table.concat(scripts, "\n")
     if #result > 4 * 1024 * 1024 then
-        source._js_lib_error = "jsLib is too large"
-        return nil, source._js_lib_error
+        return nil, "jsLib is too large"
     end
     source._js_lib_script = result
     return result
+end
+
+local function loginProgramLooksLikeScript(value)
+    value = Util.trim(tostring(value or ""))
+    if value == "" or isHttpUrl(value) or DataUri:is(value) then return false end
+    return value:find("function%s+[%w_$]+%s*%(") ~= nil
+        or value:find("[%w_$]+%s*=%s*function%s*%(") ~= nil
+        or value:find("@js:", 1, true) ~= nil
+        or value:find("<js>", 1, true) ~= nil
 end
 
 local function prepareJsLibrary(source, env)
@@ -467,13 +489,42 @@ local function prepareJsLibrary(source, env)
                 or env.base_url
             ExecutionTrace:setRule(source, env, library_field, env.__js_lib, library_base)
         end
-        local _, install_err = QuickJS:installLibrary(env.__js_lib, env)
+        local _, install_err = QuickJS:installLibrary(env.__js_lib, env, {
+            promote_lexicals = loginProgramLooksLikeScript(rawget(source, "login_url")),
+        })
         if install_err then
             env.__js_lib_error = "jsLib evaluation failed: " .. tostring(install_err)
             env.last_js_error = env.__js_lib_error
+            if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+            source._login_program_session = nil
             return nil, env.__js_lib_error
         end
     end
+    return true
+end
+
+-- Aggregate descriptors can keep shared request helpers in loginUrl. This is
+-- loaded lazily when an actual rule or user-invoked login needs it, never when
+-- the configuration page opens.
+local function prepareLoginProgram(source, env)
+    local login_url = Util.trim(tostring(type(source) == "table" and rawget(source, "login_url") or ""))
+    if not loginProgramLooksLikeScript(login_url) then return true end
+    local target = type(source) == "table" and (rawget(source, "raw") or source) or nil
+    local session = type(target) == "table" and rawget(target, "__quickjs_session") or nil
+    if session and not session.closed and source._login_program_session == session then return true end
+    local _, login_err = QuickJS:eval(login_url, env, {
+        timeout_ms = 10000, max_result_bytes = 256 * 1024, promote_lexicals = true,
+    })
+    if login_err then
+        env.__login_program_error, env.last_js_error = login_err, login_err
+        if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+        source._login_program_session = nil
+        return nil, login_err
+    end
+    env.__promote_rule_lexicals = true
+    session = type(target) == "table" and rawget(target, "__quickjs_session")
+        or rawget(env, "__quickjs_session")
+    source._login_program_session = session
     return true
 end
 
@@ -590,6 +641,17 @@ local function analyzeCompatibility(source)
         if severity[target_grade] > severity[grade] then grade = target_grade end
     end
 
+    -- A `leko://` source is served by a Lua driver inside this plugin, so the
+    -- JavaScript and login-gate penalties below describe work that never
+    -- happens for it.  Reporting "兼容运行时 / 需要 JavaScript" on such a source
+    -- contradicts what runs, so record the driver as the capability instead and
+    -- keep the grade at A.
+    --
+    -- The wording is deliberately free of the words that SourceStatus:
+    -- friendlyReason rewrites ("javascript", "登录", "promise", …), otherwise
+    -- this bullet would come back as "需要 JavaScript" in the source dialog.
+    local native_label = BuiltinSources:nativeLabel(source)
+
     local media_kind = inferMediaKind(source)
     if media_kind ~= "text" then add("Leko 当前阅读链仅处理纯文本小说源（识别为 " .. media_kind .. "）", "D") end
     if not source.search_url or source.search_url == "" then add("缺少搜索地址", "D") end
@@ -601,12 +663,17 @@ local function analyzeCompatibility(source)
 
     local raw = source.raw or {}
     local js_lib = source.js_lib or raw.jsLib or raw.js_lib or ""
-    if js_lib ~= "" then add("使用 jsLib；按实际调用加载命名函数、箭头函数与常量", "B") end
+    if native_label then add("由 Leko 内置原生驱动直接请求，书源规则只做字段解析", "A") end
+    if js_lib ~= "" and not native_label then
+        add("使用 jsLib；按实际调用加载命名函数、箭头函数与常量", "B")
+    end
     if raw.hasInjectJs or Util.trim(source.inject_js or raw.injectJs or "") ~= "" then
         add("网页注入脚本不属于无浏览器阅读链", "C")
     end
-    if raw.hasLogin or Util.trim(source.login_url or raw.loginUrl or "") ~= ""
-        or Util.trim(source.login_ui or raw.loginUi or "") ~= "" then
+    -- The native driver owns its own credential form, so a loginUi is a normal
+    -- configuration screen here rather than a capability gap.
+    if not native_label and (raw.hasLogin or Util.trim(source.login_url or raw.loginUrl or "") ~= ""
+            or Util.trim(source.login_ui or raw.loginUi or "") ~= "") then
         add("包含可选登录功能；匿名阅读链与登录能力分开判定", "B")
     end
 
@@ -630,7 +697,9 @@ local function analyzeCompatibility(source)
     local allowed_constructor = {
         RegExp=true, Date=true, Array=true, Set=true, Map=true, Error=true, Uint8Array=true,
         JavaImporter=true, ByteArrayInputStream=true, ByteArrayOutputStream=true,
-        GZIPInputStream=true, String=true,
+        GZIPInputStream=true, String=true, BigInteger=true,
+        SecretKeySpec=true, IvParameterSpec=true, PKCS8EncodedKeySpec=true,
+        X509EncodedKeySpec=true, RSAPublicKeySpec=true,
     }
 
     local saw_js, saw_xpath, saw_charset, saw_paging, saw_bridge = false, false, false, false, false
@@ -649,10 +718,6 @@ local function analyzeCompatibility(source)
         end
         if lower:find("promise", 1, true) or lower:match("%f[%a]async%f[%A]") or lower:match("%f[%a]await%f[%A]") then
             add("核心规则依赖异步 Promise/async JavaScript", "C")
-        end
-        if lower:find("x509encodedkeyspec", 1, true) or lower:find("rsapublickeyspec", 1, true)
-            or lower:match("rsa%s*/%s*(ecb|none)") then
-            add("核心规则依赖尚未桥接的 RSA 公钥加解密", "C")
         end
         for constructor in surface:gmatch("new%s+([A-Za-z_$][%w_$]*)%s*%(") do
             if not allowed_constructor[constructor] and constructor ~= "Request" then
@@ -688,7 +753,7 @@ local function analyzeCompatibility(source)
         if raw_lower:find("nexttocurl", 1, true) or raw_lower:find("nextcontenturl", 1, true) then saw_paging = true end
     end
     if saw_bridge then add("使用 JavaImporter/加密/压缩/OkHttp 兼容桥", "B") end
-    if saw_js and grade == "A" then add("使用内置 JavaScript 兼容运行时", "B") end
+    if saw_js and grade == "A" and not native_label then add("使用内置 JavaScript 兼容运行时", "B") end
     if saw_xpath then add("XPath 使用常用轴、属性与索引子集", "B") end
     if saw_paging then add("包含目录或正文分页规则", "B") end
     if saw_charset then
@@ -777,6 +842,7 @@ function LegadoSource:normalize(raw)
     }
     source.compatibility_grade, source.compatibility_reasons, source.media_kind, source.compatibility_label = analyzeCompatibility(source)
     source.raw = compactRaw(raw)
+    AggregateActionCapability.bindDefinition(source)
     local legacy = { A = "full", B = "partial", C = "extension", D = "unsupported" }
     source.compatibility = legacy[source.compatibility_grade] or "unsupported"
     -- Grades describe how much of Legado semantics the source exercises; they
@@ -813,6 +879,7 @@ function LegadoSource:refreshCompatibility(source)
     source.searchable = source.supported
     source.unsupported_reason = not source.supported and table.concat(source.compatibility_reasons or {}, "；") or nil
     source.raw = compactRaw(source.raw or source)
+    AggregateActionCapability.bindDefinition(source)
     source.archived_only = false
     return source
 end
@@ -887,6 +954,18 @@ end
 local function jsEnvironment(source, context)
     context = context or {}
     local env = copyTable(context)
+    if loginProgramLooksLikeScript(source and source.login_url) then
+        -- Aggregate programs may issue several host requests inside one rule
+        -- and return a thousand-plus TOC. Keep this explicitly identified
+        -- runtime bounded, but larger than the ordinary source defaults.
+        env.__quickjs_memory_limit = 12 * 1024 * 1024
+        env.__quickjs_max_result_bytes = 2 * 1024 * 1024
+        env.__quickjs_timeout_ms = 10000
+    end
+    env.jsoupParse = function(value)
+        local parsed = RuleEngine:parseDocument(tostring(value or ""))
+        return { __values = { parsed } }
+    end
     source.variables = source.variables or {}
     local source_proxy = variableProxy(source.raw or source, source.variables, "source", {
         bookSourceUrl = "bookSourceUrl", bookSourceName = "bookSourceName",
@@ -895,7 +974,20 @@ local function jsEnvironment(source, context)
     source_proxy.bookSourceUrl = source_proxy.bookSourceUrl or source.source_key or source.base_url
     source_proxy.key = source_proxy.key or source.source_key or source_proxy.bookSourceUrl
     source_proxy.getLoginHeader = function() return source.login_header or "" end
-    source_proxy.putLoginHeader = function(_, value) source.login_header = value; return value end
+    source_proxy.putLoginHeader = function(_, key, value)
+        if type(key) == "table" and value == nil then source.login_header = key; return key end
+        if value ~= nil then
+            local headers = parseHeaders(source.login_header)
+            headers[tostring(key or "")] = value
+            local parts = {}
+            for name, item in pairs(headers) do parts[#parts + 1] = tostring(name) .. ": " .. tostring(item or "") end
+            table.sort(parts)
+            source.login_header = table.concat(parts, "\n")
+            return value
+        end
+        source.login_header = tostring(key or "")
+        return key
+    end
     source_proxy.removeLoginHeader = function() source.login_header = ""; return true end
     source_proxy.put = function(_, key, value)
         ExecutionTrace:sideEffect(source, "source", "put", key)
@@ -907,16 +999,26 @@ local function jsEnvironment(source, context)
     end
     source_proxy.putLoginInfo = function(_, key, value)
         source.login_info = source.login_info or {}
-        if value == nil and type(key) == "table" then source.login_info = copyTable(key)
-        else source.login_info[tostring(key)] = value end
+        if value == nil and type(key) == "table" then
+            source.login_info = copyTable(key)
+        elseif value == nil and type(key) == "string" and Util.trim(key):sub(1, 1) == "{" then
+            local ok, decoded = pcall(rapidjson.decode, key)
+            if ok and type(decoded) == "table" then source.login_info = copyTable(decoded)
+            else source.login_info[tostring(key)] = value end
+        else source.login_info[tostring(key or "")] = value end
         return value or key
     end
     source_proxy.getLoginInfoMap = function()
         local map = copyTable(source.login_info or {})
-        map.get = function(self, key) return self[tostring(key)] end
-        return map
+        return { kind = "JavaMap", values = map }
     end
-    source_proxy.getLoginInfo = function() return source.login_info or {} end
+    source_proxy.getLoginInfo = function()
+        local value = source.login_info or {}
+        if type(value) == "string" then return value end
+        local ok, encoded = pcall(rapidjson.encode, value)
+        return ok and encoded or "{}"
+    end
+    source_proxy.removeLoginInfo = function() source.login_info = {}; return true end
     source_proxy.getKey = function() return source.source_key or source.base_url or "" end
     source_proxy.refreshExplore = function()
         ExecutionTrace:extension(source, "refreshExplore")
@@ -934,8 +1036,7 @@ local function jsEnvironment(source, context)
     end
     source_proxy.getLoginHeaderMap = function()
         local map = parseHeaders(source.login_header)
-        map.get = function(self, key) return self[tostring(key):lower()] or self[key] end
-        return map
+        return { kind = "JavaMap", values = map }
     end
     env.source = source_proxy
     local trace = ExecutionTrace:get(source)
@@ -967,22 +1068,28 @@ local function jsEnvironment(source, context)
         end,
         setCookie = function(_, url, value)
             ExecutionTrace:sideEffect(source, "cookie", "set", url)
-            source.cookies = source.cookies or {}; source.cookies[tostring(url or source.base_url)] = tostring(value or ""); return true
+            CookieJar:setHeader(source, url or source.base_url, value)
+            return true
         end,
         setWebCookie = function(_, url, value)
             ExecutionTrace:sideEffect(source, "cookie", "setWeb", url)
-            source.cookies = source.cookies or {}; source.cookies[tostring(url or source.base_url)] = tostring(value or ""); return true
+            CookieJar:setHeader(source, url or source.base_url, value)
+            return true
         end,
         removeCookie = function(_, url)
             ExecutionTrace:sideEffect(source, "cookie", "remove", url)
-            if url then source.cookies[tostring(url)] = nil else source.cookies = {} end
+            if url then CookieJar:remove(source, url) else source.cookies = {} end
             -- Android CookieManager-style removal is a side effect.  Returning
             -- true here leaked the word "true" into Legado {{...}} request
             -- templates (e.g. `truehttps://...`).
             return nil
         end,
     }
-    source.cache_memory = source.cache_memory or {}
+    local cache_memory = rawget(source, "cache_memory")
+    if type(cache_memory) ~= "table" then
+        cache_memory = {}
+        rawset(source, "cache_memory", cache_memory)
+    end
     local cache_prefix = tostring(source.id or source.source_key or source.name or "source") .. ":"
     env.cache = {
         get = function(_, key)
@@ -1001,9 +1108,9 @@ local function jsEnvironment(source, context)
             ExecutionTrace:sideEffect(source, "cache", "remove", key)
             source.variables["cache:" .. tostring(key)] = nil; return true
         end,
-        getFromMemory = function(_, key) return source.cache_memory[tostring(key)] end,
-        putMemory = function(_, key, value) source.cache_memory[tostring(key)] = value; return value end,
-        deleteMemory = function(_, key) source.cache_memory[tostring(key)] = nil; return true end,
+        getFromMemory = function(_, key) return cache_memory[tostring(key)] end,
+        putMemory = function(_, key, value) cache_memory[tostring(key)] = value; return value end,
+        deleteMemory = function(_, key) cache_memory[tostring(key)] = nil; return true end,
         getFile = function(_, key)
             if storage_ok and Storage and Storage.readCache then return Storage:readCache("source-js", cache_prefix .. tostring(key)) end
             return source.variables["file:" .. tostring(key)]
@@ -1023,7 +1130,9 @@ local function jsEnvironment(source, context)
         local library_field = trace.stage == "content" and "content.content" or (trace.stage or "unknown")
         ExecutionTrace:setRule(source, env, library_field, env.__js_lib, env.base_url)
     end
-    prepareJsLibrary(source, env)
+    local library_ok, library_err = prepareJsLibrary(source, env)
+    if library_ok ~= nil then prepareLoginProgram(source, env)
+    elseif library_err then env.__login_program_error = library_err end
     return env
 end
 
@@ -1188,6 +1297,14 @@ local function responseRuleUrl(response)
     return network_base ~= "" and network_base or url
 end
 
+local function responseRuleInputUrl(response)
+    if response and response.virtual and response.request_type ~= nil
+            and Util.trim(tostring(response.request_type or "")) ~= "" then
+        return requestUrlPart(response.url)
+    end
+    return responseRuleUrl(response)
+end
+
 local function absolutizeRequestSpec(spec, base_url)
     base_url = requestUrlPart(base_url)
     if type(spec) == "table" then
@@ -1278,56 +1395,31 @@ local function hasContentType(headers)
     return value ~= nil and tostring(value) ~= ""
 end
 
+local function unavailableInteraction(method)
+    return function(_, url)
+        -- Throw through the host bridge so source-owned try/catch can recover.
+        -- A caught optional UI call must not poison the complete rule result.
+        error("INTERACTION_REQUIRED: java." .. method .. ": " .. tostring(url or ""), 0)
+    end
+end
+
 local function installRequestNetworkBridge(self, source, env, context)
     context = context or {}
     env.java = env.java or {}
     local function optionalToast(_, message)
-        env.__host_warnings = env.__host_warnings or {}
-        env.__host_warnings[#env.__host_warnings + 1] =
-            "java.longToast unavailable on KOReader: " .. tostring(message or "")
+        env.__host_messages = env.__host_messages or {}
+        env.__host_messages[#env.__host_messages + 1] = tostring(message or "")
         return nil
     end
-    -- Request-rule environments may already contain the generic host methods
-    -- installed by QuickJS.  Replace them here: a request script that asks
-    -- for a browser or verification prompt must become an explicit
-    -- interaction result, not an uncaught host-denied exception.
+    -- Use the same catchable API contract for request and content rules.
     env.java.toast = optionalToast
     env.java.longToast = optionalToast
-    local function requireInteraction(_, url)
-        env.__interaction_required = "INTERACTION_REQUIRED: browser verification: " .. tostring(url or "")
-        env.last_js_error = env.__interaction_required
-        local trace = ExecutionTrace:get(source)
-        if trace then trace.interaction_required = true end
-        return ""
+    for _, method in ipairs({ "startBrowser", "startBrowserAwait", "webView", "webview",
+            "showBrowser", "getVerificationCode" }) do
+        env.java[method] = unavailableInteraction(method)
     end
-    env.java.startBrowser = requireInteraction
-    env.java.startBrowserAwait = requireInteraction
-    env.java.webView = requireInteraction
-    env.java.webview = requireInteraction
-    env.java.showBrowser = requireInteraction
-    env.java.getVerificationCode = requireInteraction
     local network_base = firstNetworkBase(context.network_base, context.base_url,
         context.book and context.book.book_url, source.base_url, source.source_key)
-    local function markBrowserChallenge(response, request_spec)
-        local body = tostring(response and response.body or "")
-        local lower = body:lower()
-        -- Cloudflare's interstitial is the concrete response checked by the
-        -- Some source rules require browser interaction. Mark that condition
-        -- at the transport boundary as well:
-        -- this keeps the request result explicit even when a host string
-        -- wrapper changes the observable behavior of String.match.
-        if lower:find("<title>just a moment", 1, true)
-            or lower:find("cf_chl_opt", 1, true)
-            or lower:find("challenges.cloudflare.com", 1, true) then
-            local url = requestUrlPart(response and (response.url or response.request_url) or "")
-            if url == "" then url = requestUrlPart(request_spec) end
-            env.__interaction_required = "INTERACTION_REQUIRED: browser verification: "
-                .. tostring(url or network_base or "")
-            env.last_js_error = env.__interaction_required
-            local trace = ExecutionTrace:get(source)
-            if trace then trace.interaction_required = true end
-        end
-    end
     local function nested(spec, method, body, headers, follow_redirects)
         local request_spec = spec
         if method then request_spec = { url = spec, method = method, body = body or "", headers = headers or {} } end
@@ -1344,16 +1436,36 @@ local function installRequestNetworkBridge(self, source, env, context)
             follow_redirects = follow_redirects ~= false,
             retries = 0,
         })
-        if not response then env.last_js_error = tostring(err or "nested request failed"); return nil end
-        markBrowserChallenge(response, request_spec)
+        if not response then
+            local message = tostring(err or "nested request failed")
+            env.__nested_request_error = message
+            env.last_js_error = message
+            return nil
+        end
+        -- Return response bytes unchanged; the rule decides how to handle them.
         return response
     end
     env.ajax = function(spec)
         local response = nested(spec, nil, nil, nil, true)
-        return response and response.body or ""
+        if not response then return "" end
+        local body = tostring(response.body or "")
+        if body == "" then
+            local url = requestUrlPart(response.url or response.request_url or spec)
+            local status = response.code or response.status or "?"
+            env.__nested_request_error = "嵌套请求返回空正文（HTTP " .. tostring(status)
+                .. "）：" .. tostring(url)
+        end
+        return body
     end
     env.java.ajax = function(_, spec) return env.ajax(spec) end
     env.java.connect = function(_, spec) return responseProxy(nested(spec, nil, nil, nil, true)) end
+    env.java.get = function(_, url, headers)
+        url = tostring(url or "")
+        if url:match("^https?://") or url:sub(1, 1) == "/" then
+            return responseProxy(nested(url, "GET", "", headers, true))
+        end
+        return env.variables[url] or ""
+    end
     -- Several Legado request rules intentionally inspect a POST redirect's
     -- Location header.  Keep java.post's immediate response observable while
     -- ordinary plugin requests continue to follow redirects normally.
@@ -1395,6 +1507,7 @@ local function parseRequestSpec(self, spec, source, keyword, page, context)
             headers = option_headers,
             charset = charset,
             type = spec.type,
+            data_options = copyTable(spec),
             web_view = spec.webView == true or spec.web_view == true,
             web_js = spec.webJs or spec.web_js,
         }
@@ -1468,6 +1581,7 @@ local function parseRequestSpec(self, spec, source, keyword, page, context)
         headers = option_headers,
         charset = charset,
         type = options.type,
+        data_options = options,
         retry = options.retry,
         web_view = options.webView == true or options.web_view == true,
         web_js = options.webJs or options.web_js,
@@ -1517,7 +1631,9 @@ function LegadoSource:_prepareRequest(source, spec, keyword, page, context)
         end
         mergeHeaders(request.headers, parseHeaders(rendered))
     end
-    mergeHeaders(request.headers, source.header)
+    if diagnosticRuleType(dynamic_header) ~= "js" then
+        mergeHeaders(request.headers, source.header)
+    end
     -- Legado login headers are runtime request state. Search may succeed without
     -- them while detail/catalog endpoints reject the next request with HTTP 400.
     mergeHeaders(request.headers, parseHeaders(source.login_header))
@@ -1586,6 +1702,7 @@ local function virtualResponse(request, max_bytes)
         status = "200 data URI",
         virtual = true,
         data_metadata = decoded.metadata,
+        data_options = request.data_options,
         request_type = request.type,
     }
 end
@@ -1596,7 +1713,7 @@ function LegadoSource:requestBinary(source, spec, context, options)
     if not request then return nil, prepare_err end
     local trace_request = ExecutionTrace:requestStart(source, request)
     if BuiltinSources:isFixtureUrl(request.url) then
-        local fixture, fixture_err = BuiltinSources:request(request.url)
+        local fixture, fixture_err = BuiltinSources:request(request.url, source)
         ExecutionTrace:requestEnd(source, trace_request, fixture, fixture_err)
         return fixture, fixture_err
     end
@@ -1609,7 +1726,9 @@ function LegadoSource:requestBinary(source, spec, context, options)
         ExecutionTrace:requestEnd(source, trace_request, virtual)
         return virtual
     end
-    request.accept = options.accept or "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+    -- Match the formats accepted by ImageInfo/KOReader. Advertising AVIF here
+    -- can negotiate bytes that the cover pipeline cannot inspect or display.
+    request.accept = options.accept or "image/webp,image/png,image/jpeg,image/gif,image/svg+xml,image/tiff,image/*;q=0.8,*/*;q=0.5"
     if type(options.headers) == "table" then
         request.headers = request.headers or {}
         for name, value in pairs(options.headers) do request.headers[name] = value end
@@ -1641,7 +1760,7 @@ function LegadoSource:request(source, spec, keyword, page, context, request_opti
     if not request then return nil, prepare_err end
     local trace_request = ExecutionTrace:requestStart(source, request)
     if BuiltinSources:isFixtureUrl(request.url) then
-        local fixture, fixture_err = BuiltinSources:request(request.url)
+        local fixture, fixture_err = BuiltinSources:request(request.url, source)
         ExecutionTrace:requestEnd(source, trace_request, fixture, fixture_err)
         return fixture, fixture_err
     end
@@ -1714,7 +1833,7 @@ function LegadoSource:request(source, spec, keyword, page, context, request_opti
 
     if type(response.body) == "string" then
         local detected = Charset:detect(response.body, response.content_type, request.charset)
-        local decoded, decode_err = Charset:decode(response.body, detected)
+        local decoded, decode_err = Charset:decodeResponse(response.body, detected)
         if not decoded then return nil, stageError("CHARSET_FAILED", source, tostring(detected) .. "：" .. tostring(decode_err)) end
         response.body, response.charset = decoded, detected
     end
@@ -1770,20 +1889,21 @@ responseProxy = function(response)
     end
     proxy.cookies = function() return headerValue("set-cookie") or "" end
     proxy.header = function(_, name) return headerValue(name) or "" end
-    proxy.headers = function()
+    proxy.headers = function(receiver, name)
+        if name ~= nil or type(receiver) == "string" then
+            name = name ~= nil and name or receiver
+            local value = headerValue(name)
+            return value and { value } or {}
+        end
         local headers = copyTable(response.headers or {})
-        headers.get = function(self, key)
-            key = tostring(key or ""):lower()
-            for name, value in pairs(self) do if tostring(name):lower() == key then return value end end
-        end
-        headers.names = function(self)
-            local result = {}; for name in pairs(self) do if type(name) == "string" then result[#result + 1] = name end end
-            return result
-        end
+        headers.__leko_response_headers = true
         return headers
     end
     proxy.request = function()
-        return { url = function() return response.url or response.request_url or response.request_base_url or "" end }
+        return {
+            __leko_response_request = true,
+            url = response.url or response.request_url or response.request_base_url or "",
+        }
     end
     proxy.raw = function() return proxy end
     proxy.toString = function() return tostring(response.body or "") end
@@ -1797,12 +1917,25 @@ makeRuleEnv = function(self, source, response, extra)
         rawset(env, "__diagnostic_trace", trace)
         rawset(env, "__diagnostic_stage", trace.stage or source._diagnostic_stage or "source")
     end
-    local rule_url = responseRuleUrl(response)
+    local rule_url = responseRuleInputUrl(response)
     env.base_url, env.baseUrl = rule_url, rule_url
     -- Preserve the exact response body for pure `@js:` rules.  The parsed
     -- document remains the selector context, but Legado scripts such as
     -- `JSON.parse(result).data` must see the original JSON/text payload.
-    env.__raw_response_body = type(response.body) == "string" and response.body or tostring(response.body or "")
+    local raw_response_body = type(response.body) == "string" and response.body or tostring(response.body or "")
+    if response.virtual and response.request_type ~= nil
+            and Util.trim(tostring(response.request_type or "")) ~= "" then
+        env.__data_uri_rule_input = true
+        local encoded, encode_err = DataUri:ruleInput(raw_response_body, response.data_options)
+        if encoded == nil then
+            env.__data_uri_error = "DATA_URI_INVALID_HEX: " .. tostring(encode_err or "invalid hex payload")
+            env.last_js_error = env.__data_uri_error
+        else
+            env.__data_uri_encoded_body = encoded
+            raw_response_body = encoded
+        end
+    end
+    env.__raw_response_body = raw_response_body
     env.currentResponse = responseProxy(response)
     env.parseHtml = function(value) return RuleEngine:parseDocument(tostring(value or "")) end
     local function jsoupCollection(values, owner, owner_first, owner_last)
@@ -1907,7 +2040,7 @@ makeRuleEnv = function(self, source, response, extra)
     local function connect(spec, method, body, headers)
         local request_spec = spec
         if method then request_spec = { url = spec, method = method, body = body or "", headers = headers or {} } end
-        local nested = self:request(source, request_spec, env.keyword, env.page, {
+        local nested, nested_err = self:request(source, request_spec, env.keyword, env.page, {
             -- AnalyzeRule.ajax/connect constructs AnalyzeUrl(url) without a
             -- baseUrl.  Keep the empty logical base even though the request
             -- transport needs the source origin to resolve an absolute URL.
@@ -1916,11 +2049,24 @@ makeRuleEnv = function(self, source, response, extra)
             referer = isHttpUrl(response.url) and response.url or response.request_base_url,
             book = env.book, chapter = env.chapter,
         }, { skip_login_check = env.__in_login_check == true })
+        if not nested then
+            local message = tostring(nested_err or "nested request failed")
+            env.__nested_request_error = message
+            env.last_js_error = message
+        end
         return nested
     end
     env.ajax = function(spec)
         local nested = connect(spec)
-        return nested and nested.body or ""
+        if not nested then return "" end
+        local body = tostring(nested.body or "")
+        if body == "" then
+            local url = requestUrlPart(nested.url or nested.request_url or spec)
+            local status = nested.code or nested.status or "?"
+            env.__nested_request_error = "嵌套请求返回空正文（HTTP " .. tostring(status)
+                .. "）：" .. tostring(url)
+        end
+        return body
     end
     env.ajaxAll = function(specs)
         local output = {}
@@ -1928,7 +2074,7 @@ makeRuleEnv = function(self, source, response, extra)
             local nested = connect(spec)
             output[#output + 1] = responseProxy(nested)
         end
-        return output
+        return { __leko_java_list = output }
     end
     local utility_json = legadoUtilityJson()
     env.java = {
@@ -1954,23 +2100,21 @@ makeRuleEnv = function(self, source, response, extra)
         initUrl = function() return response.url or "" end,
         searchBook = function(_, key, group) env.__search_book = { key = key, group = group }; return true end,
         upLoginData = function(_, value) env.__login_data = value; return true end,
-        startBrowser = function(_, url) env.__interaction_required = "INTERACTION_REQUIRED: 浏览器：" .. tostring(url or ""); env.last_js_error = env.__interaction_required; return "" end,
-        startBrowserAwait = function(_, url) env.__interaction_required = "INTERACTION_REQUIRED: 浏览器验证：" .. tostring(url or ""); env.last_js_error = env.__interaction_required; return "" end,
-        webView = function(_, url) env.__interaction_required = "INTERACTION_REQUIRED: WebView：" .. tostring(url or ""); env.last_js_error = env.__interaction_required; return "" end,
-        webview = function(_, url) env.__interaction_required = "INTERACTION_REQUIRED: WebView：" .. tostring(url or ""); env.last_js_error = env.__interaction_required; return "" end,
-        showBrowser = function(_, url) env.__interaction_required = "INTERACTION_REQUIRED: 浏览器：" .. tostring(url or ""); env.last_js_error = env.__interaction_required; return "" end,
-        getVerificationCode = function() env.__interaction_required = "INTERACTION_REQUIRED: 验证码"; env.last_js_error = env.__interaction_required; return "" end,
+        startBrowser = unavailableInteraction("startBrowser"),
+        startBrowserAwait = unavailableInteraction("startBrowserAwait"),
+        webView = unavailableInteraction("webView"),
+        webview = unavailableInteraction("webview"),
+        showBrowser = unavailableInteraction("showBrowser"),
+        getVerificationCode = unavailableInteraction("getVerificationCode"),
     }
     env.java.toast = function(_, message)
-        env.__host_warnings = env.__host_warnings or {}
-        env.__host_warnings[#env.__host_warnings + 1] =
-            "java.toast unavailable on KOReader: " .. tostring(message or "")
+        env.__host_messages = env.__host_messages or {}
+        env.__host_messages[#env.__host_messages + 1] = tostring(message or "")
         return nil
     end
     env.java.longToast = function(_, message)
-        env.__host_warnings = env.__host_warnings or {}
-        env.__host_warnings[#env.__host_warnings + 1] =
-            "java.longToast unavailable on KOReader: " .. tostring(message or "")
+        env.__host_messages = env.__host_messages or {}
+        env.__host_messages[#env.__host_messages + 1] = tostring(message or "")
         return nil
     end
     env.java.ruleUrl = rule_url or ""
@@ -2006,6 +2150,118 @@ local function parsePage(response)
     return RuleEngine:parseDocument(response.body, response.content_type)
 end
 
+local function environmentStageError(source, env)
+    if not env then return nil end
+    if env.__login_program_error then return stageError("LOGIN_PROGRAM_FAILED", source, env.__login_program_error) end
+    if env.__data_uri_error then return stageError("DATA_URI_INVALID", source, env.__data_uri_error) end
+    if env.__interaction_required then return stageError("INTERACTION_REQUIRED", source, env.__interaction_required) end
+    return nil
+end
+
+local function loginResultDetail(env, result)
+    local messages = {}
+    for _, message in ipairs(env and env.__host_messages or {}) do
+        messages[#messages + 1] = tostring(message)
+    end
+    return { result = result, messages = messages, env = env }
+end
+
+local function loginEnvironment(self, source, options, status)
+    local base = requestUrlPart(source.base_url or source.source_key)
+    if not base:match("^https?://") then base = "https://leko.invalid/login" end
+    local env = makeRuleEnv(self, source, {
+        url = base, request_url = base, request_base_url = base,
+        code = 200, status = status or "200 login", content_type = "text/plain",
+        headers = {}, body = "",
+    }, {
+        keyword = "", searchKey = "", page = 1, variables = source.variables,
+        result = copyTable(source.login_info or {}),
+        __interactive = options and options.interactive == true,
+        __stage = "login", __rule = "login",
+    })
+    env.key = nil -- loginUi scripts often declare a function named key.
+    env.__in_login_check, env.__login = true, true
+    return env
+end
+
+-- Keep loginUrl as an explicit user action.  It is never probed while the
+-- configuration page opens, so a large jsLib or a source-owned login program
+-- cannot delay book-source management.
+function LegadoSource:executeLogin(source, options)
+    options = type(options) == "table" and options or {}
+    if type(source) ~= "table" then return false, "书源对象无效" end
+    local login_url = Util.trim(tostring(source.login_url or ""))
+    if login_url == "" then return false, "该书源没有 loginUrl/login()" end
+    if isHttpUrl(login_url) or DataUri:is(login_url) then
+        return false, "不支持：loginUrl 需要手机或浏览器界面"
+    end
+    -- An explicit login starts a clean source-owned Realm; after it succeeds,
+    -- the normal reading chain reuses that same Realm.
+    if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+    if type(options.login_data) == "table" then
+        source.login_info = copyTable(options.login_data)
+        local saved, save_err = self:_saveRuntimeSource(source)
+        if saved == false then return false, "登录信息保存失败：" .. tostring(save_err or "未知错误") end
+    end
+    source.login_info = source.login_info or {}
+    local env = loginEnvironment(self, source, options, "200 login")
+    env.result = copyTable(source.login_info)
+    if env.__login_program_error then
+        if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+        source._login_program_session = nil
+        return false, "loginUrl 执行失败：" .. tostring(env.__login_program_error), loginResultDetail(env)
+    end
+    local result, login_err = QuickJS:eval(
+        "if(typeof login!='function'){throw('login function not found')} return login.apply(this);",
+        env, { timeout_ms = tonumber(options.timeout_ms) or 5000, max_result_bytes = 256 * 1024 })
+    if login_err then return false, "login() 执行失败：" .. tostring(login_err), loginResultDetail(env) end
+    if env.__interaction_required then
+        return false, "不支持：该登录流程需要手机或浏览器界面", loginResultDetail(env, result)
+    end
+    local saved, save_err = self:_saveRuntimeSource(source)
+    if saved == false then return false, "登录状态保存失败：" .. tostring(save_err or "未知错误"), loginResultDetail(env, result) end
+    return true, nil, loginResultDetail(env, result)
+end
+
+function LegadoSource:executeLoginUiAction(source, action, options)
+    options = type(options) == "table" and options or {}
+    action = Util.trim(tostring(action or ""))
+    if type(source) ~= "table" then return false, "书源对象无效" end
+    if action == "" then return false, "该控件没有可执行 action" end
+    if action:match("^https?://") then return false, "该控件需要手机或浏览器界面" end
+    if type(options.login_data) == "table" then
+        source.login_info = copyTable(options.login_data)
+        local saved, save_err = self:_saveRuntimeSource(source)
+        if saved == false then return false, "登录信息保存失败：" .. tostring(save_err or "未知错误") end
+    end
+    local env = loginEnvironment(self, source, options, "200 loginUi")
+    env.__login_ui_action = true
+    env.result = copyTable(source.login_info or {})
+    if env.__login_program_error then
+        if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+        source._login_program_session = nil
+        return false, "loginUrl 执行失败：" .. tostring(env.__login_program_error), loginResultDetail(env)
+    end
+    local result, action_err = QuickJS:eval(action, env, {
+        timeout_ms = tonumber(options.timeout_ms) or 5000, max_result_bytes = 256 * 1024,
+    })
+    if action_err then
+        -- A failed optional action owns its error.  Rebuild the shared Realm on
+        -- the next reading operation so partial globals cannot leak into it.
+        if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+        source._login_program_session = nil
+        return false, "按钮执行失败：" .. tostring(action_err), loginResultDetail(env)
+    end
+    if env.__interaction_required then
+        if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+        source._login_program_session = nil
+        return false, "该按钮需要手机或浏览器界面", loginResultDetail(env, result)
+    end
+    local saved, save_err = self:_saveRuntimeSource(source)
+    if saved == false then return false, "执行结果保存失败：" .. tostring(save_err or "未知错误"), loginResultDetail(env, result) end
+    return true, nil, loginResultDetail(env, result)
+end
+
 local function initializedContext(document, rules, env)
     local init_rule = firstRule(rules, "init", "initial", "root")
     if not init_rule then return document end
@@ -2017,6 +2273,21 @@ end
 
 local normalizeCoverCandidate
 
+-- A JSON search response can contain a very large catalogue.  Only a static
+-- title/author projection is safe to use for the first pass: templates and
+-- scripts may read mutable source state or perform requests, so those rules
+-- always retain the established complete parser path below.
+local function safeJsonDiscoveryRule(rule)
+    if rule == nil or rule == "" then return true end
+    if type(rule) == "table" then
+        for _, part in ipairs(rule) do
+            if not safeJsonDiscoveryRule(part) then return false end
+        end
+        return true
+    end
+    return RuleEngine:isStaticJsonProjection(rule)
+end
+
 local function parseBookInfoResponse(self, source, seed, response, options)
     options = options or {}
     local response_url = responseRuleUrl(response)
@@ -2027,6 +2298,7 @@ local function parseBookInfoResponse(self, source, seed, response, options)
     if options.refresh_cover then info.cover = nil end
     local env = makeRuleEnv(self, source, response, { book = info, variables = info.variables })
     local context = initializedContext(document, rules, env)
+    local prefer_json_context = type(context) == "table" and not isRuleNode(context)
     local mappings = {
         { "title", { "name", "bookName", "title" } },
         { "author", { "author", "writer" } },
@@ -2046,8 +2318,9 @@ local function parseBookInfoResponse(self, source, seed, response, options)
         local field, names = mapping[1], mapping[2]
         local rule = firstRule(rules, unpack(names))
         traceRule(source, env, "bookInfo." .. field, rule)
-        local value = field == "cover" and RuleEngine:extractUrl(context, rule, response_url, env)
-            or RuleEngine:extract(context, rule, response_url, "", env)
+        local value = field == "cover" and RuleEngine:extractUrl(context, rule, response_url, env,
+                prefer_json_context)
+            or RuleEngine:extract(context, rule, response_url, "", env, true)
         if field == "cover" then value = normalizeCoverCandidate(value, response_url) end
         if nonEmptyScalar(value) then
             info[field] = field == "cover" and value or Util.collapseSpaces(value)
@@ -2055,7 +2328,7 @@ local function parseBookInfoResponse(self, source, seed, response, options)
     end
     local toc_rule = firstRule(rules, "tocUrl", "toc_url", "catalogUrl")
     traceRule(source, env, "bookInfo.tocUrl", toc_rule)
-    local toc_url = RuleEngine:extractUrl(context, toc_rule, response_url, env)
+    local toc_url = RuleEngine:extractUrl(context, toc_rule, response_url, env, prefer_json_context)
     if toc_rule and toc_url == "" and env.last_js_error then
         return nil, env.last_js_error
     end
@@ -2183,6 +2456,94 @@ function LegadoSource:search(source, keyword, page, options)
     end
     local results = {}
     local max_results = math.max(1, tonumber(options.max_results or math.huge) or math.huge)
+
+    -- For a static JSON title/author rule, identify the best row within the
+    -- user-selected inspection limit, then execute the complete legacy rules
+    -- for just that row. HTML/DOM, templates and side-effecting JavaScript do
+    -- not enter this branch.
+    local lazy_initial_variables, lazy_variables_by_node
+    local name_rule = firstRule(rules, "name", "bookName", "title")
+    local author_rule = firstRule(rules, "author", "writer")
+    local discovery_cover_rule = firstRule(rules, "coverUrl", "cover", "image")
+    local discover_cover = options.search_mode == "cover"
+    if options.lazy_search == true
+            and safeJsonDiscoveryRule(name_rule) and safeJsonDiscoveryRule(author_rule)
+            and (not discover_cover or safeJsonDiscoveryRule(discovery_cover_rule)) then
+        -- Global search scans a wider window than the emit cap: aggregate
+        -- sources repeat one book across many site mirrors, so a window equal
+        -- to the cap could deduplicate down to a single row.
+        local discovery_limit
+        if options.search_mode == "global" then
+            discovery_limit = math.min(#nodes, math.max(60, math.floor(max_results) * 6))
+        else
+            discovery_limit = math.min(#nodes, math.max(1, math.floor(max_results)))
+        end
+        local json_nodes = discovery_limit > 0
+        for index = 1, discovery_limit do
+            local node = nodes[index]
+            if type(node) ~= "table" or isRuleNode(node) then json_nodes = false; break end
+        end
+        if json_nodes then
+            local discovered = {}
+            for index = 1, discovery_limit do
+                local node = nodes[index]
+                local candidate = {
+                    source_id = source.id,
+                    variables = copyTable(source.variables),
+                    _search_base_url = response_url,
+                }
+                env.variables = candidate.variables
+                bindBookEnvironment(env, source, candidate)
+                local function discoverField(field, names)
+                    local rule = firstRule(rules, unpack(names))
+                    traceRule(source, env, "search." .. field, rule)
+                    local value = RuleEngine:extract(node, rule, response_url, "", env, true)
+                    if nonEmptyScalar(value) then candidate[field] = Util.collapseSpaces(value) end
+                end
+                discoverField("title", { "name", "bookName", "title" })
+                discoverField("author", { "author", "writer" })
+                if discover_cover then discoverField("cover", { "coverUrl", "cover", "image" }) end
+                candidate.variables = copyTable(env.variables)
+                candidate._lazy_node = node
+                discovered[#discovered + 1] = candidate
+            end
+            if discover_cover then
+                -- Keep all same-title image alternatives inside the inspection
+                -- limit. One failed internal provider must not erase the rest.
+                nodes, lazy_variables_by_node = {}, {}
+                for _, candidate in ipairs(discovered) do
+                    if BookIdentity:sameTitle(options.search_title, candidate.title) then
+                        nodes[#nodes + 1] = candidate._lazy_node
+                        lazy_variables_by_node[candidate._lazy_node] = candidate.variables
+                    end
+                end
+            else
+                -- Global search keeps every distinct relevant book, best first
+                -- (aggregate sources like 书山 return hundreds of different
+                -- books; collapsing to one row threw the list away).  Same-title
+                -- switch still selects exactly one row.
+                local ranked
+                if options.search_mode == "global" then
+                    ranked = BookIdentity:rankedSearchResults(discovered, keyword, max_results)
+                else
+                    local selected = BookIdentity:bestExactTitle(discovered, options.search_title,
+                        options.search_author, false)
+                    ranked = selected and { { item = selected } } or {}
+                end
+                if #ranked == 0 then
+                    restoreRuntimeSuppression()
+                    return {}
+                end
+                lazy_variables_by_node = {}
+                nodes = {}
+                for _, hit in ipairs(ranked) do
+                    nodes[#nodes + 1] = hit.item._lazy_node
+                    lazy_variables_by_node[hit.item._lazy_node] = hit.item.variables
+                end
+                max_results = #nodes
+            end
+        end
+    end
     for _, node in ipairs(nodes) do
         -- SearchBook is mutable while rules are evaluated.  Real Legado rules
         -- commonly populate kind/wordCount/lastChapter first and reference
@@ -2190,7 +2551,8 @@ function LegadoSource:search(source, keyword, page, options)
         -- without a bound book silently loses IDs such as book.kind.
         local candidate = {
             source_id = source.id,
-            variables = copyTable(source.variables),
+            variables = copyTable(lazy_variables_by_node and lazy_variables_by_node[node]
+                or lazy_initial_variables or source.variables),
             _search_base_url = response_url,
         }
         retainJsonNodeFields(candidate, node)
@@ -2200,7 +2562,7 @@ function LegadoSource:search(source, keyword, page, options)
         local function textField(field, names)
             local rule = firstRule(rules, unpack(names))
             traceRule(source, env, "search." .. field, rule)
-            local value = RuleEngine:extract(node, rule, response_url, "", env)
+            local value = RuleEngine:extract(node, rule, response_url, "", env, true)
             if nonEmptyScalar(value) then candidate[field] = Util.collapseSpaces(value) end
             return candidate[field] or ""
         end
@@ -2213,7 +2575,9 @@ function LegadoSource:search(source, keyword, page, options)
 
         local cover_rule = firstRule(rules, "coverUrl", "cover", "image")
         traceRule(source, env, "search.cover", cover_rule)
-        local cover = normalizeCoverCandidate(RuleEngine:extractUrl(node, cover_rule, response_url, env), response_url)
+        local prefer_json_context = type(node) == "table" and not isRuleNode(node)
+        local cover = normalizeCoverCandidate(RuleEngine:extractUrl(node, cover_rule, response_url, env,
+            prefer_json_context), response_url)
         -- Field scripts may assign `book.coverUrl/book.bookUrl/book.tocUrl` as
         -- their primary side effect and intentionally return nothing.  Those
         -- assignments already landed on the mutable SearchBook proxy; never
@@ -2223,7 +2587,7 @@ function LegadoSource:search(source, keyword, page, options)
 
         local book_url_rule = firstRule(rules, "bookUrl", "book_url", "url")
         traceRule(source, env, "search.bookUrl", book_url_rule)
-        local book_url = RuleEngine:extractUrl(node, book_url_rule, response_url, env)
+        local book_url = RuleEngine:extractUrl(node, book_url_rule, response_url, env, prefer_json_context)
         if not nonEmptyScalar(book_url) then book_url = "" end
         if book_url == "" then
             -- Only an explicit JS assignment to the mutable SearchBook proxy
@@ -2238,7 +2602,7 @@ function LegadoSource:search(source, keyword, page, options)
 
         local toc_rule = firstRule(rules, "tocUrl", "toc_url", "catalogUrl")
         traceRule(source, env, "search.tocUrl", toc_rule)
-        local toc_value = RuleEngine:extractUrl(node, toc_rule, response_url, env)
+        local toc_value = RuleEngine:extractUrl(node, toc_rule, response_url, env, prefer_json_context)
         if not nonEmptyScalar(toc_value) then toc_value = "" end
         if toc_value == "" then toc_value = tostring(candidate.toc_url or "") end
         candidate.toc_url = toc_value ~= "" and resolveRuleRequest(toc_value, response_url, response.request_base_url) or nil
@@ -2246,8 +2610,13 @@ function LegadoSource:search(source, keyword, page, options)
 
         if tostring(candidate.title or "") ~= "" and tostring(candidate.book_url or "") ~= "" then
             results[#results + 1] = candidate
+            -- Exact-title early exit only makes sense for same-title source
+            -- switching, where one complete candidate is the whole answer.
+            -- In global keyword search the first exact hit is just the best
+            -- of MANY rows the aggregate source returned; breaking here
+            -- collapsed the list back to a single row.
             local exact_query = options.exact_title_query
-            if nonEmptyScalar(exact_query) then
+            if nonEmptyScalar(exact_query) and options.search_mode ~= "global" then
                 local score = BookIdentity:searchScore(exact_query, candidate.title, candidate.author)
                 if score == 1000 then break end
             end
@@ -2271,6 +2640,30 @@ function LegadoSource:search(source, keyword, page, options)
     if options.save_runtime ~= false then self:_saveRuntimeSource(source) end
     if options.cache_write ~= false then cacheWrite("search", cache_key, results) end
     return results
+end
+
+local function reportProgress(options, stage, current, total)
+    if type(options) == "table" and type(options.on_progress) == "function" then
+        pcall(options.on_progress, stage, current, total)
+    end
+end
+
+-- Content pagination does not know its final page count until nextContentUrl
+-- becomes empty.  Give every page/phase a coordinate on one convergent scale
+-- instead of restarting at 0/3 for each response.  This is derived from the
+-- real ordered work (page + phase), so callers never need to hide regressions
+-- with max(old, new).
+local function contentActivityProgress(page, phase)
+    page = math.max(1, math.floor(tonumber(page) or 1))
+    phase = math.max(0, math.min(3, math.floor(tonumber(phase) or 0)))
+    local completed_units = (page - 1) * 3 + phase
+    if completed_units <= 0 then return 0, 1000 end
+    return math.floor(1000 * completed_units / (completed_units + 3)), 1000
+end
+
+local function reportContentProgress(options, stage, page, phase)
+    local current, total = contentActivityProgress(page, phase)
+    reportProgress(options, "正文第 " .. tostring(page) .. " 页 · " .. stage, current, total)
 end
 
 function LegadoSource:getBookInfo(source, result, options)
@@ -2307,6 +2700,7 @@ function LegadoSource:getBookInfo(source, result, options)
         })
     else
         local detail_base = source.base_url
+        reportProgress(options, "正在请求书籍详情", 0, 2)
         response, err = self:request(source, result.book_url, nil, 1, {
             book = result,
             base_url = detail_base,
@@ -2314,6 +2708,7 @@ function LegadoSource:getBookInfo(source, result, options)
         })
     end
     if not response then return nil, stageError("DETAIL_REQUEST_FAILED", source, err) end
+    reportProgress(options, "书籍详情已返回，正在解析", 1, 2)
     local response_url = responseRuleUrl(response)
     local document = parsePage(response)
     local rules = source.rule_book_info
@@ -2321,7 +2716,10 @@ function LegadoSource:getBookInfo(source, result, options)
     info.variables = copyTable(result.variables or source.variables)
     if options.refresh_cover then info.cover = nil end
     local env = makeRuleEnv(self, source, response, { book = info, variables = info.variables })
+    local environment_error = environmentStageError(source, env)
+    if environment_error then return nil, environment_error end
     local context = initializedContext(document, rules, env)
+    local prefer_json_context = type(context) == "table" and not isRuleNode(context)
     local mappings = {
         { "title", { "name", "bookName", "title" } },
         { "author", { "author", "writer" } },
@@ -2338,8 +2736,9 @@ function LegadoSource:getBookInfo(source, result, options)
         local field, names = mapping[1], mapping[2]
         local rule = firstRule(rules, unpack(names))
         traceRule(source, env, "bookInfo." .. field, rule)
-        local value = field == "cover" and RuleEngine:extractUrl(context, rule, response_url, env)
-            or RuleEngine:extract(context, rule, response_url, "", env)
+        local value = field == "cover" and RuleEngine:extractUrl(context, rule, response_url, env,
+                prefer_json_context)
+            or RuleEngine:extract(context, rule, response_url, "", env, true)
         if field == "cover" then value = normalizeCoverCandidate(value, response_url) end
         if nonEmptyScalar(value) then
             info[field] = field == "cover" and value or Util.collapseSpaces(value)
@@ -2347,7 +2746,7 @@ function LegadoSource:getBookInfo(source, result, options)
     end
     local toc_rule = firstRule(rules, "tocUrl", "toc_url", "catalogUrl")
     traceRule(source, env, "bookInfo.tocUrl", toc_rule)
-    local toc_url = RuleEngine:extractUrl(context, toc_rule, response_url, env)
+    local toc_url = RuleEngine:extractUrl(context, toc_rule, response_url, env, prefer_json_context)
     if toc_rule and toc_url == "" and env.last_js_error then
         return nil, stageError("DETAIL_PARSE_FAILED", source, env.last_js_error)
     end
@@ -2385,16 +2784,59 @@ end
 
 local function ruleFlag(context, rule, response, env)
     if rule == nil or rule == "" then return false end
-    local value = RuleEngine:extract(context, rule, responseRuleUrl(response), "", env)
+    local value = RuleEngine:extract(context, rule, responseRuleInputUrl(response), "", env, true)
     if type(value) == "boolean" then return value end
     value = Util.trim(tostring(value or "")):lower()
     return value ~= "" and value ~= "0" and value ~= "false" and value ~= "null" and value ~= "nil"
 end
 
-local function addChapters(chapters, seen, nodes, rules, response, env)
+local function addChapters(chapters, seen, nodes, rules, response, env, options, signature)
     local response_url = responseRuleUrl(response)
+    local rule_url = responseRuleInputUrl(response)
     local current_volume = nil
+    if not options._toc_reuse_index then
+        local existing = options.existing_chapters
+        if type(existing) == "function" then existing = signature and existing() or nil end
+        options._toc_reuse_index = TocReuse:index(existing)
+    end
+    local previous = options._toc_reuse_index
+    local item_keys, item_counts = {}, {}
+    if signature then
+        for index, node in ipairs(nodes) do
+            local key = not isRuleNode(node) and TocReuse:itemKey(node, signature) or nil
+            item_keys[index] = key
+            if key then item_counts[key] = (item_counts[key] or 0) + 1 end
+        end
+    end
+    local chapter_url_rule = firstRule(rules, "chapterUrl", "url", "href")
+    local eager_batch_urls
+    if options.defer_chapter_urls == false and chapter_url_rule then
+        eager_batch_urls = RuleEngine:extractUrlsBatch(nodes, chapter_url_rule,
+            rule_url, env, response_url, 32)
+    end
     for index, node in ipairs(nodes) do
+        if index == 1 or index % 25 == 0 then
+            local label = signature and previous.count > 0 and not options.force_toc_parse
+                and "正在核对目录（" or "正在解析目录（"
+            reportProgress(options, label .. tostring(index) .. "/" .. tostring(#nodes) .. "）", index, #nodes)
+        end
+        local reuse_key = not isRuleNode(node) and TocReuse:key(node, signature) or nil
+        local item_key = item_keys[index]
+        local reused = not options.force_toc_parse and reuse_key and previous[reuse_key]
+        local stats = options.toc_stats
+        if reused then
+            local chapter = copyTable(reused)
+            local seen_key = tostring(chapter._raw_url or chapter.url or "")
+            if not seen[seen_key] then
+                seen[seen_key] = true
+                chapter.index = #chapters + 1
+                chapter.volume = chapter.is_volume and chapter.title or current_volume
+                chapters[#chapters + 1] = chapter
+            end
+            if chapter.is_volume then current_volume = chapter.title end
+            if stats then stats.reused = (stats.reused or 0) + 1 end
+        else
+        if stats then stats.parsed = (stats.parsed or 0) + 1 end
         -- BookChapterList creates a fresh BookChapter for every TOC node.
         -- Bind that empty chapter while evaluating the node so @put targets
         -- the same object as AnalyzeRule.put, while reads fall back to the
@@ -2413,7 +2855,9 @@ local function addChapters(chapters, seen, nodes, rules, response, env)
             variableScope(book_variables or {}, source_variables))
         local title_rule = firstRule(rules, "chapterName", "name", "title")
         traceRule(env.source and rawget(env.source, "__target") or nil, env, "toc.chapterName", title_rule)
-        local title = RuleEngine:extract(node, title_rule, response_url, "", env)
+        -- Field rules consume this selected chapter, while src retains the
+        -- response. Do not let raw-body transport optimizations choose result.
+        local title = RuleEngine:extract(node, title_rule, rule_url, "", env, true)
         local format_js = firstRule(rules, "formatJs", "format_js")
         if title ~= "" and format_js and format_js ~= "" then
             traceRule(env.source and rawget(env.source, "__target") or nil, env, "toc.formatJs", format_js)
@@ -2426,7 +2870,6 @@ local function addChapters(chapters, seen, nodes, rules, response, env)
         local volume_rule = firstRule(rules, "isVolume", "is_volume")
         traceRule(env.source and rawget(env.source, "__target") or nil, env, "toc.isVolume", volume_rule)
         local is_volume = ruleFlag(node, volume_rule, response, env)
-        local chapter_url_rule = firstRule(rules, "chapterUrl", "url", "href")
         traceRule(env.source and rawget(env.source, "__target") or nil, env, "toc.chapterUrl", chapter_url_rule)
         -- BookChapterList stores the selector result as-is.  URL resolution is
         -- deferred to BookChapter.getAbsoluteURL(), so the production content
@@ -2434,7 +2877,18 @@ local function addChapters(chapters, seen, nodes, rules, response, env)
         -- absolute Book.bookUrl.  Keep both representations for ordinary
         -- chapters: the public URL is request-ready for the desktop host,
         -- while the raw value preserves the WebBook branch predicate.
-        local raw_chapter_url = RuleEngine:extract(node, chapter_url_rule, nil, "", env)
+        local deferred_url
+        if options.defer_chapter_urls ~= false and not is_volume and chapter_url_rule then
+            deferred_url = RuleEngine:prepareDeferredUrl(node, chapter_url_rule, rule_url, env)
+        end
+        local raw_chapter_url
+        if deferred_url then
+            raw_chapter_url = "leko-deferred://chapter/" .. tostring(deferred_url.identity)
+        elseif eager_batch_urls then
+            raw_chapter_url = eager_batch_urls[index]
+        else
+            raw_chapter_url = RuleEngine:extractUrl(node, chapter_url_rule, rule_url, env, true, response_url)
+        end
         local volume_url_fallback = false
         if not nonEmptyScalar(raw_chapter_url) then
             if is_volume then
@@ -2453,16 +2907,20 @@ local function addChapters(chapters, seen, nodes, rules, response, env)
         -- Keep the marker in _raw_url for the special-volume content branch
         -- and expose the same request-ready URL that the production model
         -- returns to callers.
-        local chapter_url = volume_url_fallback
+        local chapter_url = deferred_url and raw_chapter_url or (volume_url_fallback
             and (response_url or raw_chapter_url)
-            or resolveRuleRequest(raw_chapter_url, response_url, response.request_base_url)
+            or resolveRuleRequest(raw_chapter_url, response_url, response.request_base_url))
         local normalized_title = Util.collapseSpaces(title)
         local seen_key = tostring(raw_chapter_url or "")
         if title ~= "" and chapter_url ~= "" and not seen[seen_key] then
             seen[seen_key] = true
-            local update_value = RuleEngine:extract(node, firstRule(rules, "updateTime", "update_time", "info"), response_url, "", env)
+            if not TocReuse:canStore(chapter_url_rule, raw_chapter_url) then
+                reuse_key, item_key = nil, nil
+            end
+            local update_value = RuleEngine:extract(node, firstRule(rules, "updateTime", "update_time", "info"), rule_url, "", env, true)
+            local previous_item = item_key and item_counts[item_key] == 1 and previous.items[item_key]
             chapters[#chapters + 1] = {
-                id = Util.hashId(seen_key), title = normalized_title, url = chapter_url,
+                id = previous_item and previous_item.id or Util.hashId(seen_key), title = normalized_title, url = chapter_url,
                 index = #chapters + 1, downloaded = false,
                 is_volume = is_volume,
                 volume = is_volume and normalized_title or current_volume,
@@ -2473,18 +2931,24 @@ local function addChapters(chapters, seen, nodes, rules, response, env)
                 variables = copyTable(chapter_context.variables),
                 _request_base_url = firstNetworkBase(responseRuleUrl(response), response.request_base_url),
                 _raw_url = tostring(raw_chapter_url or ""),
+                _deferred_url = deferred_url,
+                _toc_reuse_key = reuse_key,
+                _toc_item_key = item_key,
             }
         end
         if is_volume and title ~= "" then current_volume = normalized_title end
+        end
     end
 end
 
 function LegadoSource:getToc(source, book, options)
     options = options or {}
+    local existing = options.existing_chapters or book.chapters
+    options._toc_reuse_index = type(existing) == "table" and TocReuse:index(existing) or nil
     local ok, support_err = checkSupported(source)
     if not ok then return nil, support_err end
     local cache_key = tostring(source.id) .. "\n" .. tostring(book.toc_url or book.book_url or "")
-    local cached = options.cache_read ~= false and cacheRead("toc", cache_key) or nil
+    local cached = not options.check_only and options.cache_read ~= false and cacheRead("toc", cache_key) or nil
     if type(cached) == "table" and #cached > 0 then return cached end
     if source.single_chapter then
         local chapter_url = book.toc_url or book.book_url
@@ -2497,6 +2961,8 @@ function LegadoSource:getToc(source, book, options)
             downloaded = false,
             variables = {},
         }}
+        if options.check_only then return {count=1, signature=tostring(chapter_url)} end
+        book.toc_node_count, book.toc_list_signature = 1, tostring(chapter_url)
         if options.cache_write ~= false then cacheWrite("toc", cache_key, single) end
         return single
     end
@@ -2504,6 +2970,16 @@ function LegadoSource:getToc(source, book, options)
     local list_rule = firstRule(rules, "chapterList", "chapter_list", "list")
     if not list_rule then return nil, "缺少 ruleToc.chapterList" end
 
+    -- A scripted next-page rule may read state written by chapter rules.
+    -- Preserve that ordering even during a lightweight check.
+    local pagination_rule = firstRule(rules, "nextTocUrl", "nextUrl", "nextPage")
+    local check_needs_chapter_state = options.check_only and not safeJsonDiscoveryRule(pagination_rule)
+    -- Changed directories are committed by the background check. For paged
+    -- rules keep the original chapter/page side-effect order and retain the
+    -- result; for one-page lists wait until the cheap probe proves a change.
+    local materialize_check = options.check_only and options.prepare_update
+        and pagination_rule ~= nil and pagination_rule ~= ""
+    local pending_page
     local pre_update = firstRule(rules, "preUpdateJs", "pre_update_js")
     -- WebBook.getChapterListAwait only runs this branch when its runPerJs
     -- argument is true.  Keeping the opt-in explicit prevents a normal TOC
@@ -2539,6 +3015,7 @@ function LegadoSource:getToc(source, book, options)
         end
     end
 
+    local node_count, list_signatures = 0, {}
     local current_url, pages, chapters, seen_pages, seen_chapters, last_env, last_response = book.toc_url or book.book_url, 0, {}, {}, {}, nil, nil
     local inline_response
     local inline_body = tostring(book.toc_html or "")
@@ -2548,7 +3025,8 @@ function LegadoSource:getToc(source, book, options)
     -- only when the resolved TOC URL is that same detail/book URL (including
     -- the final URL recorded after a redirect), never as a generic parse
     -- fallback for an unrelated page.
-    if inline_body ~= "" and (tostring(current_url or "") == tostring(book.book_url or "")
+    if not options.check_only and options.reuse_inline_response ~= false
+            and inline_body ~= "" and (tostring(current_url or "") == tostring(book.book_url or "")
             or tostring(current_url or "") == inline_detail_url) then
         ExecutionTrace:branch(source, "toc-html-reuse", "toc", "book.tocHtml", {
             value = inline_body,
@@ -2574,6 +3052,7 @@ function LegadoSource:getToc(source, book, options)
         if pages == 1 and inline_response then
             response = inline_response
         else
+            reportProgress(options, "正在请求目录第 " .. tostring(pages) .. " 页", 0, 1)
             response, err = self:request(source, current_url, nil, pages, {
                 book = book, page = pages, base_url = request_base, referer = request_base,
             })
@@ -2581,18 +3060,71 @@ function LegadoSource:getToc(source, book, options)
         if not response then
             return nil, stageError("TOC_REQUEST_FAILED", source, err or ("第 " .. tostring(pages) .. " 页失败"))
         end
+        reportProgress(options, "目录已返回，正在提取章节", 0, 1)
         last_response = response
         local response_url = responseRuleUrl(response)
         local document = parsePage(response)
         local env = makeRuleEnv(self, source, response, { book = book, page = pages, variables = book.variables or source.variables })
         last_env = env
+        local environment_error = environmentStageError(source, env)
+        if environment_error then return nil, environment_error end
         local context = initializedContext(document, rules, env)
         traceRule(source, env, "toc.chapterList", list_rule)
-        addChapters(chapters, seen_chapters, RuleEngine:select(context, list_rule, env), rules, response, env)
+        local nodes = RuleEngine:select(context, list_rule, env)
+        if env.last_js_error then
+            if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+            return nil, stageError("TOC_REQUEST_FAILED", source, env.__nested_request_error or env.last_js_error)
+        end
+        node_count = node_count + #nodes
+        -- Chapter java.get reads chapter -> book -> source, whereas list
+        -- scripts may have a narrower variable table. Probe dependencies in
+        -- the same scope as a fresh chapter, then restore the list scope for
+        -- next-page rules.
+        local list_variables = env.variables
+        env.variables = variableScope({}, variableScope(book.variables, source.variables))
+        local reuse_signature = not options.disable_toc_reuse and TocReuse:prepare(
+            source, rules, env, responseRuleInputUrl(response)) or nil
+        env.variables = list_variables
+        local encoded_ok, encoded
+        if #nodes == 0 or not isRuleNode(nodes[1]) then encoded_ok, encoded = pcall(rapidjson.encode, nodes, {sort_keys=true}) end
+        -- JSON aggregates expose their actual selected catalogue here, even
+        -- when the outer response was only a data URI request descriptor.
+        list_signatures[#list_signatures + 1] = Digest:sha256((encoded_ok and encoded or response.body or "")
+            .. (reuse_signature or ""))
+        if not options.check_only or check_needs_chapter_state or materialize_check then
+            addChapters(chapters, seen_chapters, nodes, rules, response, env, options, reuse_signature)
+            if options.prepare_update and env.last_js_error then
+                return nil, stageError("TOC_REQUEST_FAILED", source, env.__nested_request_error or env.last_js_error)
+            end
+        elseif options.prepare_update then
+            pending_page = {nodes=nodes, response=response, env=env, signature=reuse_signature}
+        end
         local next_rule = firstRule(rules, "nextTocUrl", "nextUrl", "nextPage")
         traceRule(source, env, "toc.nextTocUrl", next_rule)
         local next_url = next_rule and RuleEngine:extractUrl(context, next_rule, response_url, env) or ""
         current_url = next_url ~= "" and resolveRuleRequest(next_url, response_url, response.request_base_url) or nil
+    end
+    if current_url and current_url ~= "" and not seen_pages[current_url] then
+        return nil, stageError("TOC_REQUEST_FAILED", source, "目录分页未完成")
+    end
+    local list_signature = Digest:sha256(table.concat(list_signatures, "\n")
+        .. rapidjson.encode(rules, {sort_keys=true})
+        .. tostring((book.variables and book.variables.__reverse_toc) or source.variables.__reverse_toc or false))
+    if options.check_only then
+        if node_count == 0 then return nil, stageError("TOC_PARSE_EMPTY", source, "目录列表为空") end
+        local changed = node_count ~= book.toc_node_count or list_signature ~= book.toc_list_signature
+        if not options.prepare_update or not changed then
+            if options.save_runtime ~= false then self:_saveRuntimeSource(source) end
+            return {count=node_count, signature=list_signature}
+        end
+        if pending_page then
+            addChapters(chapters, seen_chapters, pending_page.nodes, rules,
+                pending_page.response, pending_page.env, options, pending_page.signature)
+            if pending_page.env.last_js_error then
+                return nil, stageError("TOC_REQUEST_FAILED", source,
+                    pending_page.env.__nested_request_error or pending_page.env.last_js_error)
+            end
+        end
     end
     if (book.variables and book.variables.__reverse_toc) or source.variables.__reverse_toc then
         local reversed = {}
@@ -2609,28 +3141,92 @@ function LegadoSource:getToc(source, book, options)
             local meta = diagnosticParseMeta(source, last_response, list_rule)
             if meta ~= "" then message = message .. " · " .. meta end
         end
-        return nil, stageError(last_env and last_env.last_js_error and "SCRIPT_UNSUPPORTED" or "TOC_PARSE_EMPTY", source, message)
+        local nested_error = last_env and last_env.__nested_request_error
+        if last_env and last_env.last_js_error and type(QuickJS.closeSession) == "function" then
+            QuickJS:closeSession(source)
+        end
+        return nil, stageError(nested_error and "TOC_REQUEST_FAILED"
+            or (last_env and last_env.last_js_error and "SCRIPT_UNSUPPORTED" or "TOC_PARSE_EMPTY"),
+            source, nested_error or message)
     end
     if options.save_runtime ~= false then self:_saveRuntimeSource(source) end
+    if options.check_only then
+        return {count=node_count, signature=list_signature, chapters=chapters}
+    end
+    book.toc_node_count, book.toc_list_signature = node_count, list_signature
     if options.cache_write ~= false then cacheWrite("toc", cache_key, chapters) end
     return chapters
 end
 
-function LegadoSource:getContent(source, book, chapter)
+local function nextChapterRequest(book, chapter, options)
+    if options.next_chapter_url ~= nil then return options.next_chapter_url end
+    local chapters = book.chapters or {}
+    local index = tonumber(chapter.index)
+    local function matches(candidate)
+        return candidate and (candidate == chapter
+            or (chapter.id ~= nil and candidate.id == chapter.id)
+            or (chapter.url ~= nil and candidate.url == chapter.url))
+    end
+    if not index or not matches(chapters[index]) then
+        index = nil
+        for i, candidate in ipairs(chapters) do
+            if matches(candidate) then index = i; break end
+        end
+    end
+    if not index then return nil end
+    -- Like Legado, the final chapter also stops a link back to the first.
+    local following = chapters[index + 1] or chapters[1]
+    if not following or following._deferred_url then return nil end
+    return following._raw_url or following.url
+end
+
+function LegadoSource:getContent(source, book, chapter, options)
+    options = options or {}
+    local next_chapter_url = nextChapterRequest(book, chapter, options)
+    local started_at = socket.gettime()
     local ok, support_err = checkSupported(source)
     if not ok then return nil, support_err, false end
     local rules = source.rule_content
+    local runtime_chapter = chapter
+    local deferred_capture = type(chapter._deferred_url) == "table" and chapter._deferred_url or nil
+    if deferred_capture then
+        local chapter_url_rule = firstRule(source.rule_toc, "chapterUrl", "url", "href")
+        if not chapter_url_rule then
+            return nil, stageError("CONTENT_REQUEST_FAILED", source, "章节地址规则已不存在，请刷新目录"), false
+        end
+        reportContentProgress(options, "正在生成章节请求地址", 1, 0)
+        local resolution_base = chapter._request_base_url or book.toc_url or book.book_url or source.base_url
+        local deferred_response = {
+            url = resolution_base, request_url = resolution_base,
+            request_base_url = resolution_base, body = "", headers = {}, code = 200, status = 200,
+        }
+        local deferred_env = makeRuleEnv(self, source, deferred_response, {
+            book = book, chapter = chapter, page = 1,
+            variables = variableScope(chapter.variables, variableScope(book.variables, source.variables)),
+            base_url = resolution_base,
+        })
+        local resolved_url, resolve_err = RuleEngine:resolveDeferredUrl(
+            deferred_capture, chapter_url_rule, resolution_base, deferred_env, resolution_base)
+        if not resolved_url then
+            return nil, stageError("CONTENT_REQUEST_FAILED", source,
+                "生成章节请求地址失败：" .. tostring(resolve_err or "未知错误")), false
+        end
+        runtime_chapter = copyTable(chapter)
+        runtime_chapter.variables = chapter.variables
+        runtime_chapter.url = resolved_url
+        runtime_chapter._raw_url = resolved_url
+    end
     local content_rule = firstRule(rules, "content", "body", "text")
     -- WebBook.getContentAwait returns the chapter URL when no content rule is
     -- declared.  It is a real production branch, not a parser failure.
     if not content_rule then
         ExecutionTrace:branch(source, "empty-content-rule", "content", "ruleContent.content", {
-            value = chapter._raw_url or chapter.url,
+            value = runtime_chapter._raw_url or runtime_chapter.url,
         })
         -- WebBook returns BookChapter.url as stored by the TOC rule.  Leko
         -- keeps the resolved URL in chapter.url for the host, so use the raw
         -- value here to preserve the production no-rule branch.
-        return tostring(chapter._raw_url or chapter.url or ""), nil, false
+        return tostring(runtime_chapter._raw_url or runtime_chapter.url or ""), nil, false
     end
     -- SharedJsScope is cached by jsLib and held weakly by Legado.  Do not close
     -- the source-owned QuickJS session merely because content begins: that
@@ -2638,17 +3234,17 @@ function LegadoSource:getContent(source, book, chapter)
     -- depend on a synthetic stage boundary.  Explicit source/task teardown
     -- still calls QuickJS.closeSession through the normal lifecycle path.
     if Util.trim(tostring(source.js_lib or "")) ~= "" then
-        source._js_library_base_url_override = chapter.url
+        source._js_library_base_url_override = runtime_chapter.url
     end
-    local raw_chapter_url = tostring(chapter._raw_url or chapter.url or "")
-    if chapter.is_volume == true and raw_chapter_url:sub(1, #tostring(chapter.title or ""))
-            == tostring(chapter.title or "") then
+    local raw_chapter_url = tostring(runtime_chapter._raw_url or runtime_chapter.url or "")
+    if runtime_chapter.is_volume == true and raw_chapter_url:sub(1, #tostring(runtime_chapter.title or ""))
+            == tostring(runtime_chapter.title or "") then
         ExecutionTrace:branch(source, "special-volume-content", "content", "bookChapter.isVolume", {
-            value = chapter.tag or "",
+            value = runtime_chapter.tag or "",
         })
-        return tostring(chapter.tag or ""), nil, false
+        return tostring(runtime_chapter.tag or ""), nil, false
     end
-    local current_url, pages, seen_pages, pieces, last_env, last_response = chapter.url, 0, {}, {}, nil, nil
+    local current_url, pages, seen_pages, pieces, last_env, last_response = runtime_chapter.url, 0, {}, {}, nil, nil
     local inline_response
     -- BookService must know whether the content parser actually selected the
     -- bounded detail response before deleting its sidecar.
@@ -2659,8 +3255,8 @@ function LegadoSource:getContent(source, book, chapter)
     -- BookContent has the same narrowly-scoped reuse branch as BookChapterList:
     -- only a chapter whose URL is the resolved book/detail URL can consume the
     -- retained detail HTML.
-    if inline_body ~= "" and (tostring(chapter._raw_url or chapter.url or "") == tostring(book.book_url or "")
-            or tostring(chapter._raw_url or chapter.url or "") == inline_detail_url) then
+    if inline_body ~= "" and (tostring(runtime_chapter._raw_url or runtime_chapter.url or "") == tostring(book.book_url or "")
+            or tostring(runtime_chapter._raw_url or runtime_chapter.url or "") == inline_detail_url) then
         ExecutionTrace:branch(source, "content-toc-html-reuse", "content", "book.tocHtml", {
             value = inline_body,
         })
@@ -2678,7 +3274,11 @@ function LegadoSource:getContent(source, book, chapter)
             value = source.source_regex,
         })
     end
-    while current_url and current_url ~= "" and pages < self.max_content_pages and not seen_pages[current_url] do
+    while current_url and current_url ~= "" and not seen_pages[current_url] do
+        if socket.gettime() - started_at >= self.max_content_seconds then
+            return nil, stageError("CONTENT_REQUEST_FAILED", source,
+                "正文请求超过总时限，未缓存不完整章节"), inline_response_consumed
+        end
         seen_pages[current_url], pages = true, pages + 1
         -- BookContent creates AnalyzeUrl(nextUrl) without a baseUrl for
         -- content pagination.  Only the first content request uses book.tocUrl.
@@ -2690,8 +3290,9 @@ function LegadoSource:getContent(source, book, chapter)
             response = inline_response
             inline_response_consumed = true
         else
+            reportContentProgress(options, "正在请求目标章节正文", pages, 0)
             response, err = self:request(source, current_url, nil, pages, {
-                book = book, chapter = chapter, page = pages,
+                book = book, chapter = runtime_chapter, page = pages,
                 base_url = request_base, referer = request_base,
             }, {
                 -- AnalyzeUrl.getStrResponseAwait(jsStr = ruleContent.webJs)
@@ -2703,26 +3304,31 @@ function LegadoSource:getContent(source, book, chapter)
         if not response then
             return nil, stageError("CONTENT_REQUEST_FAILED", source, err or ("第 " .. tostring(pages) .. " 页失败"))
         end
+        reportContentProgress(options, "正文已返回，正在执行解析规则", pages, 1)
         last_response = response
         local response_url = responseRuleUrl(response)
         if response_url == "" then
             response_url = requestUrlPart(response and (response.url or response.request_url) or current_url)
         end
         local document = parsePage(response)
-        local chapter_variables = type(chapter.variables) == "table" and chapter.variables or {}
+        local chapter_variables = type(runtime_chapter.variables) == "table" and runtime_chapter.variables or {}
         local book_variables = type(book.variables) == "table" and book.variables or {}
         local variables = variableScope(chapter_variables, variableScope(book_variables, source.variables))
         local env = makeRuleEnv(self, source, response, {
-            book = book, chapter = chapter, page = pages, variables = variables,
+            book = book, chapter = runtime_chapter, page = pages, variables = variables,
             base_url = response_url,
+            nextChapterUrl = next_chapter_url,
         })
         -- Keep the rule JS base tied to the actual chapter response even when
         -- a transport adapter omits its normalized URL field.
         env.base_url, env.baseUrl = response_url, response_url
         last_env = env
+        local environment_error = environmentStageError(source, env)
+        if environment_error then return nil, environment_error, inline_response_consumed end
         local context = initializedContext(document, rules, env)
         traceRule(source, env, "content.content", content_rule)
         local content = RuleEngine:extract(context, content_rule, response_url, "\n", env)
+        reportContentProgress(options, "正文规则完成，正在整理内容", pages, 2)
         content = RuleEngine:applyReplaceRules(content, firstRule(rules, "replaceRegex", "replace_regex"))
         content = RuleEngine:applyReplaceRules(content, source.raw and source.raw.replaceRegex)
         local formatted_content, media_contract = RuleEngine:formatContent(content, response_url)
@@ -2732,7 +3338,19 @@ function LegadoSource:getContent(source, book, chapter)
         local next_rule = firstRule(rules, "nextContentUrl", "nextUrl", "nextPage")
         traceRule(source, env, "content.nextContentUrl", next_rule)
         local next_url = next_rule and RuleEngine:extractUrl(context, next_rule, response_url, env) or ""
+        -- A later page's script failure must not turn the already collected
+        -- prefix into a successfully cached, incomplete chapter.
+        if env.last_js_error then
+            local nested_error = env.__nested_request_error
+            if type(QuickJS.closeSession) == "function" then QuickJS:closeSession(source) end
+            return nil, stageError(nested_error and "CONTENT_REQUEST_FAILED" or "SCRIPT_UNSUPPORTED",
+                source, nested_error or env.last_js_error), inline_response_consumed
+        end
         current_url = next_url ~= "" and resolveRuleRequest(next_url, response_url, response.request_base_url) or nil
+        if current_url and next_chapter_url and next_chapter_url ~= ""
+                and current_url == resolveRuleRequest(next_chapter_url, response_url, response.request_base_url) then
+            current_url = nil
+        end
     end
     -- Legado appends successive content pages with one line break. A blank
     -- line here changes the chapter body and is observable in the oracle.
@@ -2752,8 +3370,15 @@ function LegadoSource:getContent(source, book, chapter)
             local meta = diagnosticParseMeta(source, last_response, content_rule)
             if meta ~= "" then message = message .. " · " .. meta end
         end
-        return nil, stageError(last_env and last_env.last_js_error and "SCRIPT_UNSUPPORTED" or "CONTENT_PARSE_EMPTY", source, message)
+        local nested_error = last_env and last_env.__nested_request_error
+        if last_env and last_env.last_js_error and type(QuickJS.closeSession) == "function" then
+            QuickJS:closeSession(source)
+        end
+        return nil, stageError(nested_error and "CONTENT_REQUEST_FAILED"
+            or (last_env and last_env.last_js_error and "SCRIPT_UNSUPPORTED" or "CONTENT_PARSE_EMPTY"),
+            source, nested_error or message)
     end
+    reportProgress(options, "正文分页请求完成，正在完成整理", 1000, 1000)
     self:_saveRuntimeSource(source)
     return output, nil, inline_response_consumed
 end
@@ -2808,6 +3433,7 @@ function LegadoSource:validateChain(source, keyword, options)
     })
     if not chapters or #chapters == 0 then return fail("toc", toc_err or "目录为空") end
     report.chapter_count = #chapters
+    info.chapters = chapters
 
     report.stage = "content"
     local content, content_err = self:getContent(source, info, chapters[1])
@@ -2834,5 +3460,6 @@ LegadoSource.requestUrlPart = requestUrlPart
 LegadoSource.absolutizeRequestSpec = absolutizeRequestSpec
 LegadoSource.firstNetworkBase = firstNetworkBase
 LegadoSource.analyzeCompatibility = analyzeCompatibility
+LegadoSource._test = { contentActivityProgress = contentActivityProgress }
 
 return LegadoSource

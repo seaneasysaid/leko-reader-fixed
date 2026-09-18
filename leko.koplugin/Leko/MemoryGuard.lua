@@ -1,16 +1,13 @@
 -- Lightweight Linux memory-pressure guard for old Kindle devices.
 -- It never allocates large buffers and reads only small /proc text files.
 local MemoryGuard = {
-    -- Below this available-memory level, keep background work single-process.
+    -- Retained for diagnostics; live dangerous pressure decides worker count.
     cautious_available_kb = 128 * 1024,
-    -- A large KOReader parent makes fork/COW expensive even when MemAvailable
-    -- still looks healthy. This ceiling also forces one background worker.
+    -- Retained for package compatibility; the live reserve below is decisive.
     cautious_rss_kb = 96 * 1024,
     -- Used only for diagnostics and more aggressive garbage collection.
     critical_available_kb = 64 * 1024,
-    -- Kindle 7-class devices commonly expose only about 256 MiB. Two forked
-    -- search children are not safe there even when the current free-memory
-    -- snapshot happens to look healthy.
+    -- Used for low-RAM waves and child-growth policy, not worker admission.
     low_ram_total_kb = 384 * 1024,
 }
 
@@ -53,12 +50,10 @@ function MemoryGuard:recommendedBackgroundWorkers()
     local total = tonumber(snapshot.total_kb)
     local available = tonumber(snapshot.available_kb)
     local rss = tonumber(snapshot.rss_kb)
-    -- Unknown memory state is treated conservatively. /proc is expected on
-    -- KOReader devices; failure to read it must not silently enable two forks.
+    -- Unknown live pressure remains conservative.
     if not total or not available or not rss then return 1, snapshot end
-    if total < self.low_ram_total_kb then return 1, snapshot end
-    if available < self.cautious_available_kb then return 1, snapshot end
-    if rss > self.cautious_rss_kb then return 1, snapshot end
+    if available < self.critical_available_kb then return 1, snapshot end
+    if total > 0 and total - rss < self.critical_available_kb then return 1, snapshot end
     return 2, snapshot
 end
 
@@ -85,6 +80,7 @@ function MemoryGuard:backgroundChildUnsafe(pid)
     -- MemAvailable is the most useful signal here because fork RSS includes
     -- shared COW pages and therefore grossly overstates unique child memory.
     if available and available < self.critical_available_kb then
+        pcall(function() require("Leko/SearchResultCache"):onMemoryPressure() end)
         return true, "系统可用内存已低于 " .. tostring(math.floor(self.critical_available_kb / 1024)) .. " MiB", snapshot, child_rss
     end
     -- A child far larger than the parent baseline usually means one source has

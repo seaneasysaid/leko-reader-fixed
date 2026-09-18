@@ -193,12 +193,22 @@ local function sourceRuntimePayload(source)
     return {
         cookies = type(source.cookies) == "table" and source.cookies or {},
         variables = type(source.variables) == "table" and source.variables or {},
+        -- loginUi fields are runtime state: a configured aggregate source must
+        -- continue to work after its source record is reloaded or KOReader is
+        -- restarted, without putting credentials in the source catalogue.
+        login_info = type(source.login_info) == "table" and source.login_info or {},
         -- Legado JS may call source.putLoginHeader() during search and consume
         -- it in ruleBookInfo/ruleToc. It is runtime state just like Cookie and
         -- source variables, so subprocess boundaries must preserve it.
         login_header = source.login_header,
+        -- Compact, non-sensitive loginUi capability verdicts.  The signature
+        -- includes the source definitions and host capability version.
+        action_capability_cache = type(source.action_capability_cache) == "table"
+            and source.action_capability_cache or nil,
     }
 end
+
+Storage.TOC_FORMAT = 2 -- bump to invalidate cached TOCs when chapter descriptor encoding changes
 
 function Storage:init()
     Util.mkdirp(self.root_dir)
@@ -674,6 +684,17 @@ function Storage:listSourceSummaries()
         if resolved then result[#result + 1] = resolved end
     end
     return sortSourceSummaries(result)
+end
+
+function Storage:getSourceCatalogRevision()
+    if not self._source_catalog_cache then
+        local summaries = self:listSourceSummaries()
+        if not summaries then return nil end
+    end
+    local catalog = self._source_catalog_cache or {}
+    return table.concat({ tostring(catalog.records_file or ""),
+        tostring(catalog.source_compatibility_version or ""),
+        tostring(catalog.builtin_sources_version or "") }, ":")
 end
 
 
@@ -1160,14 +1181,22 @@ function Storage:getDefaultReaderStyle()
         layout_version = READER_LAYOUT_VERSION,
         margin_left = 28,
         margin_right = 28,
-        -- Legacy fields retained for settings compatibility. Paginator owns
-        -- the vertical chrome gaps; only margin_left/margin_right are used as
-        -- user-facing reading margins.
-        margin_top = 14,
+        -- User-facing vertical margins (上下边距). Paginator insets the
+        -- reading area by these values; margin_left/margin_right form the
+        -- horizontal reading margins. 12/12 matches the historical chrome
+        -- gaps so existing readers keep their geometry by default.
+        margin_top = 12,
         margin_bottom = 12,
         line_spacing = 0.28,
         paragraph_spacing = 10,
+        -- 段评（番茄 / 七猫 / QQ阅读章节的段落评论气泡）。默认关闭：只在排版菜单里显式打开。
+        para_review_enabled = false,
         indent = true,
+        text_align = "left",
+        -- 字体粗细: false = 正常, true = 粗体.
+        body_bold = false,
+        -- 夜间模式: dark background with light text.
+        night_mode = false,
         show_header = true,
         show_footer = true,
         chapter_new_page = true,
@@ -1185,6 +1214,10 @@ function Storage:getReaderStyle()
     local saved = self:getSettings():readSetting("reader_style") or {}
     local style = self:getDefaultReaderStyle()
     for key, value in pairs(saved) do style[key] = value end
+    -- 字体粗细 was removed from the reader UI. Force any legacy numeric
+    -- (1/2/3) or boolean true value back to false so old bold archives do
+    -- not linger once the menu entry is gone.
+    style.body_bold = false
     -- 0.15.19 persisted the old fixed 44/54 chapter-opening gaps. Migrate
     -- only those title fields; never touch the user's font, horizontal
     -- reading margins, line spacing or indentation preference.
@@ -1273,7 +1306,7 @@ function Storage:saveBookProfileToc(book_id, profile_key, chapters)
     if not book_id or not profile_key or type(chapters) ~= "table" then return false end
     Util.mkdirp(self:getBookProfileTocDir(book_id))
     local settings = LuaSettings:open(self:getBookProfileTocPath(book_id, profile_key))
-    settings.data = { chapters = chapters, updated_at = os.time() }
+    settings.data = { chapters = chapters, updated_at = os.time(), toc_format = self.TOC_FORMAT }
     settings:flush()
     return true
 end
@@ -1282,6 +1315,7 @@ function Storage:loadBookProfileToc(book_id, profile_key)
     local path = self:getBookProfileTocPath(book_id, profile_key)
     if lfs.attributes(path, "mode") ~= "file" then return nil end
     local data = LuaSettings:open(path).data or {}
+    if tonumber(data.toc_format) ~= self.TOC_FORMAT then return nil end
     return type(data.chapters) == "table" and data.chapters or nil
 end
 
@@ -1736,7 +1770,11 @@ function Storage:hydrateSourceRuntime(source)
     local runtime = LuaSettings:open(path).data or {}
     if type(runtime.cookies) == "table" then source.cookies = runtime.cookies end
     if type(runtime.variables) == "table" then source.variables = runtime.variables end
+    if type(runtime.login_info) == "table" then source.login_info = runtime.login_info end
     if runtime.login_header ~= nil then source.login_header = runtime.login_header end
+    if type(runtime.action_capability_cache) == "table" then
+        source.action_capability_cache = runtime.action_capability_cache
+    end
     local payload = sourceRuntimePayload(source)
     self._runtime_source_signatures[tostring(source.id)] = stableStateSignature(payload)
     return source

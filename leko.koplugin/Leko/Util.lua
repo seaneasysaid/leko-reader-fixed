@@ -184,6 +184,37 @@ function Util.mkdirp(path)
     return true
 end
 
+-- Monotonic counter so two calls in the same millisecond cannot collide.
+local tmpname_counter = 0
+
+-- os.tmpname() raises "unable to generate a unique filename" on Android
+-- (bionic's tmpnam is unusable) and on some devices returns a path under
+-- /tmp that cannot actually be opened.  Prefer the platform helper only
+-- after proving the returned path is writable; otherwise fall back to a
+-- scratch file inside leko's own cache directory, which every reader
+-- build (Android app-private storage included) can write.
+function Util.tmpname()
+    tmpname_counter = tmpname_counter + 1
+    local ok, path = pcall(os.tmpname)
+    if ok and type(path) == "string" and path ~= "" then
+        local file = io.open(path, "wb")
+        if file then
+            file:close()
+            os.remove(path)
+            return path
+        end
+    end
+    local datastorage = require("datastorage")
+    local dir = Util.joinPath(datastorage:getDataDir(), "leko", "cache")
+    Util.mkdirp(dir)
+    local name = "leko-tmp-" .. tostring(os.time()) .. "-" .. tostring(tmpname_counter) .. ".tmp"
+    local fallback = Util.joinPath(dir, name)
+    local file = io.open(fallback, "wb")
+    if not file then return nil, "无法创建临时文件：" .. fallback end
+    file:close()
+    return fallback
+end
+
 function Util.readFile(path, binary)
     local file, err = io.open(path, binary and "rb" or "r")
     if not file then return nil, err end

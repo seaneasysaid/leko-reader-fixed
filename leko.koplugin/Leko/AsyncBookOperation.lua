@@ -9,6 +9,7 @@ local MemoryGuard = require("Leko/MemoryGuard")
 local ProcessBudget = require("Leko/ProcessBudget")
 local Storage = require("Leko/Storage")
 local SubprocessPayload = require("Leko/SubprocessPayload")
+local Util = require("Leko/Util")
 
 local AsyncBookOperation = {
     poll_interval = 0.18,
@@ -34,7 +35,10 @@ local function writeProgress(path, current, total, stage)
     local temp = path .. ".new"
     local file = io.open(temp, "wb")
     if not file then return end
-    file:write(tostring(current or 0), "\t", tostring(total or 1), "\t", stage)
+    -- A new timestamp is a real activity event even when the visible stage
+    -- and percentage stay unchanged while a large parser continues working.
+    file:write(tostring(current or 0), "\t", tostring(total or 1), "\t", stage,
+        "\t", string.format("%.6f", socket.gettime()))
     file:close()
     os.remove(path)
     os.rename(temp, path)
@@ -71,6 +75,20 @@ local function releaseBudget(worker)
     end
 end
 
+local function flushStateQueue(worker)
+    if not worker or worker.cancelled then
+        if worker then worker.state_queue = {} end
+        return
+    end
+    local queue = worker.state_queue or {}
+    worker.state_queue = {}
+    if type(worker.on_state) ~= "function" then return end
+    for _, event in ipairs(queue) do
+        if worker.cancelled then break end
+        pcall(worker.on_state, event.state, event.text, event.current, event.total, worker)
+    end
+end
+
 local function dispatchCallback(worker, ok, err, payload, book, on_complete)
     if not worker or not worker.callback then
         if on_complete then pcall(on_complete) end
@@ -80,6 +98,9 @@ local function dispatchCallback(worker, ok, err, payload, book, on_complete)
     worker.callback_pending = true
     local function run()
         worker.callback_pending = false
+        -- A host may process nextTick callbacks newest-first. Flush every real
+        -- progress event in FIFO order before completion can close the dialog.
+        flushStateQueue(worker)
         if not worker.cancelled then pcall(callback, ok, err, worker, payload, book) end
         if on_complete then pcall(on_complete) end
     end
@@ -89,12 +110,18 @@ end
 
 local function dispatchState(worker, state, text, current, total)
     if not worker or type(worker.on_state) ~= "function" or worker.cancelled then return end
-    local callback = worker.on_state
-    local function run()
-        if not worker.cancelled then pcall(callback, state, text, current, total, worker) end
+    worker.state_queue = worker.state_queue or {}
+    worker.state_queue[#worker.state_queue + 1] = {
+        state = state, text = text, current = current, total = total,
+    }
+    if worker.state_dispatch_pending then return end
+    worker.state_dispatch_pending = true
+    local function drain()
+        worker.state_dispatch_pending = false
+        flushStateQueue(worker)
     end
-    if type(UIManager.nextTick) == "function" then UIManager:nextTick(run)
-    else UIManager:scheduleIn(0, run) end
+    if type(UIManager.nextTick) == "function" then UIManager:nextTick(drain)
+    else UIManager:scheduleIn(0, drain) end
 end
 
 local function readProgress(worker)
@@ -103,9 +130,11 @@ local function readProgress(worker)
     if not file then return end
     local value = file:read("*a"); file:close()
     if value == "" or value == worker.last_progress then return end
-    local current, total, stage = value:match("^(%d+)\t(%d+)\t(.*)$")
+    local current, total, stage = value:match("^(%d+)\t(%d+)\t([^\t]*)")
     if not current then return end
     worker.last_progress = value
+    worker.last_activity_at = socket.gettime()
+    worker.last_stage = stage
     dispatchState(worker, "running", stage, tonumber(current), tonumber(total))
 end
 
@@ -119,17 +148,22 @@ end
 
 local function execute(job)
     local payload = { ok = false }
+    local function report(current, stage, total)
+        writeProgress(job.progress_path, current, total or 100, stage)
+    end
     local ok, err = xpcall(function()
         if job.operation == "prepare" then
-            local book, book_err = BookService:prepareSearchResult(job.result)
+            local book, book_err, warning = BookService:prepareSearchResult(job.result, report)
             if not book then error(tostring(book_err or "无法准备书籍")) end
+            payload.warning = warning
             payload.ok = true
             payload.book_id = book.id
         elseif job.operation == "prepare-reading" then
             local book, load_err = Storage:loadBook(job.book_id)
             if not book then error(tostring(load_err or "无法读取当前书籍")) end
-            local ready, read_err = BookService:prepareReading(book, job.chapter_index)
+            local ready, read_err, warning = BookService:prepareReading(book, job.chapter_index, report)
             if not ready then error(tostring(read_err or "试读章节准备失败")) end
+            payload.warning = warning
             payload.ok = true
             payload.book_id = ready.id
             payload.chapter_index = ready.position and ready.position.chapter or job.chapter_index
@@ -142,6 +176,9 @@ local function execute(job)
                 or (book.position and book.position.chapter) or 1) or 1
             local ready, chapter_err = BookService:ensureChapter(book, chapter_index, {
                 persist_metadata = false,
+                on_progress = function(stage, current, total)
+                    report(15 + math.floor(75 * (tonumber(current or 0) or 0) / math.max(1, tonumber(total or 100) or 100)), stage, 100)
+                end,
             })
             if not ready then error(tostring(chapter_err or "目标章节准备失败")) end
             book.position = book.position or {}
@@ -160,6 +197,9 @@ local function execute(job)
             local ready, chapter_err = BookService:ensureChapter(book, chapter_index, {
                 persist_metadata = false,
                 force_network = true,
+                on_progress = function(stage, current, total)
+                    report(15 + math.floor(75 * (tonumber(current or 0) or 0) / math.max(1, tonumber(total or 100) or 100)), stage, 100)
+                end,
             })
             if not ready then error(tostring(chapter_err or "本章刷新失败")) end
             book.position = book.position or {}
@@ -174,7 +214,7 @@ local function execute(job)
         elseif job.operation == "prepare-toc" then
             local book, load_err = Storage:loadBook(job.book_id)
             if not book then error(tostring(load_err or "无法读取当前书籍")) end
-            local ready, toc_err = BookService:ensureToc(book)
+            local ready, toc_err = BookService:ensureToc(book, report)
             if not ready then error(tostring(toc_err or "目录准备失败")) end
             payload.ok = true
             payload.book_id = ready.id
@@ -182,7 +222,7 @@ local function execute(job)
         elseif job.operation == "switch-source" then
             local book, load_err = Storage:loadBook(job.book_id)
             if not book then error(tostring(load_err or "无法读取当前书籍")) end
-            local updated, switch_err, warning = BookService:switchContentSource(book, job.result, nil, {
+            local updated, switch_err, warning = BookService:switchContentSource(book, job.result, report, {
                 prepare_chapter = true,
             })
             if not updated then error(tostring(switch_err or "内容源切换失败")) end
@@ -191,13 +231,14 @@ local function execute(job)
             payload.warning = warning
             payload.load_toc = true
         elseif job.operation == "refresh-toc" then
-            local book, load_err = Storage:loadBook(job.book_id)
+            local book, load_err = Storage:loadBook(job.book_id, {load_toc=not job.check_only})
             if not book then error(tostring(load_err or "无法读取当前书籍")) end
-            local updated, refresh_err, change = BookService:refreshToc(book)
+            local operation = job.check_only and BookService.checkToc or BookService.refreshToc
+            local updated, refresh_err, change = operation(BookService, book, report)
             if not updated then error(tostring(refresh_err or "目录刷新失败")) end
             payload.ok = true
             payload.book_id = updated.id
-            payload.load_toc = true
+            payload.load_toc = not job.check_only
             payload.toc_change = change
         elseif job.operation == "apply-cover" then
             local book, load_err = Storage:loadBook(job.book_id)
@@ -256,7 +297,7 @@ function AsyncBookOperation:_finish(worker)
     if not worker or worker.finished then return end
     worker.finished = true
     local spec = worker.spec or BookOperationSpec:get(worker.operation)
-    dispatchState(worker, "handoff", spec.handoff, 2, spec.total)
+    dispatchState(worker, "handoff", spec.handoff, spec.total >= 100 and 96 or 2, spec.total)
     local payload, payload_err = readResultPayload(worker)
     if worker.cancelled then releaseBudget(worker); return end
     local function release() releaseBudget(worker) end
@@ -282,7 +323,7 @@ function AsyncBookOperation:_finish(worker)
     if worker.cancelled then release(); return end
     local function loadParentBook()
         if worker.cancelled then release(); return end
-        dispatchState(worker, "loading", spec.loading, 3, spec.total)
+        dispatchState(worker, "loading", spec.loading, spec.total >= 100 and 98 or 3, spec.total)
         collectgarbage("collect")
         local book, load_err = Storage:loadBook(payload.book_id, { load_toc = payload.load_toc ~= false })
         if not book then
@@ -292,7 +333,7 @@ function AsyncBookOperation:_finish(worker)
         -- Disk preparation and UI presentation are separate states. The final
         -- visible completion belongs to the coordinator that owns the reader or
         -- mutation UI, not to this subprocess transport layer.
-        dispatchState(worker, "layout", spec.layout, 3, spec.total)
+        dispatchState(worker, "layout", spec.layout, spec.total >= 100 and 99 or 3, spec.total)
         dispatchCallback(worker, true, nil, payload, book, release)
     end
     local delay = tonumber(payload.parent_load_delay or 0) or 0
@@ -304,16 +345,34 @@ function AsyncBookOperation:_poll(worker)
     readProgress(worker)
     if ffiutil.isSubProcessDone(worker.pid) then
         self:_finish(worker)
-    elseif socket.gettime() - worker.started_at >= worker.timeout_seconds then
+    else
+        local now = socket.gettime()
+        local total_elapsed = now - worker.started_at
+        local idle_elapsed = now - (worker.last_activity_at or worker.started_at)
+        local timed_out = worker.timeout_mode == "inactivity"
+            and idle_elapsed >= worker.timeout_seconds
+            or worker.timeout_mode ~= "inactivity" and total_elapsed >= worker.timeout_seconds
+        if worker.max_timeout_seconds and total_elapsed >= worker.max_timeout_seconds then timed_out = true end
+        if not timed_out then
+            UIManager:scheduleIn(self.poll_interval, function() self:_poll(worker) end)
+            return
+        end
         worker.finished = true
         ffiutil.terminateSubProcess(worker.pid)
         local function finishTimeout()
             closeResultPipe(worker)
             releaseBudget(worker)
             if not worker.cancelled then
-                dispatchCallback(worker, false,
-                    "打开书籍超时（" .. tostring(worker.timeout_seconds) .. "秒）",
-                    { timed_out = true })
+                local stage = worker.last_stage and worker.last_stage ~= "" and ("；最后阶段：" .. worker.last_stage) or ""
+                local message
+                if worker.timeout_mode == "inactivity" and idle_elapsed >= worker.timeout_seconds then
+                    message = "书籍处理连续 " .. tostring(worker.timeout_seconds) .. " 秒没有新进展，已停止（总耗时 "
+                        .. tostring(math.max(1, math.floor(total_elapsed + 0.5))) .. " 秒）" .. stage
+                else
+                    message = "书籍处理达到安全上限，已停止（总耗时 "
+                        .. tostring(math.max(1, math.floor(total_elapsed + 0.5))) .. " 秒）" .. stage
+                end
+                dispatchCallback(worker, false, message, { timed_out = true })
             end
         end
         local function reap()
@@ -321,8 +380,6 @@ function AsyncBookOperation:_poll(worker)
             else UIManager:scheduleIn(self.reap_interval, reap) end
         end
         UIManager:scheduleIn(self.reap_interval, reap)
-    else
-        UIManager:scheduleIn(self.poll_interval, function() self:_poll(worker) end)
     end
 end
 
@@ -358,8 +415,13 @@ function AsyncBookOperation:start(job, callback)
         book_id = job.book_id,
         chapter_index = tonumber(job.chapter_index),
         force_network = job.force_network == true,
+        check_only = job.check_only == true,
         export_format = job.export_format,
-        progress_path = job.operation == "export-book" and os.tmpname() or nil,
+        progress_path = ({
+            prepare = true, ["prepare-reading"] = true, ["prepare-chapter"] = true,
+            ["redownload-chapter"] = true, ["prepare-toc"] = true,
+            ["switch-source"] = true, ["refresh-toc"] = true, ["export-book"] = true,
+        })[job.operation] and Util.tmpname() or nil,
         -- The selected candidate carries executable ruleSearch context. Fork
         -- with the complete table; never shrink variables/Cookie/login state to
         -- satisfy an IPC control-message limit.
@@ -373,6 +435,8 @@ function AsyncBookOperation:start(job, callback)
         pending = true,
         timeout_seconds = math.max(10,
             tonumber(job.timeout_seconds or spec.timeout_seconds or self.hard_timeout) or self.hard_timeout),
+        timeout_mode = tostring(job.timeout_mode or spec.timeout_mode or "elapsed"),
+        max_timeout_seconds = tonumber(job.max_timeout_seconds or spec.max_timeout_seconds),
         on_payload_ready = job.on_payload_ready,
         on_state = job.on_state,
         on_cancel = job.on_cancel,
@@ -385,6 +449,10 @@ function AsyncBookOperation:start(job, callback)
             tonumber(job.queue_timeout_seconds or spec.queue_timeout_seconds or self.queue_timeout)
                 or self.queue_timeout),
     }
+    worker.cancel = function(first, second)
+        local reason = first == worker and second or first
+        return AsyncBookOperation:cancel(worker, reason)
+    end
 
     local function spawn(ticket)
         worker.pending = false
@@ -411,6 +479,7 @@ function AsyncBookOperation:start(job, callback)
         worker.result_fd = result_fd_or_err
         worker.payload_path = payload_path
         worker.started_at = socket.gettime()
+        worker.last_activity_at = worker.started_at
         UIManager:scheduleIn(self.poll_interval, function() self:_poll(worker) end)
     end
 

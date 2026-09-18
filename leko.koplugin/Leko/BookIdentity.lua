@@ -9,10 +9,6 @@ local TITLE_SUFFIXES = {
     "txt全集下载", "txt下载", "电子书下载", "电子书",
 }
 
-local SITE_SUFFIXES = {
-    "笔趣阁", "顶点小说", "顶点中文", "69书吧", "小说网", "小说阅读网", "书库", "阅读网",
-}
-
 local SEMANTIC_CONTINUATIONS = {
     "续", "续集", "前传", "后传", "番外", "外传", "第二部", "第2部", "二部", "2部",
     "第三部", "第3部", "三部", "3部",
@@ -92,9 +88,6 @@ local function isPresentationSuffix(value)
         local normalized = suffix:lower():gsub("[%s%p%c]", "")
         if value == normalized or value:find(normalized, 1, true) then return true end
     end
-    for _, suffix in ipairs(SITE_SUFFIXES) do
-        if value == suffix or value:find(suffix, 1, true) then return true end
-    end
     return false
 end
 
@@ -139,22 +132,6 @@ local function stripKnownSuffixes(value)
     return trim(value)
 end
 
-local function stripSiteSuffix(value)
-    value = trim(value)
-    local lower = value:lower()
-    for _, suffix in ipairs(SITE_SUFFIXES) do
-        local needle = suffix:lower()
-        if #lower > #needle and lower:sub(-#needle) == needle then
-            local prefix = trim(value:sub(1, #value - #suffix))
-            -- These are unambiguous site labels. Remove an optional separator
-            -- before them, but never remove semantic continuation words.
-            prefix = prefix:gsub("[%s%-%_|·—–－]+$", "")
-            return trim(prefix)
-        end
-    end
-    return value
-end
-
 local function removePunctuation(value)
     value = value:gsub("[%s%p%c]", "")
     for _, token in ipairs(PUNCTUATION) do value = removePlain(value, token) end
@@ -177,7 +154,6 @@ function BookIdentity:normalizeTitle(value)
     value = stripOuterWrappers(value)
     value = stripTrailingBrackets(value)
     value = stripKnownSuffixes(value)
-    value = stripSiteSuffix(value)
     value = stripOuterWrappers(value)
     return removePunctuation(value)
 end
@@ -222,17 +198,19 @@ function BookIdentity:searchMatch(keyword, title, author)
         end
     end
     if title_query ~= "" and normalized_title ~= "" then
-        local query_length = utf8Length(title_query)
-        -- A query long enough to look like a complete Chinese book title must
-        -- match exactly after presentation suffixes are removed. This avoids
-        -- accepting sequels, similarly named books, or noisy prefix matches.
-        -- One- and two-character input is treated as an intentional partial
-        -- search and may return clearly labelled related titles.
-        if query_length <= 2 and query_length >= 1 then
-            if normalized_title:find(title_query, 1, true) then
-                return normalized_title:sub(1, #title_query) == title_query
-                    and 700 or 620, "related-title"
-            end
+        -- Partial title matches are admitted for every query length.  An exact
+        -- hit already returned above, so this branch only ranks the remainder:
+        -- a hit anchored at the start of the title outranks one found in the
+        -- middle.  Gating this on one- and two-character queries made ordinary
+        -- Chinese searches return nothing at all -- "十日终" never matched
+        -- "十日终焉", so the entire result set was dropped before reaching the
+        -- list.  That failure is invisible: no source error and no skipped
+        -- source, the list just stays empty.  Longer queries are the *more*
+        -- precise case, so the old length gate had the noise trade-off
+        -- backwards.
+        local anchor = normalized_title:find(title_query, 1, true)
+        if anchor then
+            return anchor == 1 and 700 or 620, "related-title"
         end
     end
     return nil
@@ -254,6 +232,60 @@ function BookIdentity:bestSearchResult(results, keyword)
     return best, best_score, best_kind
 end
 
+-- Ranked variant of bestSearchResult for aggregate sources (书山原生): one
+-- upstream search returns many distinct books, so collapsing to the single
+-- best row throws away everything the user searched for.  Scores every row,
+-- drops near-duplicates (same normalized title+author — the aggregate repeats
+-- the same book across dozens of mirror sites), sorts by score and returns at
+-- most max_n entries as { item, score, kind } records.
+function BookIdentity:rankedSearchResults(results, keyword, max_n)
+    max_n = tonumber(max_n) or 10
+    -- Author voting: among rows whose title is an exact match for the keyword,
+    -- the most common author is almost always the original book's author
+    -- (dozens of mirror sites), while same-title impostors (fanfic, pirated
+    -- one-chapter stubs) each carry their own author string.  Boosting the
+    -- majority author sinks impostors without rejecting them outright.
+    local kw_norm = self:normalizeTitle(keyword)
+    local votes = {}
+    for _, item in ipairs(type(results) == "table" and results or {}) do
+        if self:normalizeTitle(item and item.title) == kw_norm then
+            local a = trim(item and item.author)
+            if a ~= "" then votes[a] = (votes[a] or 0) + 1 end
+        end
+    end
+    local top_author, top_votes = nil, 1
+    for a, n in pairs(votes) do
+        if n > top_votes then top_author, top_votes = a, n end
+    end
+    local scored = {}
+    for index, item in ipairs(type(results) == "table" and results or {}) do
+        local score, kind = self:searchMatch(keyword, item and item.title, item and item.author)
+        if score then
+            -- 不去重：同一本书的多个站点镜像各占一行（每行带站点徽标），
+            -- Sean 要求全部展示；排序靠作者投票加权保证真书行在前。
+            local boost = 0
+            if self:normalizeTitle(item and item.title) == kw_norm and top_author then
+                local a = trim(item and item.author)
+                if a == top_author then
+                    boost = 10
+                elseif a == "" then
+                    boost = 4
+                end
+            end
+            scored[#scored + 1] = { item = item, score = score + boost, kind = kind, order = index }
+        end
+    end
+    table.sort(scored, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.order < b.order
+    end)
+    local out = {}
+    for i = 1, math.min(#scored, max_n) do
+        out[#out + 1] = scored[i]
+    end
+    return out
+end
+
 function BookIdentity:bestExactTitle(results, wanted_title, wanted_author, prefer_cover)
     local best, best_score
     for _, item in ipairs(type(results) == "table" and results or {}) do
@@ -272,3 +304,4 @@ function BookIdentity:bestExactTitle(results, wanted_title, wanted_author, prefe
 end
 
 return BookIdentity
+

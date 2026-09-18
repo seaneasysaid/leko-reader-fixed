@@ -6,6 +6,7 @@ if not ok_uimanager then UIManager = {} end
 local Http = require("Leko/Http")
 local Storage = require("Leko/Storage")
 local Util = require("Leko/Util")
+local BuiltinSources = require("Leko/BuiltinSources")
 
 local SourceHealth = {
     online_ttl = 6 * 60 * 60,
@@ -190,8 +191,17 @@ end
 
 function SourceHealth:probe(source, options)
     options = options or {}
+    local driver, entry = BuiltinSources:driver(source)
+    if entry then return self:probeNative(source, driver, entry, options) end
+
     local target = self:probeUrl(source)
     if not target then
+        local url = BuiltinSources:sourceUrl(source)
+        if BuiltinSources:isFixtureUrl(url) then
+            -- Served in-process by BuiltinSources; there is nothing to dial, so
+            -- a transport failure here would be meaningless.
+            return self:record(source, "online", nil, nil, "本机内置资源，不经过网络", url)
+        end
         return self:record(source, "offline", nil, nil, "没有可探测的 HTTP 地址", "")
     end
 
@@ -243,6 +253,28 @@ function SourceHealth:probe(source, options)
         return self:record(source, "online", latency, code, detail, target)
     end
     return self:record(source, "offline", latency, nil, tostring(err or "连接失败"), target)
+end
+
+-- A native source reaches the network through its own Lua driver, whose
+-- bookSourceUrl is a `leko://` URL with no host to dial.  Probing the URL would
+-- always fail, so ask the driver instead.  Drivers that do not expose `probe`
+-- are reported as reachable-by-construction rather than unreachable: the local
+-- handler answers in-process, and a false "offline" contradicts a source that
+-- searches and reads fine.
+function SourceHealth:probeNative(source, driver, entry, options)
+    local label = entry and entry.label or "内置"
+    local url = BuiltinSources:sourceUrl(source)
+    if type(driver) ~= "table" or type(driver.probe) ~= "function" then
+        return self:record(source, "online", nil, nil,
+            "由" .. label .. "原生驱动负责连接，本机不做网络探测", url)
+    end
+    local ok, result = pcall(function() return driver:probe(source, options) end)
+    if not ok or type(result) ~= "table" then
+        return self:record(source, "offline", nil, nil,
+            "原生驱动探测失败：" .. tostring(result or "没有返回结果"), url)
+    end
+    return self:record(source, result.online and "online" or "offline",
+        result.latency_ms, result.http_code, result.error, result.probe_url or url)
 end
 
 function SourceHealth:ensure(source, options)

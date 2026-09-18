@@ -5,6 +5,9 @@ local SearchSettings = {
     MIN_LIMIT = 1,
     MAX_LIMIT = 50,
     LIMIT_CHOICES = { 5, 10, 20, 50 },
+    SOCKET_TIMEOUT = 20,
+    REQUEST_MAXTIME = 24,
+    SOURCE_DEADLINE = 30,
 }
 
 function SearchSettings:normalizeLimit(value)

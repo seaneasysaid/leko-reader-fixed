@@ -93,6 +93,7 @@ function AsyncTocUpdate:_runNext(generation)
     local worker_holder = {}
     local worker, start_err = AsyncBookOperation:start({
         operation = "refresh-toc",
+        check_only = true,
         book_id = item.book_id,
         background = true,
         lane = "background",

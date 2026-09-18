@@ -2,6 +2,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local Event = require("ui/event")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
@@ -9,6 +10,7 @@ local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
+local InputDialog = require("ui/widget/inputdialog")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local Notification = require("ui/widget/notification")
 local OverlapGroup = require("ui/widget/overlapgroup")
@@ -16,14 +18,19 @@ local ProgressWidget = require("ui/widget/progresswidget")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
+local TrapWidget = require("ui/widget/trapwidget")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local Screen = Device.screen
 
+local AsyncParaReview = require("Leko/AsyncParaReview")
 local BookService = require("Leko/BookService")
 local FontSelectionView = require("Leko/FontSelectionView")
+local KOReaderStatisticsBridge = require("Leko/KOReaderStatisticsBridge")
 local Paginator = require("Leko/Paginator")
+local ParaComments = require("Leko/ParaComments")
+local ReaderMargins = require("Leko/ReaderMargins")
 local ReaderFooter = require("Leko/ReaderFooter")
 local Storage = require("Leko/Storage")
 local TocView = require("Leko/TocView")
@@ -77,6 +84,21 @@ function ReaderView:init()
     self._pending_rebuild = nil
     self.swipe_animation_enabled = self.style.page_transition_enabled ~= false
     self.chapter_clean_wave_enabled = self.style.chapter_clean_wave_enabled ~= false
+    -- 段评默认关闭。开启后为番茄 / 七猫 / QQ阅读章节拉取评论计数，并在段末显示 [N] 气泡。
+    self.para_review_enabled = self.style.para_review_enabled == true
+    -- 段末气泡的屏幕矩形（每次重画正文时重建），routeTap 用它做命中判定。
+    self._para_hit_rects = {}
+    -- 段评的「代」不在这里记账：由 ParaComments.hostKey(source) 现算。
+    -- 原生源请求成功时会记住镜像，所以那张挂在章节模型上的计数表
+    -- （以及「取失败，别再试」的标记）天然带着当时那台镜像，换镜像即作废。
+    -- 段评取数一律在子进程里跑（Leko/AsyncParaReview），这里只记「挂在屏幕上的
+    -- 等待提示」，以及当前这批请求属于哪一次点击 —— 换章 / 关阅读器后回来的
+    -- 结果靠 token 判定为过期，直接丢掉。
+    self._para_busy = nil
+    self._para_busy_token = nil
+    self._para_busy_timer = nil
+    self._para_request_token = nil
+    self._para_counts_token = nil
     self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
     local swipe_module, swipe_error = loadSwipeRefresh()
     if swipe_module then
@@ -139,6 +161,8 @@ function ReaderView:init()
     if not page then page = self:errorPage(position, err) end
     self:consumeFontFallbackNotice()
     self:setPage(page, "full")
+    self.statistics_bridge = KOReaderStatisticsBridge:new{}
+    self.statistics_bridge:start(self.book, self:_statisticsVirtualPage())
     if self._swipe_refresh_load_error then
         local message = "动画效果模块加载失败，已回退普通刷新。请完全退出并重新打开 KOReader 后，重新复制完整的 leko.koplugin 文件夹。"
         logger.warn("Leko transition coordinator disabled:", self._swipe_refresh_load_error)
@@ -152,6 +176,80 @@ function ReaderView:init()
             UIManager:show(Notification:new{ text = message })
         end
     end
+end
+
+local function clamp01(value)
+    return math.max(0, math.min(1, tonumber(value) or 0))
+end
+
+function ReaderView:_progressMetrics(use_page_end)
+    if not self.page or not self.book then return nil end
+    local chapter_index = math.max(1, tonumber(self.page.chapter_index) or 1)
+    local chapter_count = #(self.book.chapters or {})
+    local model = self.page.chapter_model or BookService:loadChapterModel(self.book, chapter_index)
+    local position = use_page_end and (self.page.next_position or self.page.start_position) or self.page.start_position
+    local chapter_progress = model and ReaderFooter:percentage(model, position, chapter_index,
+        self.page.at_end and use_page_end) or 0
+    chapter_progress = clamp01(chapter_progress)
+    return {
+        chapter_index = chapter_index, chapter_count = chapter_count, model = model,
+        chapter_progress = chapter_progress,
+        book_progress = chapter_count > 0 and clamp01(((chapter_index - 1) + chapter_progress) / chapter_count) or 0,
+    }
+end
+
+function ReaderView:_statisticsVirtualPage()
+    local metrics = self:_progressMetrics(false)
+    if not metrics then return 1 end
+    local count = KOReaderStatisticsBridge.VIRTUAL_PAGE_COUNT
+    return math.max(1, math.min(count, math.floor(metrics.book_progress * (count - 1)) + 1))
+end
+
+function ReaderView:_chapterPageMetrics()
+    if not self.page or not self.book then return nil, nil end
+    local chapter = tonumber(self.page.chapter_index) or 1
+    local cache = self._public_page_metrics
+    local signature = tostring(chapter) .. "\0" .. tostring(self.style and self.style.body_font_size or "")
+        .. "\0" .. tostring(self.style and self.style.line_spacing or "")
+    if not cache or cache.signature ~= signature then
+        cache = { signature = signature, starts = {}, total = 0 }
+        local position, safety = { chapter = chapter, paragraph = 1, char = 1 }, 0
+        while safety < 20000 do
+            safety = safety + 1
+            local generated = Paginator:makePage(self.book, position, self.style)
+            if not generated then break end
+            local start = generated.start_position or {}
+            local key = table.concat({ tostring(start.chapter or 1), tostring(start.paragraph or 1), tostring(start.char or 1) }, ":")
+            cache.total = cache.total + 1
+            cache.starts[key] = cache.total
+            local next_position = generated.next_position
+            if generated.at_end or not next_position or tonumber(next_position.chapter) ~= chapter
+                    or Util.positionEqual(next_position, start) then break end
+            position = next_position
+        end
+        self._public_page_metrics = cache
+    end
+    local current = self.page.start_position or {}
+    local key = table.concat({ tostring(current.chapter or 1), tostring(current.paragraph or 1), tostring(current.char or 1) }, ":")
+    return cache.starts[key], cache.total > 0 and cache.total or nil
+end
+
+function ReaderView:getCurrentReadingContext()
+    local metrics = self:_progressMetrics(true)
+    if self._closing or not metrics or not self.book or not self.page then return { api_version = 1, active = false } end
+    local chapter = self.book.chapters and self.book.chapters[metrics.chapter_index]
+    local chapter_page, chapter_pages = self:_chapterPageMetrics()
+    local cover_path = tostring(self.book.cover_path or "")
+    if cover_path == "" then cover_path = nil end
+    return {
+        api_version = 1, active = true, book_id = tostring(self.book.id),
+        title = tostring(self.book.title or ""), author = tostring(self.book.author or ""),
+        cover_path = cover_path, chapter_title = tostring((chapter and chapter.title) or self.page.chapter_title or ""),
+        chapter_index = metrics.chapter_index, chapter_count = metrics.chapter_count,
+        chapter_page = chapter_page, chapter_pages = chapter_pages,
+        chapter_progress = metrics.chapter_progress, book_progress = metrics.book_progress,
+        statistics_id = self.statistics_bridge and self.statistics_bridge.statistics_id or nil,
+    }
 end
 
 function ReaderView:consumeFontFallbackNotice()
@@ -247,6 +345,8 @@ function ReaderView:buildFooterStatus(page, geometry)
     local left_width = math.floor(width * 0.34)
     local right_width = math.floor(width * 0.24)
     local middle_width = math.max(1, width - left_width - right_width)
+    local chrome_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil
+    local bar_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
 
     local left = LeftContainer:new{
         dimen = Geom:new{ w = left_width, h = height },
@@ -255,6 +355,7 @@ function ReaderView:buildFooterStatus(page, geometry)
             face = geometry.chrome_face,
             padding = 0,
             max_width = left_width,
+            fgcolor = chrome_color,
         },
     }
     local right = RightContainer:new{
@@ -264,6 +365,7 @@ function ReaderView:buildFooterStatus(page, geometry)
             face = geometry.chrome_face,
             padding = 0,
             max_width = right_width,
+            fgcolor = chrome_color,
         },
     }
 
@@ -279,6 +381,7 @@ function ReaderView:buildFooterStatus(page, geometry)
                 text = cache.text,
                 face = geometry.chrome_face,
                 padding = 0,
+                fgcolor = chrome_color,
             },
             HorizontalSpan:new{ width = Screen:scaleBySize(5) },
             ProgressWidget:new{
@@ -286,7 +389,7 @@ function ReaderView:buildFooterStatus(page, geometry)
                 height = math.max(3, Screen:scaleBySize(5)),
                 padding = 0,
                 margin = 0,
-                fillcolor = Blitbuffer.COLOR_BLACK,
+                fillcolor = bar_color,
                 percentage = cache.percentage,
             },
         }
@@ -356,26 +459,89 @@ function ReaderView:onPrefetchProgress(state)
     self:_schedulePrefetchFooterRefresh()
 end
 
+-- Time + battery for the right side of the header. Battery is shown as
+-- "[nn%]" (bracketed percent) when available; otherwise only the time shows.
+function ReaderView:_headerStatusText()
+    local time_text = ""
+    local ok_time, time = pcall(os.date, "%H:%M")
+    if ok_time and time then time_text = time end
+
+    local battery_text = ""
+    local ok, powerd = pcall(function() return Device:getPowerDevice() end)
+    if ok and powerd and type(powerd.getCapacity) == "function" then
+        local ok_cap, capacity = pcall(powerd.getCapacity, powerd)
+        if ok_cap and capacity ~= nil then
+            battery_text = string.format("[%d%%]", math.max(0, math.min(100, math.floor(capacity))))
+        end
+    end
+    return time_text .. battery_text
+end
+
+-- 夜间模式: dark background with light text (黑底白字).
+function ReaderView:isNightMode()
+    return self.style and self.style.night_mode == true
+end
+
 function ReaderView:buildReadingPage(page)
     local geometry = page.geometry
     local group = VerticalGroup:new{ align = "left" }
-    table.insert(group, UI.vspace(geometry.body_top or geometry.top))
+    -- 段评气泡需要它自己的屏幕矩形来做点击命中。正文由 VerticalGroup
+    -- 自上而下顺序堆叠（align = "left"，外层 FrameContainer 的 padding /
+    -- bordersize 都是 0），所以这里按插入顺序累加高度，就得到每个元素顶边的
+    -- y 坐标 —— 和 KOReader 的布局结果逐像素一致。
+    local marker_rects = {}
+    local cursor_y = 0
+    local function vspace_height(height)
+        return math.max(0, math.floor(height or 0))
+    end
 
+    -- The header stays pinned to the physical top edge under a small offset.
+    -- The 上边距 (margin_top / geometry.body_top) is applied to the body
+    -- below the header, so changing it never pushes the header down.
     if page.show_header then
-        table.insert(group, CenterContainer:new{
-            dimen = Geom:new{ w = geometry.screen_width, h = geometry.header_height },
-            TextWidget:new{
-                text = page.chapter_title or self.book.title,
-                face = geometry.chrome_face,
-                padding = 0,
-                max_width = geometry.content_width,
+        -- Small gap so the header does not touch the physical top edge.
+        table.insert(group, UI.vspace(geometry.header_offset or 0))
+        cursor_y = cursor_y + vspace_height(geometry.header_offset or 0)
+        -- Header: chapter title left-aligned, time + battery on the right.
+        local chrome_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil
+        local status = self:_headerStatusText()
+        local status_widget = TextWidget:new{
+            text = status, face = geometry.chrome_face, padding = 0,
+            fgcolor = chrome_color,
+        }
+        local status_width = status_widget:getSize().w
+        local gap = Screen:scaleBySize(10)
+        local title_width = math.max(1, geometry.content_width - status_width - gap)
+        table.insert(group, HorizontalGroup:new{
+            HorizontalSpan:new{ width = geometry.left },
+            LeftContainer:new{
+                dimen = Geom:new{ w = title_width, h = geometry.header_height },
+                TextWidget:new{
+                    text = page.chapter_title or self.book.title,
+                    face = geometry.chrome_face, padding = 0,
+                    max_width = title_width,
+                    fgcolor = chrome_color,
+                },
+            },
+            HorizontalSpan:new{ width = gap },
+            RightContainer:new{
+                dimen = Geom:new{ w = status_width, h = geometry.header_height },
+                status_widget,
             },
         })
+        cursor_y = cursor_y + geometry.header_height
+        table.insert(group, UI.vspace(geometry.body_top or geometry.top))
+        cursor_y = cursor_y + vspace_height(geometry.body_top or geometry.top)
+    else
+        -- Hidden header: keep the body clear of the physical top edge.
+        table.insert(group, UI.vspace(geometry.body_top or geometry.top))
+        cursor_y = cursor_y + vspace_height(geometry.body_top or geometry.top)
     end
 
     for _, element in ipairs(page.elements) do
         if element.type == "title" then
             table.insert(group, UI.vspace(element.top_gap))
+            cursor_y = cursor_y + vspace_height(element.top_gap)
             table.insert(group, HorizontalGroup:new{
                 align = "center",
                 HorizontalSpan:new{ width = geometry.left },
@@ -391,28 +557,112 @@ function ReaderView:buildReadingPage(page)
                         lang = "zh-CN",
                         alignment = "left",
                         alignment_strict = true,
+                        fgcolor = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil,
+                        -- TextBoxWidget paints its own buffer filled with
+                        -- bgcolor (default white); night mode must match the
+                        -- dark page background or the title becomes a block.
+                        bgcolor = self:isNightMode() and Blitbuffer.COLOR_BLACK or nil,
                     },
                 },
             })
+            cursor_y = cursor_y + element.height
             table.insert(group, UI.vspace(element.bottom_gap))
+            cursor_y = cursor_y + vspace_height(element.bottom_gap)
         elseif element.type == "gap" then
             table.insert(group, UI.vspace(element.height))
+            cursor_y = cursor_y + vspace_height(element.height)
         elseif element.type == "line" then
+            -- v0.15.48's single-line drawing path: paint the fitted text once.
+            local text_align = tostring(self.style.text_align or "left")
+            local body_widget = TextWidget:new{
+                text = element.text,
+                face = geometry.body_face,
+                padding = 0,
+                line_height = self.style.line_spacing or 0.28,
+                lang = "zh-CN",
+                bold = false,
+                fgcolor = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil,
+                alignment = "left",
+                alignment_strict = true,
+            }
+            local line_container
+            if text_align == "center" then
+                line_container = CenterContainer:new{
+                    dimen = Geom:new{ w = geometry.content_width, h = element.height },
+                    body_widget,
+                }
+            elseif text_align == "right" then
+                line_container = RightContainer:new{
+                    dimen = Geom:new{ w = geometry.content_width, h = element.height },
+                    body_widget,
+                }
+            else
+                line_container = LeftContainer:new{
+                    dimen = Geom:new{ w = geometry.content_width, h = element.height },
+                    body_widget,
+                }
+            end
+            local row_widget = line_container
+            if element.para_marker then
+                -- 段评气泡：紧跟在段末行文字之后。分页器已经为它让出宽度
+                -- （见 Paginator.fitBodyLines 的 tail_reserve），所以这里读文字
+                -- 实测宽度就能得到精确的落点。用固定尺寸的容器包一层，
+                -- 保证 OverlapGroup / HorizontalGroup 算出来的行高仍然是
+                -- element.height —— 整个页面的纵向累加不能被打乱。
+                local text_size = body_widget:getSize()
+                local text_width = math.max(0, math.ceil((text_size and text_size.w) or 0))
+                local inline_offset = 0
+                if text_align == "center" then
+                    inline_offset = math.max(0, math.floor((geometry.content_width - text_width) / 2))
+                elseif text_align == "right" then
+                    inline_offset = math.max(0, geometry.content_width - text_width)
+                end
+                local marker_gap = geometry.para_marker_gap or 0
+                local marker_widget = TextWidget:new{
+                    text = element.para_marker,
+                    -- 与分页器预留宽度时用的**同一个** face、同一个 bold 与同一个 gap
+                    -- （都在 geometry 里，由 Paginator 一处算出来）。任何一项对不上，
+                    -- 气泡宽度就与预留宽度不一致，命中区随之偏移。
+                    face = geometry.para_marker_face or geometry.body_face,
+                    padding = 0,
+                    -- 气泡只有一行，不需要额外的行距裕量；给了反而会把
+                    -- CenterContainer 撑高、在正文行里显得偏。
+                    line_height = 0,
+                    lang = "zh-CN",
+                    bold = geometry.para_marker_bold == true,
+                    fgcolor = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil,
+                }
+                local marker_size = marker_widget:getSize()
+                local marker_width = math.max(1, math.ceil((marker_size and marker_size.w) or 1))
+                local marker_holder = CenterContainer:new{
+                    dimen = Geom:new{ w = marker_width, h = element.height },
+                    marker_widget,
+                }
+                -- OverlapGroup 的坐标原点是 HorizontalGroup 里
+                -- HorizontalSpan{width = geometry.left} 之后的位置，
+                -- 所以这里只需要行内偏移 + 文本宽度 + 一道缝。
+                local marker_x = inline_offset + text_width + marker_gap
+                marker_holder.overlap_offset = { marker_x, 0 }
+                row_widget = OverlapGroup:new{
+                    dimen = Geom:new{ w = geometry.content_width, h = element.height },
+                    allow_mirroring = false,
+                    line_container,
+                    marker_holder,
+                }
+                marker_rects[#marker_rects + 1] = {
+                    x = geometry.left + marker_x,
+                    y = cursor_y,
+                    w = marker_width,
+                    h = element.height,
+                    paragraph = element.paragraph,
+                }
+            end
             table.insert(group, HorizontalGroup:new{
                 align = "center",
                 HorizontalSpan:new{ width = geometry.left },
-                LeftContainer:new{
-                    dimen = Geom:new{ w = geometry.content_width, h = element.height },
-                    TextWidget:new{
-                        text = element.text,
-                        face = geometry.body_face,
-                        padding = 0,
-                        line_height = self.style.line_spacing or 0.28,
-                        lang = "zh-CN",
-                        bold = false,
-                    },
-                },
+                row_widget,
             })
+            cursor_y = cursor_y + element.height
         end
     end
 
@@ -428,12 +678,15 @@ function ReaderView:buildReadingPage(page)
         table.insert(group, UI.vspace(geometry.footer_height))
     end
 
+    -- 这一版页面的段评气泡命中区。routeTap 只认当前这一份。
+    self._para_hit_rects = marker_rects
+
     return FrameContainer:new{
         width = geometry.screen_width,
         height = geometry.screen_height,
         bordersize = 0,
         padding = 0,
-        background = Blitbuffer.COLOR_WHITE,
+        background = self:isNightMode() and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
         group,
     }
 end
@@ -455,7 +708,7 @@ function ReaderView:buildMenuOverlay()
         { text = "目录", bold = true, callback = function() self:showToc() end },
         { text = "上一章", callback = function() self:jumpChapter(-1) end },
         { text = "下一章", callback = function() self:jumpChapter(1) end },
-        { text = "排版", callback = function() self:showLayoutMenu() end },
+        { text = "阅读设置", font_size = 16, callback = function() self:showLayoutMenu() end },
         { text = "刷新本章", font_size = 16, callback = function() self:reloadCurrentChapter() end },
     })
     local bottom = FrameContainer:new{
@@ -564,29 +817,533 @@ function ReaderView:setSwipeAnimationEnabled(enabled)
     return enabled
 end
 
-function ReaderView:isChapterCleanWaveEnabled()
+-- 「跨章净屏」现在直接调用 KOReader 的全局刷新（整屏 full 刷新，即
+-- Screen.refreshFull），不再由本模块播放条带波。样式键沿用历史名字，
+-- 老配置无需迁移。
+function ReaderView:isChapterCleanEnabled()
     return self.chapter_clean_wave_enabled ~= false
 end
 
-function ReaderView:setChapterCleanWaveEnabled(enabled)
+function ReaderView:setChapterCleanEnabled(enabled)
     enabled = enabled == true
     self.chapter_clean_wave_enabled = enabled
     self.style.chapter_clean_wave_enabled = enabled
     Storage:saveReaderStyle(self.style)
-    if not enabled and self.swipe_refresh
-            and type(self.swipe_refresh.isWaveRunning) == "function"
-            and self.swipe_refresh:isWaveRunning() then
+    if not enabled and self.swipe_refresh and self.swipe_refresh:isRunning() then
         self:_cancelSwipeRefresh()
         if self.page then self:rebuild("partial") end
     end
-    if not self:_refreshLayoutToggle("chapter_wave_toggle",
-            enabled and "跨章净屏动画：开" or "跨章净屏动画：关") then
+    if not self:_refreshLayoutToggle("chapter_clean_toggle",
+            enabled and "跨章净屏：开" or "跨章净屏：关") then
         self:refreshLayoutMenu()
     end
     return enabled
 end
 
+-- ── 段评（番茄 / 七猫 / QQ阅读章节的段落评论） ───────────────────────────
+-- 数据全在 Leko/ParaComments：这里只负责「什么时候取、取到之后怎么落到页面上」。
+-- 计数挂在 chapter model 的 para_counts 上，分页器读它来给段末行挂气泡，
+-- 分页过程本身永远是纯本地的。气泡的点击命中走 routeTap 的矩形判定 ——
+-- 段评气泡不参与左右翻页分区，命中就直接看评论。
+
+function ReaderView:isParaReviewEnabled()
+    return self.para_review_enabled == true
+end
+
+function ReaderView:setParaReviewEnabled(enabled)
+    enabled = enabled == true
+    self.para_review_enabled = enabled
+    self.style.para_review_enabled = enabled
+    Storage:saveReaderStyle(self.style)
+    if not self:_refreshLayoutToggle("para_review_toggle",
+            enabled and "段评：开" or "段评：关") then
+        self:refreshLayoutMenu()
+    end
+    -- 开关只改「要不要给段末行让出气泡宽度」，必须重排才能生效。
+    -- 刚打开时如果本章还没有计数，就先不重排 —— 等计数到了 ensureParaCounts
+    -- 会重排一次，省掉一次无意义的二次分页。
+    local model = self.page and self.page.chapter_model
+    local has_counts = self:_paraCountsFresh(model, BookService:sourceFor(self.book))
+        and type(model.para_counts) == "table"
+    if not enabled or has_counts then self:reflowForParaReview() end
+    if enabled then
+        self:ensureParaCounts(true)
+    else
+        -- 关掉段评后不该再有气泡跳出来：把在飞的计数请求与等待提示一起收掉。
+        self._para_counts_token = nil
+        self:_endParaWait()
+        AsyncParaReview:cancel("counts", "disabled")
+    end
+    return enabled
+end
+
+--[[--
+段评开关 / 计数变化后的重排。
+
+刻意不复用 applyStyleChange：那条路会 clearBookCache，而 para_counts 正挂在
+章节模型上，也会顺手清空 history。这里只按当前位置重新分页一次，
+阅读位置与历史都不动。
+]]--
+function ReaderView:reflowForParaReview()
+    if not self.page then return false end
+    self:_settleSwipeRefresh()
+    local anchor = self.page.start_position
+    local page, err = Paginator:makePage(self.book, anchor, self.style)
+    if not page then
+        logger.warn("Leko para review reflow failed", tostring(err))
+        return false
+    end
+    self.page = page
+    self._progress_dirty = true
+    self._footer_dirty = true
+    self:rebuild("partial")
+    self:_scheduleFooterRefresh(true)
+    return true
+end
+
+--[[--
+章节模型上的段评数据是否「就是当前这一代镜像取的」。
+
+失败时模型上会留 `para_counts = false` 作为「本次会话别再试」的标记；
+原生源换过镜像之后这个标记必须失效 —— 否则新镜像永远轮不到重试，读者会以为
+这本书没有段评。所以判断依据不是「有没有值」，而是「值是哪台镜像取的」。
+]]--
+function ReaderView:_paraCountsFresh(model, source)
+    if not model or model.para_counts == nil then return false end
+    return model.para_counts_epoch == ParaComments.hostKey(source)
+end
+
+-- 换到（或首次进入）一章之后，等这一页画完再补拉本章计数：网络等待不塞进
+-- 翻页路径，成功后只重排当前页。失败会在模型上留一个 false 标记，
+-- 本次会话（同一代镜像）不再自动重试，避免每翻一页都打一次后端。
+function ReaderView:_scheduleParaCounts(page)
+    if self.para_review_enabled ~= true or not page then return end
+    local model = page.chapter_model
+    if not model or self:_paraCountsFresh(model, BookService:sourceFor(self.book)) then return end
+    local chapter_index = page.chapter_index
+    if not ParaComments.isSupported(self.book, chapter_index) then return end
+    UI.defer(self, "para_counts_" .. tostring(chapter_index), function()
+        if self._closing then return end
+        if not (self.page and self.page.chapter_index == chapter_index) then return end
+        self:ensureParaCounts(false)
+    end)
+end
+
+--[[--
+段评等待提示：延迟 0.4 秒才出现，出现后点一下就能取消。
+
+最快的路径（本地缓存命中）只要一两百毫秒，一上来就盖遮罩会白闪一下，所以先
+等 0.4 秒。它出现之后会挡住输入 —— 这正是想要的效果：既把「现在在等网络」
+说清楚，也避免读者连点同一个气泡发两次请求，还能一次点掉取消，不用干等。
+
+token 用来判定「这条提示属于哪一次请求」：换了一次请求 / 关掉阅读器之后，
+晚到的定时器和回调都不会再动屏幕。
+]]--
+function ReaderView:_beginParaWait(text, token, on_cancel)
+    self:_endParaWait()
+    self._para_busy_token = token
+    local function show()
+        self._para_busy_timer = nil
+        if self._para_busy_token ~= token or self._closing then return end
+        local trap = TrapWidget:new{
+            text = text,
+            dismiss_callback = function()
+                if self._para_busy_token ~= token then return end
+                -- 先摘掉自己的那份引用：TrapWidget 关掉自己时也会走 dismiss，
+                -- 不摘的话 _endParaWait 会去二次关闭同一个窗口。
+                self._para_busy_token = nil
+                self._para_busy = nil
+                if on_cancel then pcall(on_cancel) end
+            end,
+        }
+        self._para_busy = trap
+        UIManager:show(trap)
+        UIManager:forceRePaint()
+    end
+    self._para_busy_timer = show
+    UIManager:scheduleIn(0.4, show)
+end
+
+function ReaderView:_endParaWait()
+    if self._para_busy_timer then
+        UIManager:unschedule(self._para_busy_timer)
+        self._para_busy_timer = nil
+    end
+    self._para_busy_token = nil
+    local trap = self._para_busy
+    if trap then
+        self._para_busy = nil
+        pcall(function() UIManager:close(trap) end)
+        UIManager:forceRePaint()
+    end
+end
+
+--[[--
+确保本章的段评计数就绪（章模型上没有就取一次）。
+
+interactive 为真表示用户主动触发（刚打开开关 / 点了「本页段评」），
+这时等待和失败都要给读者交代；章节自动切换时静默处理，取不到就当没有段评。
+
+取数在子进程里跑（Leko/AsyncParaReview），所以这个函数立刻返回 —— 翻页路径
+不再为了等网络停住 4–5 秒。on_ready(counts) 在计数到位后于 UI 线程回调；
+请求失败、被前台任务挤掉、或读者已经翻走这一章时，它不会被调用
+（此时模型上是 nil，下一次进这一章会自动重试）。
+]]--
+function ReaderView:ensureParaCounts(interactive, on_ready)
+    if self.para_review_enabled ~= true then return end
+    local page = self.page
+    local model = page and page.chapter_model
+    if not model then return end
+    local source = BookService:sourceFor(self.book)
+    if self:_paraCountsFresh(model, source) then
+        -- 这一代的计数已经在手上了：不必再打后端，直接把现成的给调用方。
+        if on_ready then
+            local existing = model.para_counts
+            on_ready(type(existing) == "table" and existing or nil)
+        end
+        return
+    end
+    local chapter_index = page.chapter_index
+    if not ParaComments.isSupported(self.book, chapter_index) then
+        if interactive then
+            UIManager:show(Notification:new{ text = "本章没有段评（目前支持番茄 / 七猫 / QQ阅读）" })
+        end
+        return
+    end
+    if not source then
+        if interactive then
+            UIManager:show(Notification:new{ text = "没有找到可用的书源，无法获取段评" })
+        end
+        return
+    end
+    if AsyncParaReview:isRunning("counts") then
+        -- 已经有一批在飞（同一章重复触发很常见：打开开关 + 刚进章节各一次）。
+        -- 再发一次只会让两批计数抢同一份缓存，等前一批回来就够了。
+        return
+    end
+
+    local token = {}
+    self._para_counts_token = token
+    if interactive then
+        self:_beginParaWait("正在获取本章段评…（点按取消）", token, function()
+            self._para_counts_token = nil
+            self:_endParaWait()
+            AsyncParaReview:cancel("counts", "user")
+        end)
+    end
+
+    AsyncParaReview:start("counts", {
+        book = self.book,
+        source = source,
+        chapter_index = chapter_index,
+        -- 七猫的计数是按段落内容指纹给的，子进程要用同一份段落文本才能换算成
+        -- 段号（见 ParaComments.qmCountsByParagraph）。
+        paragraphs = model and model.paragraphs,
+    }, function(ok, payload, err)
+        if self._para_counts_token ~= token then return end
+        self._para_counts_token = nil
+        self:_endParaWait()
+        if self._closing then return end
+
+        if not ok then
+            -- 失败标记也带镜像：换镜像后这次失败不再作数，新镜像有机会重试。
+            model.para_counts, model.para_counts_epoch = false, ParaComments.hostKey(source)
+            logger.warn("Leko para review counts unavailable", tostring(err))
+            if interactive then
+                UIManager:show(Notification:new{ text = "段评获取失败：" .. tostring(err or "未知错误") })
+            end
+            return
+        end
+
+        -- 子进程里选中的镜像记在它自己的副本上，父进程看不到 —— 不同步回来的话
+        -- 下一次请求又会先把失效镜像试一遍（白等一个注定失败的往返），
+        -- _paraCountsFresh 也会永远判成过期。
+        AsyncParaReview.rememberSourceHost(source, payload.host)
+
+        local counts = payload.counts_map or {}
+        -- 段落号越界说明服务端的分段与本地不一致：越界项直接丢弃，
+        -- 免得把评论挂到不存在的段上（分页器只按 pid 查表，不越界取值）。
+        local paragraph_count = #(model.paragraphs or {})
+        local dropped = 0
+        for pid in pairs(counts) do
+            if pid >= paragraph_count then
+                counts[pid] = nil
+                dropped = dropped + 1
+            end
+        end
+        if dropped > 0 then
+            logger.warn("Leko para review: dropped out-of-range pids", tostring(dropped),
+                "of", tostring(paragraph_count), "paragraphs")
+        end
+        -- 记账用「同步之后」的镜像：下次 _paraCountsFresh 是按同一个表达式算的，
+        -- 这样才天然对得上（凭据缺失时它会回落到 "auto"）。
+        model.para_counts, model.para_counts_epoch = counts, ParaComments.hostKey(source)
+        -- 章节可能在等待期间被翻走：只有它还是当前页时才重排。
+        if self.page and self.page.chapter_model == model then
+            self:reflowForParaReview()
+        end
+        if on_ready then on_ready(counts) end
+    end)
+end
+
+function ReaderView:_paraServerLabel()
+    local source = BookService:sourceFor(self.book)
+    if not source then return "镜像：无书源" end
+    return "镜像：" .. ParaComments.hostLabel(ParaComments.host(source))
+end
+
+-- 段末气泡的命中判定。返回 1 基段落号，未命中返回 nil。
+function ReaderView:_paraMarkerAt(x, y)
+    if self.para_review_enabled ~= true then return nil end
+    if self.swipe_refresh and self.swipe_refresh:isRunning() then return nil end
+    local rects = self._para_hit_rects
+    if type(rects) ~= "table" then return nil end
+    -- 气泡本身只有几十像素宽，给一点横向余量，免得读者点了个寂寞。
+    local slack = Screen:scaleBySize(6)
+    for index = 1, #rects do
+        local rect = rects[index]
+        if x >= rect.x - slack and x <= rect.x + rect.w + slack
+                and y >= rect.y and y <= rect.y + rect.h then
+            return rect.paragraph
+        end
+    end
+    -- 页面上明明画着气泡却没命中：多半是排版与命中区对不上（换行规则、字体
+    -- 度量、行高任一处变了都会这样）。这种情况必须留下证据 —— 否则读者只会
+    -- 觉得「点气泡变成了翻页」，而日志里什么都没有。
+    --
+    -- 只打第一个矩形没法判断偏在 x 还是 y（读者报「点不动」时只能靠猜），
+    -- 所以打的是「纵向最接近的那个」以及相对它的右边缘 / 中心线差多少：
+    --   dx > 0 说明点在气泡右边（气泡画得比命中区窄，或点在气泡外的空白）
+    --   dy > h/2 说明纵向整行都错位（那才是真的排版与命中区不一致）
+    if #rects > 0 then
+        local near, near_dy
+        for index = 1, #rects do
+            local rect = rects[index]
+            local dy = math.abs((rect.y + rect.h / 2) - y)
+            if near_dy == nil or dy < near_dy then near, near_dy = rect, dy end
+        end
+        logger.warn("Leko para review: bubble tap missed", tostring(x), tostring(y),
+            "rects=" .. tostring(#rects),
+            string.format("near=%d,%d,%dx%d", near.x, near.y, near.w, near.h),
+            string.format("dx=%d dy=%d", math.floor(x - (near.x + near.w)), math.floor(near_dy)))
+    end
+    return nil
+end
+
+--[[--
+段评弹窗：微信读书「想法」式富排版。
+
+评论正文由 ParaComments 取（番茄 / QQ 两家的协议），排版渲染交给
+`Leko/review_popup` 那套管线 —— 顶部是这一段的引文，之后每条评论是
+「▸ 昵称 · ♥赞」一行加正文，长内容在底部弹窗里上下滚动。点左右半屏翻页、
+点弹窗外面或按返回键关闭。
+
+服务端一次只稳定给 20 条评论，所以首次打开连拉两页（见
+ParaComments.FIRST_OPEN_PAGES）；还有余量时弹窗底部会挂一个「继续加载」，
+按服务端回的 cursor 续拉后面的。
+
+paragraph_index 是 1 基段落号（与 model.paragraphs 一致），服务端用 0 基，
+所以这里 pid = paragraph_index - 1。
+
+options.cursor     续拉起点（续拉时由弹窗的按钮回调传入）
+]]--
+function ReaderView:showParaComments(paragraph_index, options)
+    options = options or {}
+    local page = self.page
+    if not page or not paragraph_index then return end
+    local chapter_index = page.chapter_index
+    local model = page.chapter_model
+    local pid = paragraph_index - 1
+    if pid < 0 then return end
+
+    local known_count = nil
+    if model and type(model.para_counts) == "table" then
+        known_count = tonumber(model.para_counts[pid])
+    end
+    local source = BookService:sourceFor(self.book)
+    if not source then
+        UIManager:show(Notification:new{ text = "没有找到可用的书源，无法读取段评" })
+        return
+    end
+
+    -- 富排版弹窗要用到 freetype / xtext：懒加载。失败了只影响这一个功能，
+    -- 不该把整个阅读视图拖下水。
+    local ok_popup, ReviewPopup = pcall(require, "Leko/ReviewPopup")
+    if not ok_popup or type(ReviewPopup) ~= "table" then
+        logger.warn("Leko para review: popup unavailable", tostring(ReviewPopup))
+        UIManager:show(Notification:new{ text = "段评弹窗组件加载失败" })
+        return
+    end
+
+    local cursor = tonumber(options.cursor)
+    local token = {}
+    self._para_request_token = token
+    self:_beginParaWait("正在获取段评…（点按取消）", token, function()
+        self._para_request_token = nil
+        self:_endParaWait()
+        AsyncParaReview:cancel("comments", "user")
+    end)
+
+    AsyncParaReview:start("comments", {
+        book = self.book,
+        source = source,
+        chapter_index = chapter_index,
+        pid = pid,
+        cursor = cursor,
+        -- 七猫按段落内容指纹定位这一段，子进程要用同一份段落文本才算得出同样的
+        -- 指纹（fork 复制内存，不带序列化开销）；番茄 / QQ 用不上。
+        paragraphs = model and model.paragraphs,
+    }, function(ok, payload, err)
+        if self._para_request_token ~= token then return end
+        self._para_request_token = nil
+        self:_endParaWait()
+        if self._closing then return end
+        if not ok then
+            UIManager:show(Notification:new{ text = "段评获取失败：" .. tostring(err or "未知错误") })
+            return
+        end
+        -- 续拉是「给屏幕上这个弹窗补货」：弹窗已经不在了（读者切页 / 关掉了）
+        -- 就别把它重新弹出来，否则等于在别处凭空跳出一个窗口。
+        if cursor and not ReviewPopup.isShowing() then return end
+        -- 子进程选中的镜像要同步回父进程，否则下一次请求又会先试失效的那台。
+        AsyncParaReview.rememberSourceHost(source, payload.host)
+        self:_presentParaComments(paragraph_index, payload, {
+            ReviewPopup = ReviewPopup,
+            model = model,
+            chapter_index = chapter_index,
+            known_count = known_count,
+        })
+    end)
+    return true
+end
+
+--[[--
+把一批评论渲染成弹窗。
+
+纯 UI，不发请求 —— 数据来自 AsyncParaReview 的回调，ctx 里带的是发起请求
+那一刻的上下文（弹窗模块、章模型、已知条数）。
+]]--
+function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
+    local list, remote_text, page_info = payload.list, payload.para_text or "", payload.page
+    local page = self.page
+    if page and page.chapter_index ~= ctx.chapter_index then return end
+    local model = (page and page.chapter_model) or ctx.model
+    if type(list) ~= "table" then return end
+
+    local local_text = model and model.paragraphs and model.paragraphs[paragraph_index] or ""
+    -- 引文：优先用服务端回传的段落原文（拿不到就退回本地正文）。
+    local quote = Util.trim(tostring(remote_text ~= "" and remote_text or local_text))
+
+    local items = {}
+    for _, item in ipairs(list) do
+        local text = Util.trim(tostring(item.text or ""))
+        if text ~= "" then
+            items[#items + 1] = {
+                abstract = quote,
+                author = tostring(item.name or "匿名"),
+                content = text,
+                likes_count = tonumber(item.likes) or 0,
+            }
+        end
+    end
+    if #items == 0 then
+        local known = ctx.known_count
+        UIManager:show(Notification:new{ text = (known and known > 0)
+            and ("这一段共有 " .. tostring(known) .. " 条评论，目前拿不到可显示的正文。")
+            or "这一段还没有评论。" })
+        return
+    end
+
+    -- 弹窗排版跟随正文的字体 / 字号 / 边距；body_face.size 已是屏幕缩放后的
+    -- 像素字号，正好是弹窗字体工厂要的量纲。
+    local geometry = (page and page.geometry) or Paginator:getGeometry(self.style)
+    local body_face = geometry and geometry.body_face
+    local more_text, on_more
+    if page_info and page_info.has_more == true then
+        local loaded = #list
+        local known = ctx.known_count
+        local remaining = (known and known > loaded) and (known - loaded) or nil
+        more_text = remaining and ("继续加载（还剩 " .. tostring(remaining) .. " 条）")
+            or "继续加载更多评论"
+        local next_cursor = page_info.next_cursor
+        on_more = function()
+            self:showParaComments(paragraph_index, { cursor = next_cursor })
+        end
+    end
+
+    ctx.ReviewPopup.show{
+        pages = items,
+        doc_font_name = self.style.body_font,
+        doc_font_size = (body_face and body_face.size) or Screen:scaleBySize(20),
+        doc_margins = {
+            left = (geometry and geometry.left) or Screen:scaleBySize(16),
+            right = (geometry and geometry.right) or Screen:scaleBySize(16),
+            top = Screen:scaleBySize(8),
+            bottom = Screen:scaleBySize(8),
+        },
+        height_ratio = 0.7,
+        contrast = 7,
+        tap_to_page = true,
+        more_text = more_text,
+        on_more = on_more,
+    }
+    return true
+end
+
+-- 「本页段评」：把当前页上带评论的段落列出来，直接点进去看。
+function ReaderView:showPageParaCommentList()
+    if self.para_review_enabled ~= true then
+        UIManager:show(Notification:new{ text = "请先打开「段评」" })
+        return
+    end
+    local page = self.page
+    local model = page and page.chapter_model
+    if type(model and model.para_counts) ~= "table" then
+        -- 计数现在是异步取的：直接 return 会让这次点按毫无反应。等结果回来再列一次
+        -- （取失败时 on_ready 收到 nil，不递归；失败本身已经提示过了）。
+        local chapter_index = page and page.chapter_index
+        self:ensureParaCounts(true, function(counts)
+            if not counts then return end
+            if not (self.page and self.page.chapter_index == chapter_index) then return end
+            self:showPageParaCommentList()
+        end)
+        return
+    end
+    local seen, entries = {}, {}
+    for _, element in ipairs(page.elements or {}) do
+        if element.type == "line" and element.para_marker and element.paragraph
+                and not seen[element.paragraph] then
+            seen[element.paragraph] = true
+            entries[#entries + 1] = element.paragraph
+        end
+    end
+    if #entries == 0 then
+        UIManager:show(Notification:new{ text = "本页没有带评论的段落" })
+        return
+    end
+    local dialog
+    local buttons = {}
+    local limit = math.min(#entries, 8)
+    for index = 1, limit do
+        local paragraph = entries[index]
+        local pid = paragraph - 1
+        local label = Util.trim(tostring((model.paragraphs and model.paragraphs[paragraph]) or ""))
+        if Util.utf8Length(label) > 12 then label = Util.utf8Sub(label, 1, 12) .. "…" end
+        local count = tonumber(model.para_counts[pid]) or 0
+        buttons[#buttons + 1] = { {
+            text = "第" .. tostring(pid + 1) .. "段 · " .. tostring(count) .. " 条 · " .. label,
+            callback = function()
+                UIManager:close(dialog)
+                self:showParaComments(paragraph)
+            end,
+        } }
+    end
+    dialog = ButtonDialog:new{ title = "本页段评", buttons = buttons }
+    UIManager:show(dialog)
+end
+
 function ReaderView:_nextPageGeneration()
+    self._pending_history = nil
     self.page_generation = (self.page_generation or 0) + 1
     return self.page_generation
 end
@@ -597,6 +1354,15 @@ end
 
 function ReaderView:setPage(page, refresh_type, direction, generation)
     if generation and not self:isPageGenerationCurrent(generation) then return false end
+    local pending = self._pending_history
+    if pending and pending.generation == generation then
+        if pending.forward then
+            table.insert(self.history, pending.position)
+        elseif self.history[#self.history] == pending.position then
+            table.remove(self.history)
+        end
+        self._pending_history = nil
+    end
     local previous_chapter = self.page and self.page.chapter_index
     local chapter_changed = previous_chapter ~= nil and previous_chapter ~= page.chapter_index
     if not direction then self:_cancelSwipeRefresh() end
@@ -610,7 +1376,26 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
     -- lets the footer show the existing unfinished cached/total state on the
     -- first paint of a page turn, instead of waiting for a later event.
     BookService:requestPrefetch(self.book, page.chapter_index, BookService.prefetch_window)
+    if self.statistics_bridge then self.statistics_bridge:onPageChanged(self:_statisticsVirtualPage()) end
     self:_syncPrefetchState()
+    -- 段评：进入新的一章后，等本页画完再后台补一次本章评论计数。
+    self:_scheduleParaCounts(page)
+    -- 「跨章净屏」走 KOReader 自己的全局刷新，不再是一次本地动画：新章第一页
+    -- 照常经由 widget 重绘，刷新用整屏 "full"（Screen.refreshFull）。它刻意与
+    -- 「动画效果」解耦 —— 「动画效果」只负责同章内的擦除渐显。
+    if direction and chapter_changed and self:isChapterCleanEnabled() then
+        self:_cancelSwipeRefresh()
+        self.menu_visible = false
+        self:rebuild("full")
+        -- 传 nil widget 的 "full" 入队就是 KOReader 对角线滑动全刷用的那个调用：
+        -- 它会把 UIManager.refresh_count 归零，避免周期性提升紧挨着再来一次
+        -- 黑闪（成对连闪）。两条入队会合并成同一次整屏刷新。
+        if type(UIManager.setDirty) == "function" then
+            UIManager:setDirty(nil, "full")
+        end
+        return true
+    end
+
     if direction and self:isSwipeAnimationEnabled() and self.swipe_refresh then
         self.menu_visible = false
         local target_widget = self:buildReadingPage(page)
@@ -620,9 +1405,7 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
             direction,
             function() self:_finishSwipeSubmission() end,
             {
-                chapter_changed = chapter_changed,
                 page_animation_enabled = self:isSwipeAnimationEnabled(),
-                chapter_clean_wave_enabled = self:isChapterCleanWaveEnabled(),
             })
         if not begin_ok then
             begin_err = tostring(started)
@@ -754,13 +1537,15 @@ function ReaderView:nextPage()
         end
         return true
     end
-    table.insert(self.history, Util.positionCopy(self.page.start_position))
     local generation = self:_nextPageGeneration()
+    self._pending_history = { generation = generation, forward = true,
+        position = Util.positionCopy(self.page.start_position) }
     self:loadPage(self.page.next_position, "partial", SwipeRefresh.FORWARD, generation)
     return true
 end
 
 function ReaderView:_showPreviousPage(target_position, refresh_type, generation)
+    if generation and not self:isPageGenerationCurrent(generation) then return false end
     local page, err = Paginator:findPreviousPage(self.book, target_position, self.style)
     if not page then return nil, tostring(err or "已经是第一页") end
     self.menu_visible = false
@@ -768,16 +1553,17 @@ function ReaderView:_showPreviousPage(target_position, refresh_type, generation)
 end
 
 function ReaderView:previousPage()
-    local target = table.remove(self.history)
+    local target = self.history[#self.history]
     if target then
         local generation = self:_nextPageGeneration()
+        self._pending_history = { generation = generation, position = target }
         self:loadPage(target, "partial", SwipeRefresh.BACKWARD, generation)
         return true
     end
 
     local current = self.page.start_position
     local generation = self:_nextPageGeneration()
-    local crosses_chapter = current.paragraph == 1 and current.char == 1 and current.chapter > 1
+    local crosses_chapter = current.chapter > 1 and Paginator:isChapterStart(self.book, current)
     local previous_chapter = crosses_chapter and (current.chapter - 1) or nil
     if previous_chapter and not BookService:isChapterDownloaded(self.book, previous_chapter) then
         if type(self.onPrepareChapter) ~= "function" then
@@ -831,13 +1617,22 @@ end
 function ReaderView:showToc()
     self:_settleSwipeRefresh()
     self.menu_visible = false
-    self:rebuild("ui")
+    self:onReadingPaused()
+    -- The full-screen TOC covers this page. Re-shaping the body here delays
+    -- the tap response and paints a page the user never needs to see.
     return UI.showLater(self, "toc", function()
         return TocView:new{
             book = self.book,
             current_chapter = self.page.chapter_index,
-            onChapterSelected = function(chapter_index) self:jumpToChapter(chapter_index) end,
-            on_return = function() self:_scheduleFooterRefresh(true) end,
+            onChapterSelected = function(chapter_index)
+                self:onReadingResumed()
+                self:jumpToChapter(chapter_index)
+            end,
+            on_return = function()
+                self:onReadingResumed()
+                self:rebuild("ui")
+                self:_scheduleFooterRefresh(true)
+            end,
         }
     end, "full")
 end
@@ -845,6 +1640,7 @@ end
 function ReaderView:showBookInfo()
     self:_settleSwipeRefresh()
     self.menu_visible = false
+    self:onReadingPaused()
     self:rebuild("ui")
     return UI.defer(self, "book_info", function()
         if self.onShowBookInfo then self.onShowBookInfo(self.book, self) end
@@ -976,12 +1772,12 @@ end
 function ReaderView:makeLayoutMenuButtons()
     local line_values = { 0.12, 0.20, 0.28, 0.38, 0.50 }
     local line_labels = { "最窄", "窄", "中", "宽", "最宽" }
-    local margin_values = { 12, 20, 28, 36, 48 }
-    local margin_labels = { "最窄", "窄", "中", "宽", "最宽" }
+    local margin_values = ReaderMargins.values
+    local margin_labels = ReaderMargins.labels
+    local vertical_margin_values = { 6, 12, 18, 24, 30 }
+    local vertical_margin_labels = { "最窄", "窄", "中", "宽", "最宽" }
     local paragraph_values = { 0, 6, 10, 16, 24 }
     local paragraph_labels = { "无", "0.25 行", "0.5 行", "0.75 行", "一行" }
-    local font_values = { 18, 22, 27, 32, 38, 44 }
-    local font_labels = { "很小", "小", "中", "大", "很大", "特大" }
 
     local function cycle(values, current)
         local closest = 1
@@ -1001,6 +1797,22 @@ function ReaderView:makeLayoutMenuButtons()
         return labels[closest]
     end
 
+    -- First-line indent cycles through 关 / 2 字符 / 4 字符. The legacy
+    -- boolean true is treated as the 2-character default.
+    local function indentLabel(current)
+        if current == false then return "关" end
+        local count = tonumber(current)
+        if count ~= nil and count >= 4 then return "4 字符" end
+        return "2 字符"
+    end
+
+    local function cycleIndent(current)
+        if current == false then return 2 end
+        local count = tonumber(current)
+        if count ~= nil and count >= 4 then return false end
+        return 4
+    end
+
     local function apply(fn)
         self:applyStyleChange(fn)
     end
@@ -1016,16 +1828,69 @@ function ReaderView:makeLayoutMenuButtons()
         self:showFontSelection()
     end
 
-    return {
+    -- Prompt for a custom body font size as a number.
+    local function promptFontSize()
+        self:_settleSwipeRefresh()
+        local current = tonumber(self.style.body_font_size) or 27
+        local dialog
+        dialog = InputDialog:new{
+            modal = true,
+            title = "设置字号",
+            input_hint = "请输入字号（例如 27）",
+            input_type = "number",
+            text = tostring(current),
+            buttons = {
+                {
+                    { text = "取消", id = "close", callback = function() UIManager:close(dialog) end },
+                    { text = "确定", callback = function()
+                        local raw = dialog:getInputText()
+                        UIManager:close(dialog)
+                        local size = tonumber(raw)
+                        if not size then
+                            UIManager:show(Notification:new{ text = "请输入有效数字" })
+                            return
+                        end
+                        size = math.max(14, math.min(72, math.floor(size)))
+                        apply(function(s) s.body_font_size = size end)
+                    end },
+                },
+            },
+        }
+        UIManager:show(dialog)
+        pcall(function() dialog:onShowKeyboard() end)
+    end
+
+    -- Row 2 pairs the brightness entry (when the device has a frontlight)
+    -- with the night-mode toggle; both affect light/colors together.
+    local night_button = {
+        text = "夜间模式：" .. (self:isNightMode() and "开" or "关"),
+        callback = function() apply(function(s)
+            s.night_mode = not (s.night_mode == true)
+        end) end,
+    }
+    local brightness_button
+    if self:hasFrontlightControl() then
+        brightness_button = {
+            text = "屏幕亮度",
+            callback = function()
+                close()
+                UIManager:broadcastEvent(Event:new("ShowFlDialog"))
+            end,
+        }
+    end
+    local light_row = brightness_button
+        and { brightness_button, night_button }
+        or { night_button }
+
+    local buttons = {
         {
             { text = "字体", callback = chooseFont },
-            { text = "字号：" .. choiceLabel(font_values, font_labels, self.style.body_font_size), callback = function() apply(function(s)
-                s.body_font_size = cycle(font_values, s.body_font_size or 27)
-            end) end },
+            { text = "字号：" .. tostring(self.style.body_font_size or 27), callback = promptFontSize },
         },
+        light_row,
         {
-            { text = self.style.indent == false and "首行缩进：关" or "首行缩进：开", callback = function() apply(function(s)
-                s.indent = not (s.indent ~= false)
+            { text = "首行缩进：" .. indentLabel(self.style.indent), callback = function() apply(function(s)
+                s.indent = cycleIndent(s.indent)
             end) end },
             { text = "行距：" .. choiceLabel(line_values, line_labels, self.style.line_spacing), callback = function() apply(function(s)
                 s.line_spacing = cycle(line_values, s.line_spacing or 0.28)
@@ -1041,6 +1906,14 @@ function ReaderView:makeLayoutMenuButtons()
             end) end },
         },
         {
+            { text = "上边距：" .. choiceLabel(vertical_margin_values, vertical_margin_labels, self.style.margin_top), callback = function() apply(function(s)
+                s.margin_top = cycle(vertical_margin_values, s.margin_top or 12)
+            end) end },
+            { text = "下边距：" .. choiceLabel(vertical_margin_values, vertical_margin_labels, self.style.margin_bottom), callback = function() apply(function(s)
+                s.margin_bottom = cycle(vertical_margin_values, s.margin_bottom or 12)
+            end) end },
+        },
+        {
             { text = self.style.show_header and "页眉：显示" or "页眉：隐藏", callback = function() apply(function(s)
                 s.show_header = not s.show_header
             end) end },
@@ -1052,12 +1925,40 @@ function ReaderView:makeLayoutMenuButtons()
             { id = "page_animation_toggle", text = self:isSwipeAnimationEnabled() and "动画效果：开" or "动画效果：关", callback = function()
                 self:setSwipeAnimationEnabled(not self:isSwipeAnimationEnabled())
             end },
-            { id = "chapter_wave_toggle", text = self:isChapterCleanWaveEnabled() and "跨章净屏动画：开" or "跨章净屏动画：关", callback = function()
-                self:setChapterCleanWaveEnabled(not self:isChapterCleanWaveEnabled())
+            { id = "chapter_clean_toggle", text = self:isChapterCleanEnabled() and "跨章净屏：开" or "跨章净屏：关", callback = function()
+                self:setChapterCleanEnabled(not self:isChapterCleanEnabled())
             end },
         },
-        { { text = "关闭", callback = close } },
     }
+    -- 段评只对支持的平台章节有意义（番茄 / 七猫 / QQ阅读）。不支持的书就不显示
+    -- 这一行，免得读者打开开关却什么都看不到。
+    local para_chapter_index = self.page and self.page.chapter_index
+    if para_chapter_index and ParaComments.isSupported(self.book, para_chapter_index) then
+        buttons[#buttons + 1] = {
+            { id = "para_review_toggle", text = self:isParaReviewEnabled() and "段评：开" or "段评：关", callback = function()
+                self:setParaReviewEnabled(not self:isParaReviewEnabled())
+            end },
+            { text = "本页段评", callback = function()
+                close()
+                self:showPageParaCommentList()
+            end },
+        }
+        -- 书山聚合有多台镜像，段评和正文必须落在同一台（原生源自己保证）。
+        -- 这里把当前生效的镜像摆出来，方便读者判断「是不是这台取不到数据」。
+        buttons[#buttons + 1] = {
+            { id = "para_server_button", text = self:_paraServerLabel(), callback = function()
+                UIManager:show(Notification:new{ text = "镜像由书山原生源自动轮换" })
+            end },
+        }
+    end
+    buttons[#buttons + 1] = { { text = "关闭", callback = close } }
+    return buttons
+end
+
+function ReaderView:hasFrontlightControl()
+    if type(Device.hasFrontlight) ~= "function" then return false end
+    local ok, available = pcall(Device.hasFrontlight, Device)
+    return ok and available == true
 end
 
 function ReaderView:showFontSelection()
@@ -1087,9 +1988,9 @@ function ReaderView:showLayoutMenu()
     end
     return UI.showModalLater(self, "layout_menu", function()
         local dialog = ButtonDialog:new{
-            title = "排版设置",
+            title = "阅读设置",
             modal = true,
-            rows_per_page = 6,
+            rows_per_page = 8,
             buttons = self:makeLayoutMenuButtons(),
             tap_close_callback = function()
                 self._layout_dialog = nil
@@ -1103,10 +2004,25 @@ end
 
 function ReaderView:routeTap(ges)
     local x = ges and ges.pos and ges.pos.x or self.dimen.w / 2
+    local y = ges and ges.pos and ges.pos.y or self.dimen.h / 2
     if self.menu_visible then return self:toggleMenu(false) end
-    if x < self.dimen.w * 0.27 then return self:previousPage() end
-    if x > self.dimen.w * 0.73 then return self:nextPage() end
-    return self:toggleMenu(true)
+    -- 段评气泡优先于翻页分区判定：点在气泡上就打开这一段的评论。
+    local paragraph = self:_paraMarkerAt(x, y)
+    if paragraph then
+        self:showParaComments(paragraph)
+        return true
+    end
+    local width, height = self.dimen.w, self.dimen.h
+    -- Kindle/KOReader-style tap map: narrow left gutter goes backward, most
+    -- of the page goes forward, and only a compact centre target
+    -- open controls. Keep this in one router so registered and fallback touch
+    -- paths always share exactly the same geometry.
+    if x >= width * 0.38 and x <= width * 0.62
+            and y >= height * 0.36 and y <= height * 0.64 then
+        return self:toggleMenu(true)
+    end
+    if x < width * 0.16 then return self:previousPage() end
+    return self:nextPage()
 end
 
 function ReaderView:routeSwipe(ges)
@@ -1135,13 +2051,27 @@ function ReaderView:onFlushSettings()
             self._progress_dirty = true
         end
     end
+    if self.statistics_bridge then self.statistics_bridge:checkpoint() end
 end
 
 function ReaderView:onSuspend()
     self:_settleSwipeRefresh()
+    if self.statistics_bridge then self.statistics_bridge:pause() end
     -- Power/suspend is the other safe persistence boundary. Do not write on
     -- every page turn; save the latest in-memory cursor before sleep.
     self:onFlushSettings()
+end
+
+function ReaderView:onResume()
+    if self.statistics_bridge then self.statistics_bridge:resume(self:_statisticsVirtualPage()) end
+end
+
+function ReaderView:onReadingPaused()
+    if self.statistics_bridge then self.statistics_bridge:pause() end
+end
+
+function ReaderView:onReadingResumed()
+    if self.statistics_bridge then self.statistics_bridge:resume(self:_statisticsVirtualPage()) end
 end
 
 -- Rotation actions are dispatched by the host before the screen geometry is
@@ -1169,12 +2099,20 @@ end
 function ReaderView:closeReaderNow()
     if self._closing then return true end
     self._closing = true
+    -- 段评的子进程要在关阅读器时立刻收掉：Kindle 的可用内存本来就紧，
+    -- 让一个还在跑 HTTP 的子进程活到书架上去毫无意义。等待提示也必须摘掉，
+    -- 否则它会盖在书架上，而点它已经没有阅读器可以取消了。
+    self._para_request_token = nil
+    self._para_counts_token = nil
+    self:_endParaWait()
+    AsyncParaReview:release()
     self:_cancelSwipeRefresh()
     if self._exit_dialog then UIManager:close(self._exit_dialog); self._exit_dialog = nil end
     if self._layout_dialog then UIManager:close(self._layout_dialog); self._layout_dialog = nil end
 
     BookService:cancelPrefetch(self.book.id)
     BookService:unobservePrefetch(self.book.id, self)
+    if self.statistics_bridge then self.statistics_bridge:close() end
     self:onFlushSettings()
 
     -- Rebuild the covered bookshelf before removing the reader. UIManager will
@@ -1206,6 +2144,7 @@ function ReaderView:requestExit()
         if UIManager.isWidgetShown and UIManager:isWidgetShown(self._exit_dialog) then return true end
         self._exit_dialog = nil
     end
+    self:onReadingPaused()
     return UI.showModalLater(self, "exit_dialog", function()
         local dialog
         dialog = ButtonDialog:new{
@@ -1224,10 +2163,11 @@ function ReaderView:requestExit()
                     end },
                     { text = "继续阅读", callback = function()
                         UIManager:close(dialog); self._exit_dialog = nil
+                        self:onReadingResumed()
                     end },
                 },
             },
-            tap_close_callback = function() self._exit_dialog = nil end,
+            tap_close_callback = function() self._exit_dialog = nil; self:onReadingResumed() end,
         }
         self._exit_dialog = dialog
         return dialog
@@ -1239,7 +2179,12 @@ function ReaderView:onClose()
     return self:requestExit()
 end
 function ReaderView:onCloseWidget()
+    self._para_request_token = nil
+    self._para_counts_token = nil
+    self:_endParaWait()
+    AsyncParaReview:release()
     self:_cancelSwipeRefresh()
+    if self.statistics_bridge then self.statistics_bridge:close() end
     self:onFlushSettings()
 end
 

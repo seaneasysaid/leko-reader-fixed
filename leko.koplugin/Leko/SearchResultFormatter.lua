@@ -39,6 +39,12 @@ function SearchResultFormatter:bookItem(result, options)
     if preference_ok and SourcePreference then
         source = SourcePreference:label(result) .. " " .. source
     end
+    -- 聚合源（如书山原生源）的每条结果自带底层站点名（番茄/QQ阅读……）。
+    -- 有 origin 时它比 leko 书源名更有辨识度，直接顶替显示。
+    local origin = result and tostring(result.origin or "") or ""
+    if origin ~= "" then
+        source = boundedSourceName(origin, options.source_name_chars or 12)
+    end
 
     -- The result row should answer only two user questions: which book is this,
     -- and which source found it. KOReader reserves the entire `mandatory` width

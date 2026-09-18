@@ -27,7 +27,7 @@ local CoverBrowserView = InputContainer:extend{
 local function resultKey(result)
     local source_id = tostring(result and result.source_id or "")
     local book_url = tostring(result and result.book_url or "")
-    if source_id ~= "" or book_url ~= "" then return source_id .. "\n" .. book_url end
+    if source_id ~= "" or book_url ~= "" then return source_id .. "\n" .. book_url .. "\n" .. tostring(result and result.cover or "") end
     return "cover\n" .. tostring(result and result.cover or "")
 end
 
@@ -35,7 +35,7 @@ local function mergeResolvedResult(target, resolved)
     if type(target) ~= "table" or type(resolved) ~= "table" then return end
     for _, key in ipairs({
         "title", "author", "book_url", "toc_url", "cover", "source_id", "source_name",
-        "variables", "_cover_source", "_source_runtime",
+        "variables", "_cover_source", "_source_runtime", "title_mismatch", "author_mismatch",
     }) do
         if resolved[key] ~= nil then target[key] = resolved[key] end
     end
@@ -163,6 +163,7 @@ function CoverBrowserView:rebuild()
             .. "\n" .. ((result.author and result.author ~= "") and result.author or "佚名")
             .. "\n" .. tostring(result.source_name or "")
             .. (result.is_current_cover and " · 当前封面源" or "")
+            .. (result.title_mismatch and " · 书名标注不同" or "")
             .. (result.author_mismatch and " · 作者标注不同" or "")
     else
         metadata = "找到封面后会立即显示，不必等待全部书源完成。"

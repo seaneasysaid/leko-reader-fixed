@@ -9,11 +9,13 @@ local LegadoSource = require("Leko/LegadoSource")
 local MemoryGuard = require("Leko/MemoryGuard")
 local ProcessBudget = require("Leko/ProcessBudget")
 local SearchCandidateContext = require("Leko/SearchCandidateContext")
+local SearchResultCache = require("Leko/SearchResultCache")
 local SearchSettings = require("Leko/SearchSettings")
 local SourceHealth = require("Leko/SourceHealth")
 local SourcePreference = require("Leko/SourcePreference")
 local Storage = require("Leko/Storage")
 local SubprocessPayload = require("Leko/SubprocessPayload")
+local Util = require("Leko/Util")
 
 local AsyncSourceSearch = {}
 AsyncSourceSearch.__index = AsyncSourceSearch
@@ -22,8 +24,7 @@ local POLL_INTERVAL = 0.18
 local REAP_INTERVAL = 0.18
 local SOURCE_BATCH_YIELD = 0.08
 local MAX_PARALLEL_WORKERS = 2
-local SOURCE_DEADLINE = 14
-local FAST_SOURCE_DEADLINE = 5
+local SOURCE_DEADLINE = SearchSettings.SOURCE_DEADLINE
 local DEFAULT_RESULT_LIMIT = nil
 local LOW_RAM_WAVE_SIZE = 8
 local LOW_RAM_WAVE_REST = 0.35
@@ -38,9 +39,10 @@ local FAST_KNOWN_TARGET = 10
 local FAST_EXPLORE_TARGET = 6
 local IMMEDIATE_INITIAL_PROGRESS = 8
 
-local function sourceDeadline(entry)
-    return entry and entry.fast_phase and not entry.fast_retry_done
-        and FAST_SOURCE_DEADLINE or SOURCE_DEADLINE
+local function sourceDeadline()
+    -- Leave time for a slow HTTP response plus source initialization, parsing
+    -- and result handoff. Cancellation and memory-pressure guards stay active.
+    return SOURCE_DEADLINE
 end
 
 local function clamp(value, low, high)
@@ -51,7 +53,8 @@ local function clamp(value, low, high)
 end
 
 local function sourcePriorityScore(entry, now)
-    local health = entry and entry.health or nil
+    -- Scheduling is based only on catalogue data and explicit user preference.
+    -- Per-book misses/failures must never become cross-book priority state.
     local score = tonumber(entry and entry.capability_score)
     if not score then
         local grade = tostring(entry and entry.compatibility_grade or "")
@@ -60,46 +63,11 @@ local function sourcePriorityScore(entry, now)
     score = score + clamp(entry and entry.weight, -100, 100) * 4
     local custom_order = tonumber(entry and entry.custom_order or 999999) or 999999
     if custom_order < 1000 then score = score + math.max(0, 160 - custom_order * 0.16) end
-    if type(health) ~= "table" then return score end
-
-    now = tonumber(now or os.time()) or os.time()
-    local checked_at = tonumber(health.checked_at or 0) or 0
-    local checked_age = checked_at > 0 and math.max(0, now - checked_at) or math.huge
-    if health.status == "online" and checked_age <= 30 * 24 * 60 * 60 then
-        local freshness = checked_age <= 6 * 60 * 60 and 1
-            or (checked_age <= 7 * 24 * 60 * 60 and 0.55 or 0.2)
-        score = score + 350 * freshness
-        local latency = tonumber(health.latency_ms)
-        if latency then score = score + math.max(0, 260 - latency / 8) * freshness end
-    end
-    local attempts = tonumber(health.search_attempts or 0) or 0
-    local hits = tonumber(health.search_hits or 0) or 0
-    local exact_hits = tonumber(health.exact_hits or 0) or 0
-    local failures = tonumber(health.search_failures or 0) or 0
-    local selected = tonumber(health.selected_count or 0) or 0
-    score = score + math.min(selected, 12) * 650
-    score = score + math.min(exact_hits, 20) * 70
-    if attempts > 0 then
-        score = score + math.min(1, hits / attempts) * 800
-        score = score - math.min(1, failures / attempts) * 320
-    end
-    local selected_age = now - (tonumber(health.last_selected_at or 0) or 0)
-    if selected_age >= 0 and selected_age <= 30 * 24 * 60 * 60 then score = score + 700 end
-    local hit_age = now - (tonumber(health.last_hit_at or 0) or 0)
-    if hit_age >= 0 and hit_age <= 7 * 24 * 60 * 60 then score = score + 320 end
     return score
 end
 
 local function hasUsefulHistory(entry)
-    local health = entry and entry.health
-    if type(health) ~= "table" then return false end
-    local checked_at = tonumber(health.checked_at or 0) or 0
-    local recent_ping = health.status == "online" and tonumber(health.latency_ms) ~= nil
-        and checked_at > 0 and os.time() - checked_at <= 7 * 24 * 60 * 60
-    return (tonumber(health.selected_count or 0) or 0) > 0
-        or (tonumber(health.exact_hits or 0) or 0) > 0
-        or (tonumber(health.search_attempts or 0) or 0) >= 2
-        or recent_ping
+    return false
 end
 
 local function explorationSeeds(explore, wanted)
@@ -290,6 +258,8 @@ local function compactResult(result, source, include_cover_context)
         cover = result and result.cover or nil,
         source_id = source and source.id or (result and result.source_id),
         source_name = source and source.name or (result and result.source_name),
+        -- 聚合源（书山原生）的底层站点名（番茄/QQ阅读……），供结果行显示。
+        origin = result and result.origin or nil,
         -- ruleSearch variables are executable request context, not optional UI
         -- metadata. They are moved to a child-side sidecar before IPC.
         variables = result and result.variables or nil,
@@ -314,6 +284,7 @@ local function compactRuntime(source)
         cookies = source and source.cookies or nil,
         variables = source and source.variables or nil,
         login_header = source and source.login_header or nil,
+        login_info = source and source.login_info or nil,
     }
 end
 
@@ -344,6 +315,15 @@ local function readResultPayload(worker)
     return SubprocessPayload:read(fd, path, { max_bytes = RESULT_PAYLOAD_LIMIT })
 end
 
+local function isResponseLessTransient(err)
+    local text = tostring(err or "")
+    -- Http.lua includes an HTTP status in every rejected response.  Even a
+    -- 408/429/5xx response is terminal for this query; only transport errors
+    -- before any response may receive the one tail retry.
+    if text:match("HTTP/%d+%.%d+%s+%d%d%d") or text:match("HTTP%s+%d%d%d") then return false end
+    return SourceHealth:isNetworkError(text)
+end
+
 local function executeSourceJob(job)
     local payload = { results = {} }
     local ok, err = xpcall(function()
@@ -355,18 +335,10 @@ local function executeSourceJob(job)
             source = Storage:getSource(job.source_id)
         end
         if not source then error(tostring(source_err or "找不到书源定义")) end
-        local health_map = {}
-        if type(job.cached_health) == "table" then health_map[tostring(job.source_id)] = job.cached_health end
-        local cached_decision, cached_health = SourceHealth:cachedDecision(source, nil, health_map)
-        payload.health = cached_health
-        -- Automatic sources may honor a recent explicit offline result. A
-        -- manually preferred source is deliberately still tried once; the
-        -- reader's choice must not be silently defeated by stale health.
-        if cached_decision == false and job.manual_priority ~= true then
-            payload.skipped = true
-            payload.error = cached_health and cached_health.error or "书源近期不可连接"
-        else
-            local search_started = socket.gettime()
+        -- A new query always attempts every enabled source. Historical health
+        -- is telemetry only; it must not make another book/query look complete
+        -- or silently suppress a source.
+        local search_started = socket.gettime()
             local inspect_limit = math.max(1, math.min(MAX_SOURCE_RESULTS_TO_INSPECT,
                 tonumber(job.inspect_limit or MAX_SOURCE_RESULTS_TO_INSPECT) or MAX_SOURCE_RESULTS_TO_INSPECT))
             local found, search_err = LegadoSource:search(source, job.keyword, 1, {
@@ -374,13 +346,17 @@ local function executeSourceJob(job)
                 cache_write = false,
                 save_runtime = false,
                 max_results = inspect_limit,
+                lazy_search = true,
+                search_mode = job.mode,
+                search_title = job.book_title,
+                search_author = job.book_author,
                 -- An exact normalized title scores 1000, the global search
                 -- ceiling. Once such a complete candidate has been parsed,
                 -- later rows cannot improve the selected result.
                 exact_title_query = job.mode == "global" and job.keyword or nil,
                 request_options = {
-                    timeout = 8,
-                    maxtime = 12,
+                    timeout = SearchSettings.SOCKET_TIMEOUT,
+                    maxtime = SearchSettings.REQUEST_MAXTIME,
                     retries = 0,
                     max_bytes = 2 * 1024 * 1024,
                 },
@@ -389,21 +365,19 @@ local function executeSourceJob(job)
                 local elapsed_ms = math.floor(math.max(0, socket.gettime() - search_started) * 1000 + 0.5)
                 payload.health = SourceHealth:record(source, "online", elapsed_ms, nil, nil)
                 if job.mode == "global" then
-                    local limited = {}
-                    for index = 1, math.min(#found, inspect_limit) do
-                        limited[index] = found[index]
+                    -- Rank the FULL result list, then truncate.  Truncating
+                    -- first was wrong for aggregate sources: 书山 repeats the
+                    -- same book across dozens of site mirrors, so the first
+                    -- inspect_limit rows deduplicated down to a single row.
+                    -- Scoring is cheap; the cap only bounds what we emit.
+                    local ranked = BookIdentity:rankedSearchResults(found, job.keyword, inspect_limit)
+                    for _, hit in ipairs(ranked) do
+                        local candidate = compactResult(hit.item, source, false)
+                        candidate.match_score = hit.score
+                        candidate.match_kind = hit.kind
+                        payload.results[#payload.results + 1] = candidate
                     end
-                    -- One source contributes at most its single best result. This
-                    -- prevents noisy imported sources from flooding the list with
-                    -- loosely related books while still checking later rows when
-                    -- the first row is wrong.
-                    local item, score, kind = BookIdentity:bestSearchResult(limited, job.keyword)
-                    if item then
-                        local candidate = compactResult(item, source, false)
-                        candidate.match_score = score
-                        candidate.match_kind = kind
-                        payload.results[1] = candidate
-                    elseif #found > 0 then
+                    if #payload.results == 0 and #found > 0 then
                         payload.query_mismatch = true
                     end
                 else
@@ -411,22 +385,32 @@ local function executeSourceJob(job)
                     for index = 1, math.min(#found, inspect_limit) do
                         limited[index] = found[index]
                     end
-                    local item = BookIdentity:bestExactTitle(limited, job.book_title, job.book_author,
-                        job.mode == "cover")
-                    if item then
-                        local candidate = compactResult(item, source, false)
-                        candidate.author_mismatch = BookIdentity:authorDiffers(job.book_author, item.author)
-                        if job.mode == "cover" and tostring(candidate.cover or "") == "" then
-                            candidate.needs_cover_detail = true
+                    if job.mode == "cover" then
+                        for _, item in ipairs(limited) do
+                            if BookIdentity:sameTitle(job.book_title, item.title) then
+                                local candidate = compactResult(item, source, false)
+                                candidate.author_mismatch = BookIdentity:authorDiffers(job.book_author, item.author)
+                                candidate.needs_cover_detail = tostring(candidate.cover or "") == "" or nil
+                                payload.results[#payload.results + 1] = candidate
+                            end
                         end
-                        payload.results[1] = candidate
-                    elseif #found > 0 then
-                        payload.no_same_title = true
+                    else
+                        local item = BookIdentity:bestExactTitle(limited, job.book_title, job.book_author, false)
+                        if item then
+                            local candidate = compactResult(item, source, false)
+                            candidate.author_mismatch = BookIdentity:authorDiffers(job.book_author, item.author)
+                            payload.results[1] = candidate
+                        end
                     end
+                    if #payload.results == 0 and #found > 0 then payload.no_same_title = true end
                 end
             elseif search_err then
                 payload.error = tostring(search_err)
-                if SourceHealth:isNetworkError(search_err) then
+                if isResponseLessTransient(search_err) then
+                    -- Only this narrowly identified, response-less network
+                    -- failure is eligible for one tail retry. HTTP responses,
+                    -- parser failures and ordinary no-result searches are final.
+                    payload.retryable_no_response = true
                     payload.health = SourceHealth:record(source, "offline", nil, nil,
                         "搜索请求失败：" .. tostring(search_err))
                 end
@@ -459,7 +443,6 @@ local function executeSourceJob(job)
                 exact = first ~= nil and (job.mode ~= "global" or first.match_kind == "exact-title"),
                 failed = payload.error ~= nil,
             })
-        end
         Storage:releaseSourceSettings()
         Storage:releaseSourceOverrideSettings()
     end, debug.traceback)
@@ -496,6 +479,9 @@ function AsyncSourceSearch:new(options)
     instance.on_batch = options.on_batch
     instance.on_progress = options.on_progress
     instance.on_done = options.on_done
+    instance.cache_scope = SearchResultCache:scope(instance.mode, instance.book)
+    instance.cache_key = nil
+    instance.force_refresh = options.force_refresh == true
     instance.completed_sources = 0
     instance.total_sources = 0
     instance.result_count = 0
@@ -557,6 +543,7 @@ function AsyncSourceSearch:_emit(results, entry)
     for _, raw in ipairs(results or {}) do
         local result = self:_acceptCandidate(raw, entry)
         local key = result and resultKey(result) or "\n"
+        if result and self.mode == "cover" then key = key .. "\n" .. tostring(result.cover or "") end
         if key ~= "\n" and not self.seen[key] then
             self.seen[key] = true
             self.discovered_count = self.discovered_count + 1
@@ -662,8 +649,8 @@ function AsyncSourceSearch:_deferManualPriority(entry)
             or not entry or entry.manual_priority ~= true or entry.manual_priority_retry_done then
         return false
     end
+    if (tonumber(entry.attempts or 0) or 0) >= 2 then return false end
     entry.manual_priority_retry_done = true
-    self.total_sources = self.total_sources + 1
     self.manual_priority_queue[#self.manual_priority_queue + 1] = entry
     return true
 end
@@ -690,6 +677,17 @@ function AsyncSourceSearch:_finishIfIdle()
         stage = stage .. "；仅保留前 " .. tostring(self.max_results)
             .. " 个结果，另有 " .. tostring(self.overflow_count) .. " 个没有显示"
     end
+    -- Never let an empty list stand unexplained.  A source can answer
+    -- successfully and still contribute nothing (every row was discarded by
+    -- the relevance filter), and "找到 0 个结果" on its own reads like a broken
+    -- source rather than a filtering decision.
+    if #self.errors > 0 then
+        stage = stage .. "；" .. tostring(#self.errors) .. " 个书源失败："
+            .. tostring(self.errors[1])
+    elseif self.discovered_count == 0 and (self.completed_sources or 0) > 0
+            and self.skipped_sources == 0 and self.resource_skipped_sources == 0 then
+        stage = stage .. "；书源有响应，但没有标题与关键词相关的条目"
+    end
     self.last_stage = stage
     self.finished = true
     pcall(SourceHealth.scheduleFlush, SourceHealth, 20)
@@ -711,12 +709,10 @@ function AsyncSourceSearch:_prepareQueue()
         if self.on_done then pcall(self.on_done, self.errors, self) end
         return
     end
-    local health_map = Storage:listSourceHealth()
     local skipped_id = ""
     if self.mode == "content" then
         skipped_id = tostring(self.book.source_id or "")
-    elseif self.mode == "cover" then
-        skipped_id = tostring(self.book.cover_source_id or self.book.source_id or "")
+
     end
     local records_path, records_err = Storage:getSourceCatalogRecordsPath()
     if not records_path then
@@ -726,33 +722,28 @@ function AsyncSourceSearch:_prepareQueue()
         if self.on_done then pcall(self.on_done, self.errors, self) end
         return
     end
-    local queue = {}
-    local pre_skipped = 0
+    local queue, eligible_ids = {}, {}
     for _, summary in ipairs(summaries) do
         local eligible = summary.enabled ~= false and summary.searchable ~= false
             and summary.has_search_url == true
             and tostring(summary.id or "") ~= skipped_id
             and (self.mode ~= "cover" or summary.cover_supported ~= false)
         if eligible then
+            eligible_ids[#eligible_ids + 1] = summary.id
             local manual_priority = SourcePreference:get(summary) == SourcePreference.PRIORITY
-            local decision = SourceHealth:cachedDecision(summary, nil, health_map)
-            if decision == false and not manual_priority then
-                pre_skipped = pre_skipped + 1
-            else
-                queue[#queue + 1] = {
+            queue[#queue + 1] = {
                     id = summary.id,
                     name = summary.name,
                     capability_profile = summary.capability_profile,
                     capability_score = summary.capability_score,
                     weight = summary.weight,
                     custom_order = summary.custom_order,
-                    health = health_map[tostring(summary.id or "")],
+                    health = nil,
                     manual_priority = manual_priority,
                     records_path = records_path,
                     record_offset = summary.record_offset,
                     record_length = summary.record_length,
                 }
-            end
         end
     end
     summaries = nil
@@ -770,18 +761,40 @@ function AsyncSourceSearch:_prepareQueue()
             main_queue[#main_queue + 1] = entry
         end
     end
+    self.cache_key = SearchResultCache:key(self.keyword, Storage:getSourceCatalogRevision(), eligible_ids)
+    if self.force_refresh then SearchResultCache:clear(self.cache_key) end
+    local restored = SearchResultCache:restore(self.cache_key, self.cache_scope)
+    if restored then
+        -- Reapply this session's matching policy to a compact raw candidate;
+        -- search and source switching therefore share rows but never terminal
+        -- status, failure or priority decisions.
+        self:_emit(restored.candidates, nil)
+        local function omitCompleted(entries)
+            local output = {}
+            for _, entry in ipairs(entries or {}) do
+                if not restored.completed[tostring(entry.id or "")] then output[#output + 1] = entry end
+            end
+            return output
+        end
+        main_queue = omitCompleted(main_queue)
+        manual_priority_queue = omitCompleted(manual_priority_queue)
+        deferred_queue = omitCompleted(deferred_queue)
+    end
     self.queue = main_queue
     self.queue_index = 0
     self.manual_priority_queue = manual_priority_queue
     self.manual_insert_next = false
     self.deferred_retry_queue = deferred_queue
     self.total_sources = #queue
-    self.skipped_sources = pre_skipped
-    self:_notifyProgress(pre_skipped > 0
-        and ("已跳过 " .. tostring(pre_skipped) .. " 个近期不可连接书源")
-        or (self.fast_phase_count > 0
+    if restored then
+        local completed = 0
+        for _ in pairs(restored.completed or {}) do completed = completed + 1 end
+        self.completed_sources = math.min(self.total_sources, completed)
+    end
+    self.skipped_sources = 0
+    self:_notifyProgress(self.fast_phase_count > 0
             and ("先搜索 " .. tostring(self.fast_phase_count) .. " 个常用/快速与探索书源")
-            or "书源索引已准备"), true)
+            or "书源索引已准备", true)
     collectgarbage("step", 80)
     self:_scheduleFill(0)
 end
@@ -806,6 +819,13 @@ end
 
 function AsyncSourceSearch:_processSourceResult(entry, payload)
     payload = type(payload) == "table" and payload or { results = {}, error = "单源搜索结果损坏" }
+    if payload.retryable_no_response == true and entry
+            and (tonumber(entry.attempts or 0) or 0) < 2
+            and not self.cancelled and not self.finished then
+        self:_deferEntry(entry)
+        self:_notifyProgress("书源暂时无响应，已在队尾重试一次", true)
+        return false
+    end
     self:_markFastAttempt(entry)
     self.completed_sources = self.completed_sources + 1
     if payload.health then SourceHealth:save(payload.health) end
@@ -817,9 +837,13 @@ function AsyncSourceSearch:_processSourceResult(entry, payload)
     if payload.error then self:_addError(entry and entry.name, payload.error) end
     local direct = type(payload.results) == "table" and payload.results or {}
     local emitted = self:_emit(direct, entry)
-    -- A preferred source that returned no usable result gets one later retry at
-    -- the tail of the manual insertion queue, before that queue is exhausted.
-    if not emitted then self:_deferManualPriority(entry) end
+    -- Do not cache preemption, cancellation or a pending retry.  A completed
+    -- source is remembered only after its subprocess produced a real terminal
+    -- payload, and cached rows contain no response body or runtime session.
+    if self.cache_key and entry and not payload.error and not payload.skipped and not payload.resource_guard
+            and not payload.retryable_no_response and not payload.process_abnormal then
+        SearchResultCache:record(self.cache_key, self.cache_scope, entry.id, direct)
+    end
     -- Drop the decoded IPC tree as soon as the tiny rows have been handed off.
     -- On Kindle 7 this matters more than keeping a large payload alive until the
     -- next periodic collection.
@@ -835,7 +859,8 @@ function AsyncSourceSearch:_processSourceResult(entry, payload)
     elseif payload.health and payload.health.status == "offline" then
         stage = "已跳过不可连接书源 " .. tostring(self.completed_sources) .. "/" .. tostring(self.total_sources)
     elseif payload.error and not payload.no_same_title and not payload.query_mismatch then
-        stage = "已跳过异常书源 " .. tostring(self.completed_sources) .. "/" .. tostring(self.total_sources)
+        stage = tostring(entry and entry.name or "书源") .. "搜索失败："
+            .. Util.truncateUtf8(Util.collapseSpaces(tostring(payload.error)), 100)
     else
         -- Title/query mismatches are normal search misses. Keep them internal,
         -- as Legado-style streaming search does, rather than blaming a source.
@@ -937,6 +962,17 @@ function AsyncSourceSearch:_spawnSource(holder, budget_ticket)
         self:_returnEntry(holder.entry)
         return
     end
+    local attempts = tonumber(holder.entry and holder.entry.attempts or 0) or 0
+    if attempts >= 2 then
+        ProcessBudget:release(budget_ticket)
+        self:_processSourceResult(holder.entry, {
+            results = {}, process_abnormal = true,
+            error = "该书源在本次查询中的执行次数已达到上限",
+        })
+        self:_continueAfterSource()
+        return
+    end
+    holder.entry.attempts = attempts + 1
     local payload_path = SubprocessPayload:newPath("source-search-" .. tostring(holder.entry and holder.entry.id or ""),
         type(Storage.getCacheDir) == "function" and Storage:getCacheDir("tmp") or "/tmp")
     if self.low_ram then MemoryGuard:prepareForFork() else collectgarbage("step", 96) end
@@ -949,6 +985,7 @@ function AsyncSourceSearch:_spawnSource(holder, budget_ticket)
         ProcessBudget:release(budget_ticket)
         self:_processSourceResult(holder.entry, {
             results = {}, error = tostring(result_fd_or_err or "无法启动单源搜索进程"),
+            process_abnormal = true,
             health = SourceHealth:record(holder.entry, "offline", nil, nil, "无法启动单源搜索进程"),
         })
         self:_continueAfterSource()
@@ -959,7 +996,7 @@ function AsyncSourceSearch:_spawnSource(holder, budget_ticket)
         result_fd = result_fd_or_err,
         entry = holder.entry,
         started_at = socket.gettime(),
-        deadline = sourceDeadline(holder.entry),
+        deadline = sourceDeadline(),
         finished = false,
         budget_ticket = budget_ticket,
         payload_path = payload_path,
@@ -996,7 +1033,9 @@ function AsyncSourceSearch:_requestEntry(entry)
         on_start = function(granted) self:_spawnSource(holder, granted) end,
         on_error = function(err)
             self.pending[holder] = nil
-            self:_processSourceResult(entry, { results = {}, error = tostring(err) })
+            self:_processSourceResult(entry, {
+                results = {}, error = tostring(err), process_abnormal = true,
+            })
             self:_continueAfterSource()
         end,
     }
@@ -1037,7 +1076,10 @@ function AsyncSourceSearch:_pollWorker(worker)
     if ffiutil.isSubProcessDone(worker.pid) then
         local payload, payload_err = readResultPayload(worker)
         if type(payload) ~= "table" then
-            payload = { results = {}, error = tostring(payload_err or "单源搜索没有返回有效结果") }
+            payload = {
+                results = {}, error = tostring(payload_err or "单源搜索没有返回有效结果"),
+                process_abnormal = true,
+            }
         end
         self:_completeWorker(worker, payload)
     else
@@ -1055,39 +1097,14 @@ function AsyncSourceSearch:_pollWorker(worker)
         if socket.gettime() - worker.started_at >= deadline then
             worker.finished = true
             ffiutil.terminateSubProcess(worker.pid)
-            if worker.entry
-                    and (worker.entry.fast_phase or worker.entry.manual_priority == true)
-                    and not worker.entry.fast_retry_done
-                    and not worker.entry.manual_priority_retry_done then
-                -- A first-pass timeout is not a source failure. Automatic
-                -- fast-phase entries go to the full-scan retry queue; a
-                -- preferred entry is appended to its own insertion queue by
-                -- the reaper, so it keeps its place among manual retries.
-                if worker.entry.manual_priority ~= true then
-                    worker.entry.fast_retry_done = true
-                    self:_markFastAttempt(worker.entry)
-                else
-                    -- This first timeout has no result payload to pass through
-                    -- _processSourceResult, but it is still one completed
-                    -- attempt because the retry is counted separately.
-                    self.completed_sources = self.completed_sources + 1
-                    self:_deferManualPriority(worker.entry)
-                end
-                local stage = worker.entry.manual_priority == true
-                    and "手动优先源首次未响应，已排到插队队列末尾重试"
-                    or ("快速阶段暂未响应，已留到完整扫描再试 · "
-                        .. tostring(self.fast_attempted_count) .. "/" .. tostring(self.fast_phase_count))
-                self:_notifyProgress(stage, true)
-                self:_reapWorker(worker, nil, "deferred")
-            else
-                self:_reapWorker(worker, {
-                    results = {}, skipped = true,
-                    error = "这条书源搜索超时（" .. tostring(SOURCE_DEADLINE) .. "秒）",
-                    health = SourceHealth:record(worker.entry, "offline",
-                        math.floor(SOURCE_DEADLINE * 1000), nil,
-                        "这条书源搜索超时（" .. tostring(SOURCE_DEADLINE) .. "秒）"),
-                }, false)
-            end
+            local no_response = {
+                results = {}, retryable_no_response = true,
+                error = "这条书源搜索超时（" .. tostring(SOURCE_DEADLINE) .. "秒）",
+                health = SourceHealth:record(worker.entry, "offline",
+                    math.floor(SOURCE_DEADLINE * 1000), nil,
+                    "这条书源搜索超时（" .. tostring(SOURCE_DEADLINE) .. "秒）"),
+            }
+            self:_reapWorker(worker, no_response, false)
         else
             UIManager:scheduleIn(POLL_INTERVAL, function() self:_pollWorker(worker) end)
         end
@@ -1107,7 +1124,18 @@ function AsyncSourceSearch:start()
             if self.on_done then pcall(self.on_done, self.errors, self) end
             return
         end
-        self:_prepareQueue()
+        -- AsyncSourceCatalog deliberately isolates caller callbacks with
+        -- pcall.  Convert a preparation exception into a terminal search
+        -- error here; otherwise the callback error is swallowed and the UI
+        -- remains forever at the pre-catalog 0/0 state.
+        local prepared, prepare_err = xpcall(function() self:_prepareQueue() end, debug.traceback)
+        if not prepared and not self.cancelled and not self.finished then
+            self:_addError("书源索引", prepare_err)
+            self.last_stage = "书源索引读取失败：" .. tostring(prepare_err):gsub("\n.*", "")
+            self.finished = true
+            self:_notifyProgress(self.last_stage, true)
+            if self.on_done then pcall(self.on_done, self.errors, self) end
+        end
     end)
     return self
 end

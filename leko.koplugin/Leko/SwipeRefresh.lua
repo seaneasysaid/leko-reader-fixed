@@ -1,14 +1,18 @@
 -- Reader-local transition coordinator.
 --
--- Same-chapter pages use the device's native swipe when the device advertises
--- that capability, and otherwise use the small local software strip fallback.
--- Chapter boundaries may use the travelling black/white cleanup wave. No
--- global KOReader refresh policy is changed here.
+-- Same-chapter page turns use the software wipe animation (擦除渐显),
+-- modeled after the koplugin-swipe-animation/Swipe_Animation.koplugin
+-- patch: the old page stays as the background while vertical strips of the
+-- new page are revealed one UI tick at a time. The device's native hardware
+-- swipe is kept only as a fallback when the software backend is unavailable.
+-- Chapter boundaries are not handled here at all: 「跨章净屏」delegates to
+-- KOReader's global refresh (see ReaderView:setPage). This module only owns
+-- the same-chapter software wipe and its native fallback, and it never
+-- changes KOReader's global refresh policy.
 
 local Blitbuffer = require("ffi/blitbuffer")
 local Device = require("device")
 
-local ChapterWaveRefresh = require("Leko/ChapterWaveRefresh")
 local SwipeAnimation = require("Leko/SwipeAnimation")
 
 local Screen = Device.screen
@@ -19,12 +23,15 @@ SwipeRefresh.__index = SwipeRefresh
 SwipeRefresh.FORWARD = "forward"
 SwipeRefresh.BACKWARD = "backward"
 
--- This is the legacy fallback for devices without KOReader's hardware swipe
--- capability.  It keeps the .40/.42 visual contract (one target strip per UI
--- tick) without retaining an old framebuffer or creating an animation queue.
+-- This is the software wipe fallback used for every same-chapter page turn.
+-- It keeps the .40/.42 visual contract (one target strip per UI tick)
+-- without retaining an old framebuffer or creating an animation queue.
 local PORTRAIT_STRIPS = 8
 local LANDSCAPE_STRIPS = 6
-local SOFTWARE_FRAME_DELAY = 0.018
+-- Animation frame delay in seconds: 15 ms between strips, matching the
+-- Swipe_Animation.koplugin default (its portrait/landscape defaults are
+-- 20/10 ms; 15 ms is the middle ground requested for Leko).
+local SOFTWARE_FRAME_DELAY = 0.015
 local SOFTWARE_ALIGNMENT = 8
 local SOFTWARE_OVERLAP = 8
 
@@ -60,10 +67,6 @@ function SwipeRefresh:new(options)
         device = instance.device,
         screen = screen,
     }
-    instance.chapter_wave = ChapterWaveRefresh:new{
-        screen = screen,
-        ui_manager = options.ui_manager,
-    }
     return instance
 end
 
@@ -73,14 +76,6 @@ end
 
 function SwipeRefresh:isNativeSwipeAvailable()
     return self.native_swipe:isAvailable()
-end
-
-function SwipeRefresh:isChapterWaveAvailable()
-    return self.chapter_wave:isAvailable()
-end
-
-function SwipeRefresh:isWaveRunning()
-    return self.running == true and self.mode == "wave"
 end
 
 function SwipeRefresh:isSoftwareSwipeAvailable()
@@ -156,9 +151,6 @@ function SwipeRefresh:_invalidate()
     self:_unschedulePendingFrame()
     local previous_mode = self.mode
     local target = self.target_framebuffer
-    if previous_mode == "wave" then
-        target = self.chapter_wave:cancel() or target
-    end
     if previous_mode == "native" then self.native_swipe:reset() end
     self.generation = self.generation + 1
     self.running = false
@@ -339,21 +331,6 @@ function SwipeRefresh:_runSoftwareFrame(token)
     end
 end
 
-function SwipeRefresh:_completeWave(request_generation, wave_token, target)
-    if request_generation ~= self.generation or self.mode ~= "wave" or not self.running then
-        freeBuffer(target)
-        return
-    end
-    local callback = self._on_complete
-    self.target_framebuffer = nil
-    self._on_complete = nil
-    self.running = false
-    self.mode = nil
-    self.direction = nil
-    freeBuffer(target)
-    if type(callback) == "function" then pcall(callback, wave_token) end
-end
-
 -- Render the latest page and replace any active transition. The options are
 -- deliberately explicit so a chapter boundary can never accidentally use a
 -- same-page native swipe.
@@ -363,20 +340,17 @@ function SwipeRefresh:begin(widget, direction, on_complete, options)
         return nil, "无效的翻页方向"
     end
 
-    local chapter_changed = options.chapter_changed == true
     local page_animation_enabled = options.page_animation_enabled ~= false
     if not page_animation_enabled then
         return nil, "页面动画已关闭"
     end
 
     self:_invalidate()
-    local use_wave = chapter_changed
-        and options.chapter_clean_wave_enabled == true
-        and self:isChapterWaveAvailable()
-    local use_native = self:isNativeSwipeAvailable()
-    local use_software = not use_native
-        and self:isSoftwareSwipeAvailable()
-    if not use_wave and not use_native and not use_software then
+    -- The software wipe (擦除渐显) is the primary page-turn animation. The
+    -- native hardware swipe is used only when the software backend cannot run.
+    local use_software = self:isSoftwareSwipeAvailable()
+    local use_native = not use_software and self:isNativeSwipeAvailable()
+    if not use_native and not use_software then
         return nil, "当前正文刷新后端没有启用的页面动画"
     end
     if not self.ui_manager
@@ -392,19 +366,6 @@ function SwipeRefresh:begin(widget, direction, on_complete, options)
     self.running = true
     self._on_complete = on_complete
     local request_generation = self.generation
-
-    if use_wave then
-        self.mode = "wave"
-        local started, wave_token_or_err = self.chapter_wave:begin(target, direction,
-            function(wave_token, completed_target)
-                self:_completeWave(request_generation, wave_token, completed_target)
-            end)
-        if not started then
-            self:_invalidate()
-            return nil, wave_token_or_err
-        end
-        return true, request_generation
-    end
 
     if use_native then
         self.mode = "native"
@@ -439,9 +400,6 @@ end
 -- owned by Screen/EPDC and is never synchronously awaited here.
 function SwipeRefresh:settle()
     if not self.running or not self.target_framebuffer then return false end
-    if self.mode == "wave" then
-        return self.chapter_wave:settle()
-    end
 
     local token = self.generation
     self:_unschedulePendingFrame()

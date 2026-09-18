@@ -63,7 +63,9 @@ function ReadingCoordinator:_showError(title, err, callback)
 end
 
 function ReadingCoordinator:_presentReader(book, progress, task, options)
+    local task_generation = task.generation
     runAfterPaint(function()
+        if task.generation ~= task_generation then return end
         local ok, reader_or_err, model_err = xpcall(function()
             local current, index_err = clampChapter(book, options.chapter_index)
             if not current then return nil, index_err end
@@ -100,6 +102,11 @@ function ReadingCoordinator:_presentReader(book, progress, task, options)
             task:complete(progress)
             if UIManager.setDirty then UIManager:setDirty(reader, "full") end
             if UIManager.forceRePaint then UIManager:forceRePaint() end
+            if options.warning then
+                UIManager:show(require("ui/widget/notification"):new{
+                    text = tostring(options.warning), timeout = 8,
+                })
+            end
             if type(self.on_reader_created) == "function" then pcall(self.on_reader_created, reader, book) end
             if type(self.on_reader_shown) == "function" then pcall(self.on_reader_shown, reader, book) end
             if type(options.on_reader_shown) == "function" then pcall(options.on_reader_shown, reader, book) end
@@ -124,7 +131,7 @@ function ReadingCoordinator:open(book, options)
         self:_showError("无法准备阅读", "书籍信息不完整", options.on_failure)
         return nil
     end
-    if self:isBusy() then return nil, "已有阅读任务正在进行" end
+    if self:isBusy() then self:cancel("replaced") end
 
     local in_library = Storage:isInLibrary(book.id)
     local title = options.title or (in_library and "正在准备阅读" or "正在准备试读")
@@ -148,8 +155,9 @@ function ReadingCoordinator:open(book, options)
         on_failure = function(err)
             self:_showError("无法准备阅读", err, options.on_failure)
         end,
-        on_success = function(ready_book, _, progress, task)
+        on_success = function(ready_book, payload, progress, task)
             self:_presentReader(ready_book, progress, task, {
+                warning = payload and payload.warning,
                 chapter_index = chapter_index,
                 origin_view = options.origin_view,
                 return_view = options.return_view,
@@ -199,7 +207,9 @@ function ReadingCoordinator:prepareChapter(reader, position, refresh_type, optio
             self:_showError(force_network and "刷新本章失败" or "章节打开失败", err, options.on_failure)
         end,
         on_success = function(updated_book, _, progress, task)
+            local task_generation = task.generation
             runAfterPaint(function()
+                if task.generation ~= task_generation then return end
                 if reader._closing then task:complete(progress); return end
                 if options.generation and type(reader.isPageGenerationCurrent) == "function"
                         and not reader:isPageGenerationCurrent(options.generation) then
@@ -258,7 +268,9 @@ function ReadingCoordinator:refreshToc(reader, options)
             self:_showError("目录检查失败", err, options.on_failure)
         end,
         on_success = function(updated, payload, progress, task)
+            local task_generation = task.generation
             runAfterPaint(function()
+                if task.generation ~= task_generation then return end
                 if reader._closing then task:complete(progress); return end
                 if generation and type(reader.isPageGenerationCurrent) == "function"
                         and not reader:isPageGenerationCurrent(generation) then

@@ -3,6 +3,7 @@ local UIManager = require("ui/uimanager")
 
 local SearchCandidateContext = require("Leko/SearchCandidateContext")
 local SourceResultActions = require("Leko/SourceResultActions")
+local UI = require("Leko/UI")
 
 local StreamingResultList = Menu:extend{
     covers_fullscreen = true,
@@ -48,6 +49,7 @@ function StreamingResultList:_installMenuCallbacks()
 end
 
 function StreamingResultList:init()
+    self._disposed = false
     self:_initializeResults()
     self:_installMenuCallbacks()
     -- Menu:updateItems relies on geometry created by Menu.init. Build the
@@ -57,6 +59,17 @@ function StreamingResultList:init()
     if self.refreshItems then self:refreshItems() end
     self._initializing_menu = false
     Menu.init(self)
+end
+
+function StreamingResultList:requestManualRefresh()
+    -- Menu selection still owns the current item/widget tree until its callback
+    -- returns. Rebuilding that tree inline can crash old Kindle UI backends.
+    -- Defer once, coalesce repeated taps, and do nothing if the list closed in
+    -- the meantime.
+    return UI.defer(self, "manual_result_refresh", function()
+        if self._disposed then return end
+        if type(self.onManualRefresh) == "function" then self:onManualRefresh() end
+    end)
 end
 
 function StreamingResultList:onResultSelected(result)
@@ -120,16 +133,12 @@ end
 -- sidecars remain available until the user explicitly leaves the list.
 function StreamingResultList:prepareForReturn()
     self._preserve_for_return = true
-    self.searching = false
     self:_cancelPendingRefresh()
-    if not self._return_search_cancelled and self.onCancelSearch then
-        pcall(self.onCancelSearch)
-        self._return_search_cancelled = true
-    end
     return self
 end
 
 function StreamingResultList:onReturn()
+    self._disposed = true
     if self.cancelBookOperation then pcall(self.cancelBookOperation, self) end
     if not self._return_search_cancelled and self.onCancelSearch then pcall(self.onCancelSearch) end
     self._preserve_for_return = false
@@ -143,8 +152,12 @@ end
 
 function StreamingResultList:onCloseWidget()
     self:_cancelPendingRefresh()
-    if not self._return_search_cancelled and self.onCancelSearch then pcall(self.onCancelSearch) end
+    -- A full-screen detail/reader transition may temporarily close the list
+    -- widget while keeping it as the explicit return route.  Preserve both
+    -- its candidates and its live search generation in that case.
     if self._preserve_for_return then return end
+    self._disposed = true
+    if not self._return_search_cancelled and self.onCancelSearch then pcall(self.onCancelSearch) end
     -- Candidate execution contexts may have been spilled to tmp sidecars on
     -- low-memory devices. A widget can be closed programmatically without
     -- going through onReturn(), so clean them here as well.
