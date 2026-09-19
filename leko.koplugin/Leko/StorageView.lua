@@ -40,7 +40,7 @@ function StorageView:buildItems(stats)
         { text = "清理图片缓存", mandatory = sizeLabel(stats, "cache_images"), action = "clear_images" },
         { text = "清理临时下载", mandatory = sizeLabel(stats, "cache_tmp"), action = "clear_tmp" },
         { text = "清理全部临时缓存", mandatory = sizeLabel(stats, "cache"), action = "clear_all", separator = true },
-        { text = "已下载章节", mandatory = sizeLabel(stats, "books"), dim = true },
+        { text = "清理已下载章节", mandatory = sizeLabel(stats, "books") .. " ›", action = "clear_chapters" },
         { text = "书源备份", mandatory = stats and (tostring(stats.backup_count or 0)
             .. " 份 · " .. Storage:formatBytes(stats.sources) .. " ›") or "正在统计…", action = "source_backups" },
     }
@@ -111,7 +111,8 @@ function StorageView:init()
                     .. "\n书源备份：" .. Storage:formatBytes(stats.sources)
                     .. "\n临时缓存：" .. Storage:formatBytes(stats.cache)
                     .. "\n总计：" .. Storage:formatBytes(stats.total)
-                    .. "\n\n清理临时缓存不会删除书架、阅读进度或已下载章节。",
+                    .. "\n\n清理临时缓存不会删除书架、阅读进度或已下载章节；"
+                    .. "\n已下载章节可在下方单独清理，清理后重新打开会自动重新下载。",
             })
             return
         end
@@ -131,6 +132,27 @@ function StorageView:init()
         elseif item.action == "clear_images" then kinds = { "images" }
         elseif item.action == "clear_tmp" then kinds = { "tmp", "http" }
         elseif item.action == "clear_all" then kinds = false
+        elseif item.action == "clear_chapters" then
+            local stats = Storage:getCachedStorageStats()
+            UIManager:show(ConfirmBox:new{
+                text = "清理全部已下载章节（"
+                    .. sizeLabel(stats, "books") .. "）？\n\n"
+                    .. "书架、阅读进度和目录都会保留，重新打开章节时会自动重新下载。正在整本缓存的书籍会被停止。",
+                ok_text = "清理",
+                ok_callback = function()
+                    local cancelled = 0
+                    for _, id in ipairs(Storage:listBookDataIds()) do
+                        if BookService:cancelFullBookCache(id) then cancelled = cancelled + 1 end
+                    end
+                    local cleared = Storage:clearAllBookChapters()
+                    CoverService:clearMemory()
+                    Storage:clearCachedStorageStats()
+                    UIManager:show(Notification:new{ text = "已清理 " .. tostring(cleared)
+                        .. " 本书的章节" .. (cancelled > 0 and ("，停止 " .. tostring(cancelled) .. " 个整本缓存任务") or "") })
+                    menu:refresh(true)
+                end,
+            })
+            return
         else return end
 
         UIManager:show(ConfirmBox:new{

@@ -1574,6 +1574,37 @@ function Storage:deleteBook(book_id)
     return Util.removeTree(self:getBookDir(book_id))
 end
 
+-- All book data directories under books/, including entries that were
+-- removed from the shelf with keep_files (their dirs stay on disk).
+function Storage:listBookDataIds()
+    local ids = {}
+    local root = self:getBooksDir()
+    if lfs.attributes(root, "mode") ~= "directory" then return ids end
+    for entry in lfs.dir(root) do
+        if entry ~= "." and entry ~= ".."
+                and lfs.attributes(Util.joinPath(root, entry), "mode") == "directory" then
+            ids[#ids + 1] = entry
+        end
+    end
+    table.sort(ids)
+    return ids
+end
+
+-- Delete one book's downloaded chapter files only. Metadata, TOC, reading
+-- progress and covers stay; downloads are self-healing because chapter
+-- presence is always verified against the file system before a read.
+function Storage:clearBookChapters(book_id)
+    return Util.removeTree(self:getChapterDir(book_id))
+end
+
+function Storage:clearAllBookChapters()
+    local ids = self:listBookDataIds()
+    for _, id in ipairs(ids) do
+        Util.removeTree(self:getChapterDir(id))
+    end
+    return #ids
+end
+
 function Storage:getCoverPath(book_id, extension)
     extension = tostring(extension or "jpg"):lower():gsub("[^%w]", "")
     if extension == "jpeg" then extension = "jpg" end
