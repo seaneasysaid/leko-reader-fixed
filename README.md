@@ -1,5 +1,8 @@
 # Leko Reader — 非官方增强版 Fork
 
+[![release](https://img.shields.io/github/v/release/seaneasysaid/leko-reader-fixed)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
+[![downloads](https://img.shields.io/github/downloads/seaneasysaid/leko-reader-fixed/total)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
+
 本项目是 [`jnjnnjzch/leko-reader`](https://github.com/jnjnnjzch/leko-reader) 的非官方增强版 Fork。
 
 > 本项目不是上游项目的官方版本。上游来源、提交历史及代码差异均通过 GitHub Fork 关系公开保留。
