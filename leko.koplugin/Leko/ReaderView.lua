@@ -1273,6 +1273,8 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
 
     ctx.ReviewPopup.show{
         pages = items,
+        -- 段标识：区分「同一段继续加载」与「换了新一段」，决定弹窗是否保留滚动位置。
+        paragraph_key = tostring(ctx.chapter_index) .. ":" .. tostring(paragraph_index),
         doc_font_name = self.style.body_font,
         doc_font_size = (body_face and body_face.size) or Screen:scaleBySize(20),
         doc_margins = {

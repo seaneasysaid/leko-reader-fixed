@@ -109,6 +109,7 @@ function M.show(opts)
         on_more = opts.on_more,
     }
     _pool[position] = popup
+    popup._para_key = opts.paragraph_key
     UIManager:show(popup)
     return popup
 end
