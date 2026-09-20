@@ -659,6 +659,25 @@ function ReaderView:buildMenuOverlay()
     return top, bottom
 end
 
+--[[--
+一次整页重绘该请求哪种波形 / 区域。
+
+开着「避免界面闪烁」时，UIManager 会把**带 region 的** "partial" 降级成 "ui"
+（uimanager.lua 的 _refresh：`mode == "partial" and region` → `ui`）。"ui" 是两级
+DU 波形，只适合小面积 UI 更新；拿它去刷整页重新折行后的正文，旧字盖不干净 ——
+读者看到的就是「新字叠着旧字、行首缺字」，而手动全刷一下又好了。
+KOReader 自己的阅读器对整页重绘用的是 `setDirty(view, "partial")` 且**不带 region**，
+UIManager 会把没有 region 的刷新自己补成全屏，波形仍停在正规的 partial。
+
+约定：调用方**明确指定** region 的（页脚条等局部刷新）照旧原样传下去；没指定时，
+只有 "partial" 省略 region，其余模式仍显式传整屏 dimen（保持既有行为）。
+]]--
+local function pageRefresh(mode, region, dimen)
+    mode = mode or "ui"
+    if not region and mode ~= "partial" then region = dimen end
+    return mode, region
+end
+
 function ReaderView:rebuild(refresh_type, refresh_region)
     -- The callback is not guaranteed to run after a dialog closes or a
     -- reflow reconstructs the ReaderView. Read the service-owned state at
@@ -692,7 +711,8 @@ function ReaderView:rebuild(refresh_type, refresh_region)
     else
         self[1] = page_widget
     end
-    UIManager:setDirty(self, refresh_type or "ui", refresh_region or self.dimen)
+    local mode, region = pageRefresh(refresh_type, refresh_region, self.dimen)
+    UIManager:setDirty(self, mode, region)
     return true
 end
 
@@ -717,7 +737,8 @@ function ReaderView:_finishSwipeSubmission()
     local pending = self._pending_rebuild
     self._pending_rebuild = nil
     if pending then
-        UIManager:setDirty(self, pending.refresh_type or "ui", pending.refresh_region or self.dimen)
+        local mode, region = pageRefresh(pending.refresh_type, pending.refresh_region, self.dimen)
+        UIManager:setDirty(self, mode, region)
     end
 end
 
@@ -820,10 +841,23 @@ end
 章节模型上，也会顺手清空 history。这里只按当前位置重新分页一次，
 阅读位置与历史都不动。
 ]]--
+-- 「屏幕上看得见的排版」指纹：元素类型 + 正文 + 气泡文字 + 用掉的高度。
+-- 整页重排前后各取一次，就能判断这次重排到底有没有动到屏幕上的东西。
+local function pageLayoutSignature(page)
+    if type(page) ~= "table" or type(page.elements) ~= "table" then return nil end
+    local parts = {}
+    for i, element in ipairs(page.elements) do
+        parts[i] = tostring(element.type) .. "\1" .. tostring(element.text or "")
+            .. "\1" .. tostring(element.para_marker or "")
+    end
+    return table.concat(parts, "\2") .. "\3" .. tostring(page.used_height or 0)
+end
+
 function ReaderView:reflowForParaReview()
     if not self.page then return false end
     self:_settleSwipeRefresh()
     local anchor = self.page.start_position
+    local previous_signature = pageLayoutSignature(self.page)
     local page, err = Paginator:makePage(self.book, anchor, self.style)
     if not page then
         logger.warn("Leko para review reflow failed", tostring(err))
@@ -832,8 +866,17 @@ function ReaderView:reflowForParaReview()
     self.page = page
     self._progress_dirty = true
     self._footer_dirty = true
-    self:rebuild("partial")
-    self:_scheduleFooterRefresh(true)
+    if pageLayoutSignature(page) == previous_signature then
+        -- 这一章没有任何段落要挂气泡（计数为空，或与本代完全相同）：排版一字未动，
+        -- 屏幕上已经是最终画面，页脚百分比也由同一批元素决定。这里就该什么都不刷 ——
+        -- 无条件 rebuild 一次等于为「什么都没变」在屏幕上盖一层残影。
+        return true
+    end
+    -- 气泡挤进段末行，那一行的可用宽度变窄，后面每一行都重新折行 —— 屏幕上现有的
+    -- 每一个字都已经作废。这种规模的变更只能用整屏闪刷（和「跨章净屏」同一条路径）：
+    -- 局部 / 快速波形盖不住已经落下的旧字，读者看到的就是「新字叠着旧字、行首缺字」。
+    -- 页脚由这次 rebuild 一并重画，不需要再补一次局部刷新。
+    self:rebuild("full")
     return true
 end
 
