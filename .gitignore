@@ -21,6 +21,13 @@
 !/leko.koplugin/Leko/
 /leko.koplugin/Leko/*
 !/leko.koplugin/Leko/*.lua
+
+# Segmented-review popup (bottom "thought"-style) implementation.
+# NOTE: the parent dir must be re-admitted first, otherwise git never descends
+# into an ignored directory and the !rules for its files are dead letters.
+!/leko.koplugin/Leko/review_popup/
+/leko.koplugin/Leko/review_popup/*
+!/leko.koplugin/Leko/review_popup/*.lua
 !/leko.koplugin/Leko/gbk-unicode.bin
 !/leko.koplugin/Leko/native/
 /leko.koplugin/Leko/native/*
