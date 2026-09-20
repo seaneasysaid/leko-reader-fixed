@@ -1,5 +1,5 @@
 return {
-    version = "0.17.24",
+    version = "0.16.0-fixed.3",
     catalog_version = 6,
     -- 9: native (leko://) sources are no longer graded "兼容运行时 / 需要
     -- JavaScript".  The bump makes startup re-seed the built-in definitions so
