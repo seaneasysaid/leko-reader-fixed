@@ -76,3 +76,14 @@ koreader/plugins/leko.koplugin/leko.koplugin/main.lua   ← 错误
 ## 使用声明
 
 本项目仅用于个人学习和技术研究，不代表上游项目及相关内容平台的官方立场。本项目不存储、不分发任何书籍内容，所有正文均通过用户自行配置的书源获取。使用者应自行确认适用的授权条件并自行承担风险。请尊重版权、支持正版阅读。如涉及侵权请联系删除。
+
+## 项目推荐
+
+如果你也在电纸书上看书，这些是我维护的其他 KOReader 项目，欢迎一并试试：
+
+| 插件 | 简介 |
+| --- | --- |
+| [legadocomic.koplugin](https://github.com/seaneasysaid/legadocomic.koplugin) | 只专注看漫画的 KOReader 插件：连接安卓「开源阅读」(Legado) 的 Web 服务，漫画流式翻页 + 磁盘缓存 + 智能预取 |
+| [fanqie.koplugin-fixed](https://github.com/seaneasysaid/fanqie.koplugin-fixed) | KOReader 番茄小说插件非官方增强版：适配书山聚合 + 知秋段评，正文无广告，节点测速自动切换（非官方增强版，fork 自 hesan1232/fanqie.koplugin） |
+| [readingstats.koplugin](https://github.com/seaneasysaid/readingstats.koplugin) | 轻量版阅读统计 · 阅读足迹 —— KOReader 插件：日历阅读统计 + GitHub 风格热力图 + 阅读分析（含年度/月度书籍排行） |
+| [koreader-remote](https://github.com/seaneasysaid/koreader-remote) | KOReader Wi-Fi 无线控制网站：手机浏览器即可远程操作电纸书（[在线版](https://seaneasysaid.github.io/koreader-remote/)） |
