@@ -1,7 +1,9 @@
 # Leko Reader — 非官方增强版 Fork
 
-[![release](https://img.shields.io/github/v/release/seaneasysaid/leko-reader-fixed)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
-[![downloads](https://img.shields.io/github/downloads/seaneasysaid/leko-reader-fixed/total)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
+<!-- 徽章末尾的 ?v=N 是缓存刷新参数：GitHub 的图片代理会连 shields 的 CDN 一起缓存 30 分钟以上，
+     数字看起来"没更新"时把 N 加一即可立刻强制重取。 -->
+[![release](https://img.shields.io/github/v/release/seaneasysaid/leko-reader-fixed?v=1)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
+[![downloads](https://img.shields.io/github/downloads/seaneasysaid/leko-reader-fixed/total?v=1)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
 
 本项目是 [`jnjnnjzch/leko-reader`](https://github.com/jnjnnjzch/leko-reader) 的非官方增强版 Fork。
 
