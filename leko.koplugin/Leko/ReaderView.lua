@@ -14,7 +14,6 @@ local InputDialog = require("ui/widget/inputdialog")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local Notification = require("ui/widget/notification")
 local OverlapGroup = require("ui/widget/overlapgroup")
-local ProgressWidget = require("ui/widget/progresswidget")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
@@ -75,9 +74,6 @@ function ReaderView:init()
     self._layout_dialog = nil
     self._closing = false
     self.prefetch_state = nil
-    self._prefetch_footer_signature = nil
-    self._prefetch_footer_rendered_signature = nil
-    self._prefetch_footer_refresh_pending = false
     self._progress_dirty = false
     self._footer_dirty = true
     self.page_generation = 0
@@ -294,8 +290,6 @@ function ReaderView:refreshFooterFromCache(refresh_type)
     if self._closing or not self.page then return false end
     self:_settleSwipeRefresh()
     self:_syncPrefetchState()
-    self._prefetch_footer_signature = ReaderFooter:prefetchSignature(self.prefetch_state)
-    self._prefetch_footer_rendered_signature = nil
     self._footer_dirty = true
     local region = self.menu_visible and self.dimen or self:_footerRegion()
     return self:rebuild(refresh_type or "full", region or self.dimen)
@@ -314,12 +308,6 @@ end
 
 function ReaderView:buildFooterStatus(page, geometry)
     local total_chapters = #(self.book.chapters or {})
-    local state = self.prefetch_state
-    -- A page rebuild already contains the current cache indicator.  Remember
-    -- that signature so a queued prefetch notification can coalesce with the
-    -- page turn instead of rebuilding the whole reading page a second time.
-    self._prefetch_footer_rendered_signature = ReaderFooter:prefetchSignature(state)
-    self._prefetch_footer_signature = self._prefetch_footer_rendered_signature
     self._footer_dirty = false
     local chapter_index = tonumber(page.chapter_index or 1) or 1
     local chapter_percentage = 0
@@ -336,7 +324,9 @@ function ReaderView:buildFooterStatus(page, geometry)
 
     local left_text = string.format("第 %d / %d 章", chapter_index, total_chapters)
     local right_text = string.format("本章 %d%%", math.floor(chapter_percentage * 100 + 0.5))
-    local cache = ReaderFooter:prefetchLabel(state)
+    -- The footer no longer renders any cache/prefetch indicator. A progress bar
+    -- here meant one footer-only repaint per prefetch tick, and those regional
+    -- refreshes could race the chapter-turn full refresh on E Ink.
     -- Keep the status line inside the same horizontal reading margins as the
     -- body. This avoids text touching the panel edges on small Kindle screens.
     local width = math.max(1, geometry.content_width or (geometry.screen_width
@@ -346,7 +336,6 @@ function ReaderView:buildFooterStatus(page, geometry)
     local right_width = math.floor(width * 0.24)
     local middle_width = math.max(1, width - left_width - right_width)
     local chrome_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil
-    local bar_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
 
     local left = LeftContainer:new{
         dimen = Geom:new{ w = left_width, h = height },
@@ -369,33 +358,9 @@ function ReaderView:buildFooterStatus(page, geometry)
         },
     }
 
-    local middle_content
-    if cache then
-        -- Keep the 0.15.39 visual scale: the bar was 22% of the usable
-        -- reading width. Computing 28% of the already narrowed middle column
-        -- made it only about 12% of the page and nearly invisible on Kindle 7.
-        local cache_bar_width = math.max(Screen:scaleBySize(54), math.floor(width * 0.22))
-        middle_content = HorizontalGroup:new{
-            align = "center",
-            TextWidget:new{
-                text = cache.text,
-                face = geometry.chrome_face,
-                padding = 0,
-                fgcolor = chrome_color,
-            },
-            HorizontalSpan:new{ width = Screen:scaleBySize(5) },
-            ProgressWidget:new{
-                width = cache_bar_width,
-                height = math.max(3, Screen:scaleBySize(5)),
-                padding = 0,
-                margin = 0,
-                fillcolor = bar_color,
-                percentage = cache.percentage,
-            },
-        }
-    else
-        middle_content = TextWidget:new{ text = "", face = geometry.chrome_face, padding = 0 }
-    end
+    -- Middle column stays empty: the footer only shows 「第 x / y 章」 and
+    -- 「本章 n%」. Nothing about the background prefetch is rendered anymore.
+    local middle_content = TextWidget:new{ text = "", face = geometry.chrome_face, padding = 0 }
 
     local footer = HorizontalGroup:new{
         left,
@@ -422,41 +387,12 @@ function ReaderView:_footerRegion()
     }
 end
 
-function ReaderView:_schedulePrefetchFooterRefresh()
-    if self._prefetch_footer_refresh_pending then return true end
-    self._prefetch_footer_refresh_pending = true
-    local callback = function()
-        self._prefetch_footer_refresh_pending = false
-        if self._closing or self.menu_visible or not self.page or not self.style.show_footer then return end
-        if self._prefetch_footer_signature == self._prefetch_footer_rendered_signature then
-            return
-        end
-        local region = self:_footerRegion()
-        if not region then return end
-        if self:isSwipeAnimationEnabled() and self.swipe_refresh
-                and self.swipe_refresh:isRunning() then
-            self._pending_rebuild = { refresh_type = "fast", refresh_region = region }
-            return
-        end
-        self:rebuild("fast", region)
-    end
-    if type(UIManager.nextTick) == "function" then
-        UIManager:nextTick(callback)
-    else
-        UIManager:scheduleIn(0.05, callback)
-    end
-    return true
-end
-
+-- The footer no longer shows anything about the background prefetch, so a
+-- progress tick must not trigger a repaint. Each tick used to rebuild the whole
+-- reading page and then flush only the footer strip; on E Ink those regional
+-- refreshes could race the chapter-turn refresh and leave a half-painted page.
 function ReaderView:onPrefetchProgress(state)
-    local previous_signature = self._prefetch_footer_signature
     self.prefetch_state = state
-    self._prefetch_footer_signature = ReaderFooter:prefetchSignature(state)
-    self._footer_dirty = true
-    if self._closing or self.menu_visible or not self.page or not self.style.show_footer then return end
-    if UIManager.isWidgetShown and not UIManager:isWidgetShown(self) then return end
-    if self._prefetch_footer_signature == previous_signature then return end
-    self:_schedulePrefetchFooterRefresh()
 end
 
 -- Time + battery for the right side of the header. Battery is shown as
