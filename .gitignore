@@ -64,3 +64,4 @@
 /scripts/*
 !/scripts/generate_charset_tables.py
 !/scripts/package.ps1
+!/scripts/validate-lean-rebuild.ps1
