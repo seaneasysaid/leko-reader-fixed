@@ -2022,6 +2022,157 @@ function ReaderView:onReaderMenu() return self:toggleMenu() end
 function ReaderView:onPageForward() return self:nextPage() end
 function ReaderView:onPageBackward() return self:previousPage() end
 
+-- ── 遥控器 / Dispatcher 事件 ──────────────────────────────────────────────
+-- KOReader HTTP Inspector（/koreader/event/<事件名>/<参数>）和 Dispatcher 的
+-- 动作都用 UIManager:sendEvent 发事件 —— 它只把事件交给窗口栈最上面那个非
+-- toast 窗口。leko 阅读时自己就是栈顶，但 leko 不加载 ReaderUI，于是
+-- ReaderPaging / ReaderToc / ReaderFrontLight 里的 onGotoViewRel、onShowToc
+-- 那些处理函数统统不在场，遥控器点下去就石沉大海。这里按 leko 自己的实现
+-- 把事件接住。每个处理完必须返回 true 消费掉，否则还会漏给底层窗口。
+
+-- 翻页。leko 一次只取一屏（取页本身可能触发跨章下载），不像 crengine 那样能
+-- 一次跳 N 页，所以只认方向：正数前进、负数后退。
+function ReaderView:onGotoViewRel(diff)
+    if self._closing then return false end
+    local step = tonumber(diff)
+    if step == nil or step == 0 then return false end
+    if self.menu_visible then self:toggleMenu(false) end
+    if step > 0 then return self:nextPage() end
+    return self:previousPage()
+end
+
+function ReaderView:onShowToc()
+    if self._closing then return false end
+    if self.menu_visible then self:toggleMenu(false) end
+    return self:showToc()
+end
+
+-- 章节跳转：leko 一章一章地缓存，没有 crengine 那种「翻到下一章首屏」之外的
+-- 概念，所以 next/prev chapter 就是 jumpChapter(±1)。
+function ReaderView:onGotoNextChapter()
+    if self._closing then return false end
+    if self.menu_visible then self:toggleMenu(false) end
+    return self:jumpChapter(1)
+end
+
+function ReaderView:onGotoPrevChapter()
+    if self._closing then return false end
+    if self.menu_visible then self:toggleMenu(false) end
+    return self:jumpChapter(-1)
+end
+
+-- 「首页 / 末页」在 leko 里落到第一章 / 最后一章的开头。
+function ReaderView:onGoToBeginning()
+    if self._closing then return false end
+    if self.menu_visible then self:toggleMenu(false) end
+    self:jumpToChapter(1)
+    return true
+end
+
+function ReaderView:onGoToEnd()
+    if self._closing then return false end
+    if self.menu_visible then self:toggleMenu(false) end
+    self:jumpToChapter(math.max(1, #(self.book.chapters or {})))
+    return true
+end
+
+function ReaderView:onShowMenu()
+    if self._closing then return false end
+    return self:toggleMenu()
+end
+
+function ReaderView:onFullRefresh()
+    if self._closing then return false end
+    self:_settleSwipeRefresh()
+    -- 与「跨章净屏」同一条路：传 nil widget 的 "full" 就是 KOReader 自己的
+    -- 整屏刷新，顺带把 refresh_count 归零，不会紧接着再黑闪一次。
+    if type(UIManager.setDirty) == "function" then UIManager:setDirty(nil, "full") end
+    return true
+end
+
+function ReaderView:onToggleNightMode()
+    if self._closing then return false end
+    local menu_was_visible = self.menu_visible
+    self:applyStyleChange(function(style)
+        style.night_mode = not (style.night_mode == true)
+    end)
+    -- applyStyleChange 是给设置弹窗准备的，会顺手把底部菜单打开；
+    -- 遥控器触发时不应该弹出菜单。
+    if not menu_was_visible and self.menu_visible then self:toggleMenu(false) end
+    return true
+end
+
+function ReaderView:onRequestSuspend()
+    if self._closing then return false end
+    if type(UIManager.suspend) ~= "function" then return false end
+    UIManager:suspend()
+    return true
+end
+
+-- 前光。leko 没有 ReaderFrontLight 模块，直接操作设备的 powerd。
+function ReaderView:_powerDevice()
+    if not self:hasFrontlightControl() then return nil end
+    if type(Device.getPowerDevice) ~= "function" then return nil end
+    local ok, powerd = pcall(Device.getPowerDevice, Device)
+    if not ok or type(powerd) ~= "table" then return nil end
+    return powerd
+end
+
+-- 越界贴边。拿不到量程上限时把原值原样交给 powerd，让它自己夹 ——
+-- 总比猜一个量程要好。
+local function clampFrontlight(powerd, field, value)
+    local min = tonumber(powerd[field .. "_min"] or powerd.fl_min) or 0
+    local max = tonumber(powerd[field .. "_max"] or powerd.fl_max)
+    if not max then return value end
+    return math.max(min, math.min(max, value))
+end
+
+-- value 为 nil 表示「按 delta 走一步」，否则按绝对值设置。
+function ReaderView:_applyFrontlight(field, setter, value, delta)
+    local powerd = self:_powerDevice()
+    if not powerd then return false end
+    if type(powerd[setter]) ~= "function" then return false end
+    local current = tonumber(powerd[field])
+    if current == nil then return false end
+    local target = value
+    if target == nil then
+        if not delta or delta == 0 then return false end
+        target = current + delta
+    end
+    return pcall(powerd[setter], powerd, clampFrontlight(powerd, field, target)) == true
+end
+
+function ReaderView:onIncreaseFlIntensity(delta)
+    return self:_applyFrontlight("fl_intensity", "setIntensity", nil, tonumber(delta) or 1)
+end
+
+function ReaderView:onDecreaseFlIntensity(delta)
+    return self:_applyFrontlight("fl_intensity", "setIntensity", nil, -(tonumber(delta) or 1))
+end
+
+function ReaderView:onSetFlIntensity(value)
+    return self:_applyFrontlight("fl_intensity", "setIntensity", tonumber(value))
+end
+
+function ReaderView:onIncreaseFlWarmth(delta)
+    return self:_applyFrontlight("fl_warmth", "setWarmth", nil, tonumber(delta) or 1)
+end
+
+function ReaderView:onDecreaseFlWarmth(delta)
+    return self:_applyFrontlight("fl_warmth", "setWarmth", nil, -(tonumber(delta) or 1))
+end
+
+function ReaderView:onSetFlWarmth(value)
+    return self:_applyFrontlight("fl_warmth", "setWarmth", tonumber(value))
+end
+
+function ReaderView:onToggleFrontlight()
+    local powerd = self:_powerDevice()
+    if not powerd then return false end
+    if type(powerd.toggleOnOff) ~= "function" then return false end
+    return pcall(powerd.toggleOnOff, powerd) == true
+end
+
 function ReaderView:onFlushSettings()
     if self.page and self._progress_dirty then
         local pos = self.page.start_position or {}
