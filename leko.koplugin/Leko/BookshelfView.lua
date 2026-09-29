@@ -22,16 +22,19 @@ local BookService = require("Leko/BookService")
 local Storage = require("Leko/Storage")
 local UI = require("Leko/UI")
 
--- 弱化色（第二行进度文字用）。Blitbuffer.gray 是 KOReader 核心 API，但个别构建可能缺失，
--- 这里做安全兜底。同一进程内取值恒定，故只求值一次，避免每次绘制都 pcall。
-local cached_dim_color
-local function dim_color()
-    if cached_dim_color == nil then
-        local ok, value = pcall(function() return Blitbuffer.gray(0.5) end)
-        cached_dim_color = (ok and value) or Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_BLACK
+-- 弱化色（第二行进度文字用）。
+-- ⚠️ Blitbuffer 的颜色是 ffi cdata，且 Color8/ColorRGB32 的 __eq 实现会直接对参数调用
+-- `color:getColorRGB32()`、没有 nil 保护（见 ffi/blitbuffer.lua）。所以**绝不能**用
+-- `color == nil` 判断：LuaJIT 会拿 cdata 跟 nil 触发 __eq(nil) 而直接崩（真机已复现）。
+-- 判空一律用 type()/真值判断。
+-- gray 是核心 API，个别构建可能缺失 ⇒ pcall 兜底；取值在进程内恒定，故只求值一次。
+local DIM_COLOR = (function()
+    local ok, value = pcall(function() return Blitbuffer.gray(0.5) end)
+    if ok and type(value) ~= "nil" then
+        return value
     end
-    return cached_dim_color
-end
+    return Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_BLACK
+end)()
 
 -- 把构造参数里的 width/height 钳制为正整数并生成 dimen。
 -- 多个控件都要这套逻辑，缺了它 nil 尺寸会一路传到布局计算里崩掉。
@@ -119,7 +122,7 @@ function CoverShadow:init()
 end
 
 function CoverShadow:paintTo(bb, x, y)
-    bb:paintRoundedRect(x, y, self.width, self.height, dim_color(), self.radius)
+    bb:paintRoundedRect(x, y, self.width, self.height, DIM_COLOR, self.radius)
 end
 
 -- FrameContainer 不会把子控件裁剪进圆角，这里手动把四角遮回背景色
@@ -338,7 +341,7 @@ function BookshelfView:buildCover(summary, width, height, radius, border, shadow
         radius = radius or 0,
         border_size = border or 0,
         shadow_offset = shadow or 0,
-        shadow_color = (shadow and shadow > 0) and dim_color() or nil,
+        shadow_color = (shadow and shadow > 0) and DIM_COLOR or nil,
     }
 end
 
@@ -378,7 +381,7 @@ function BookshelfView:buildBookCell(summary, cell_w, cell_h)
     local sub_widget = TextWidget:new{
         text = sub_text,
         face = Font:getFace("smallinfofont", 13),
-        fgcolor = dim_color(),
+        fgcolor = DIM_COLOR,
         max_width = m.cover_w,
     }
 
