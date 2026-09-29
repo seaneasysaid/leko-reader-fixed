@@ -6,7 +6,6 @@ local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
-local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
@@ -24,14 +23,25 @@ local Storage = require("Leko/Storage")
 local UI = require("Leko/UI")
 
 -- 弱化色（第二行进度文字用）。Blitbuffer.gray 是 KOReader 核心 API，但个别构建可能缺失，
--- 这里做安全兜底，避免首屏崩溃。
+-- 这里做安全兜底。同一进程内取值恒定，故只求值一次，避免每次绘制都 pcall。
+local cached_dim_color
 local function dim_color()
-    local ok, v = pcall(function() return Blitbuffer.gray(0.5) end)
-    if ok and v then return v end
-    return Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_BLACK
+    if cached_dim_color == nil then
+        local ok, value = pcall(function() return Blitbuffer.gray(0.5) end)
+        cached_dim_color = (ok and value) or Blitbuffer.COLOR_GRAY or Blitbuffer.COLOR_BLACK
+    end
+    return cached_dim_color
 end
 
--- ---- 封面卡片几何（对齐 weread 新版书架：比例 0.68 / gutter 6 / 阴影 3 / 圆角 5）----
+-- 把构造参数里的 width/height 钳制为正整数并生成 dimen。
+-- 多个控件都要这套逻辑，缺了它 nil 尺寸会一路传到布局计算里崩掉。
+local function setDimen(self)
+    self.width = math.max(1, math.floor(tonumber(self.width) or 1))
+    self.height = math.max(1, math.floor(tonumber(self.height) or 1))
+    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
+end
+
+-- ---- 封面卡片几何（比例 0.68 / 间距 6 / 阴影 3 / 圆角 5）----
 
 local function shelfSizeScale()
     return Screen:scaleBySize(1000) / 1000
@@ -48,7 +58,7 @@ local function cellCardMetrics(cell_w, cell_h)
     local border = Size.border.thin
     local max_cw = math.max(1, cell_w - 2 * gutter)
     local max_ch = math.max(1, cell_h - 2 * gutter - title_gap - title_h - sub_gap - sub_h)
-    -- weread 封面约为 2:3 竖版，卡片锁定同一比例避免四周留白
+    -- 封面约为 2:3 竖版，卡片锁定同一比例避免四周留白
     local aspect = 0.68
     local card_w, card_h
     if max_cw / max_ch > aspect then
@@ -76,7 +86,7 @@ local function cellCardMetrics(cell_w, cell_h)
     }
 end
 
--- ---- weread 同款圆角封面卡与阴影 ----
+-- ---- 圆角封面卡与阴影 ----
 
 local function inside_rounded_rect(px, py, width, height, radius)
     if px < 0 or py < 0 or px >= width or py >= height then return false end
@@ -104,10 +114,8 @@ local CoverShadow = Widget:extend{
 }
 
 function CoverShadow:init()
-    self.width = math.max(1, math.floor(tonumber(self.width) or 1))
-    self.height = math.max(1, math.floor(tonumber(self.height) or 1))
+    setDimen(self)
     self.radius = math.max(1, math.floor(tonumber(self.radius) or 1))
-    self.dimen = Geom:new{ w = self.width, h = self.height }
 end
 
 function CoverShadow:paintTo(bb, x, y)
@@ -126,11 +134,9 @@ local RoundedCoverCard = Widget:extend{
 }
 
 function RoundedCoverCard:init()
-    self.width = math.max(1, math.floor(tonumber(self.width) or 1))
-    self.height = math.max(1, math.floor(tonumber(self.height) or 1))
+    setDimen(self)
     self.radius = math.max(0, math.floor(tonumber(self.radius) or 0))
     self.border_size = math.max(0, math.floor(tonumber(self.border_size) or 0))
-    self.dimen = Geom:new{ w = self.width, h = self.height }
 end
 
 function RoundedCoverCard:free(...)
@@ -149,7 +155,9 @@ function RoundedCoverCard:_masked_corner_color(px, py)
 end
 
 function RoundedCoverCard:paintTo(bb, x, y)
-    if self.inner then self.inner:paintTo(bb, x + self.border_size, y + self.border_size) end
+    if self.inner then
+        self.inner:paintTo(bb, x + self.border_size, y + self.border_size)
+    end
     local radius = self.radius
     if radius > 0 then
         for dy = 0, radius - 1 do
@@ -175,20 +183,17 @@ function RoundedCoverCard:paintTo(bb, x, y)
     end
 end
 
--- 固定测量宽度的左对齐文字行（对齐 weread 的 LeftAlignedTitle）
+-- 固定测量宽度的左对齐文字行（内部文字垂直居中）
 local LeftAlignedText = Widget:extend{
     width = 1,
     height = 1,
     content = nil,
 }
 
-function LeftAlignedText:init()
-    self.width = math.max(1, math.floor(tonumber(self.width) or 1))
-    self.height = math.max(1, math.floor(tonumber(self.height) or 1))
-    self.dimen = Geom:new{ w = self.width, h = self.height }
-end
+LeftAlignedText.init = setDimen
 
 function LeftAlignedText:paintTo(bb, x, y)
+    if not self.content then return end
     local content_size = self.content:getSize()
     self.content:paintTo(bb, x, y + math.floor((self.height - content_size.h) / 2))
 end
@@ -206,11 +211,7 @@ local BlankCell = Widget:extend{
     height = 1,
 }
 
-function BlankCell:init()
-    self.width = math.max(1, math.floor(tonumber(self.width) or 1))
-    self.height = math.max(1, math.floor(tonumber(self.height) or 1))
-    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
-end
+BlankCell.init = setDimen
 
 function BlankCell:getSize()
     return self.dimen
@@ -225,23 +226,24 @@ end
 local BookCell = InputContainer:extend{}
 
 function BookCell:init()
-    self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
+    setDimen(self)
     self[1] = self.content
+    -- GestureRange 持有 dimen 的引用，绘制时 dimen.x/y 会被更新为屏幕绝对坐标，
+    -- 手势区域随之生效（KOReader 的标准做法）。
     self.ges_events = {
         TapBook = { GestureRange:new{ ges = "tap", range = self.dimen } },
         HoldBook = { GestureRange:new{ ges = "hold", range = self.dimen } },
     }
 end
 
-function BookCell:onTapBook()
+-- 点按与长按行为一致：都进详情页
+function BookCell:openDetails()
     if self.on_details then self.on_details(self.summary) end
     return true
 end
 
-function BookCell:onHoldBook()
-    if self.on_details then self.on_details(self.summary) end
-    return true
-end
+BookCell.onTapBook = BookCell.openDetails
+BookCell.onHoldBook = BookCell.openDetails
 
 local BookshelfView = InputContainer:extend{
     covers_fullscreen = true,
@@ -269,6 +271,7 @@ function BookshelfView:setUpdateState(state, text, current, total)
     self:rebuild()
 end
 
+-- 返回按钮文案、回调，以及"是否正在检查"（供 footer 决定是否加粗）
 function BookshelfView:_updateButton()
     local running = self.update_state == "started" or self.update_state == "running"
         or self.update_state == "paused"
@@ -277,12 +280,12 @@ function BookshelfView:_updateButton()
         local total = math.max(current, self.update_total or 0)
         return "检查中 " .. tostring(current) .. "/" .. tostring(total), function()
             return self:onCancelUpdates()
-        end
+        end, true
     end
-    return "检查更新", function() return self:onCheckUpdates() end
+    return "检查更新", function() return self:onCheckUpdates() end, false
 end
 
--- 网格几何（对齐 weread CoverLayout.calculate：子线性缩放，最多 4 列 3 行）
+-- 网格几何：子线性缩放，最多 4 列 3 行
 function BookshelfView:getMetrics()
     local header_h = math.max(54, math.floor(self.dimen.h * 0.075))
     local footer_h = math.max(54, math.floor(self.dimen.h * 0.072))
@@ -293,16 +296,14 @@ function BookshelfView:getMetrics()
     local min_cell_h = math.max(1, math.ceil(210 * card_scale))
     local columns = math.min(4, math.max(1, math.floor(width / min_cell_w)))
     local rows = math.min(3, math.max(1, math.floor(body_h / min_cell_h)))
-    local cell_w = math.max(1, math.floor(width / columns))
-    local cell_h = math.max(1, math.floor(body_h / rows))
     return {
         header_h = header_h,
         footer_h = footer_h,
         body_h = body_h,
         columns = columns,
         rows = rows,
-        cell_w = cell_w,
-        cell_h = cell_h,
+        cell_w = math.max(1, math.floor(width / columns)),
+        cell_h = math.max(1, math.floor(body_h / rows)),
     }
 end
 
@@ -316,7 +317,7 @@ function BookshelfView:buildCover(summary, width, height, radius, border, shadow
             file = cover_path,
             width = inner_w,
             height = inner_h,
-            -- 不设 scale_factor：直接拉伸到目标尺寸（cover 填满，无留白；轻微变形可接受）
+            -- 不设 scale_factor：ImageWidget 会直接拉伸到 width/height（填满无留白，轻微变形）
             file_do_cache = false,
         }
     else
@@ -363,12 +364,14 @@ function BookshelfView:buildBookCell(summary, cell_w, cell_h)
         face = Font:getFace("cfont", 15),
         max_width = m.cover_w,
     }
-    -- 第二行：「已读 x / y」弱化色，保持视觉层级
+    -- 第二行：「第 x/y 章」弱化色，保持视觉层级
     local position = summary.position or { chapter = 1 }
+    local total = math.max(0, tonumber(summary.chapter_count or 0) or 0)
     local read = tonumber(position.chapter or 1) or 1
-    local total = tonumber(summary.chapter_count or 0) or 0
-    local update_count = tonumber(summary.toc_update_count or 0) or 0
+    -- 目录刷新后总章数可能变小，读到的章数不应超过总章数
+    if total > 0 then read = math.min(math.max(1, read), total) end
     local sub_text = string.format("第 %d/%d 章", read, total)
+    local update_count = tonumber(summary.toc_update_count or 0) or 0
     if update_count > 0 then
         sub_text = sub_text .. " · 更新 " .. tostring(update_count) .. " 章"
     end
@@ -413,10 +416,13 @@ function BookshelfView:buildBookCell(summary, cell_w, cell_h)
 end
 
 function BookshelfView:rebuild(no_repaint)
+    self.books = self.books or {}
+    self.page = math.max(1, self.page or 1)
+
     local metrics = self:getMetrics()
     local header_h, footer_h, body_h = metrics.header_h, metrics.footer_h, metrics.body_h
     local width = self.dimen.w
-    self.page_size = metrics.columns * metrics.rows
+    self.page_size = math.max(1, metrics.columns * metrics.rows)
     local total_pages = math.max(1, math.ceil(#self.books / self.page_size))
     if self.page > total_pages then self.page = total_pages end
 
@@ -462,7 +468,7 @@ function BookshelfView:rebuild(no_repaint)
         end
     end
 
-    local update_text, update_callback = self:_updateButton()
+    local update_text, update_callback, update_running = self:_updateButton()
     local footer = UI.footer(width, footer_h, {
         {
             text = "‹ 上一页",
@@ -472,7 +478,7 @@ function BookshelfView:rebuild(no_repaint)
                 self:rebuild()
             end,
         },
-        { text = update_text, callback = update_callback, bold = self.update_state == "running" },
+        { text = update_text, callback = update_callback, bold = update_running },
         { text = string.format("%d / %d", self.page, total_pages), bold = true },
         {
             text = "下一页 ›",
@@ -484,6 +490,8 @@ function BookshelfView:rebuild(no_repaint)
         },
     })
 
+    -- 旧内容树里的 ImageWidget 持有 ffi blitbuffer，不显式释放会随每次翻页/刷新累积泄漏
+    if self[1] then self[1]:free() end
     self[1] = UI.screen(width, self.dimen.h, header, body, footer, header_h, footer_h)
     if not no_repaint then UIManager:setDirty(self, "ui", self.dimen) end
 end
@@ -502,7 +510,6 @@ function BookshelfView:refresh(no_repaint)
     self.books = Storage:listBooks()
     self:rebuild(no_repaint)
 end
-
 
 function BookshelfView:updateBook(book, no_repaint, change)
     if not book or not book.id then return self:refresh(no_repaint) end
