@@ -22,7 +22,7 @@ local BookService = require("Leko/BookService")
 local Storage = require("Leko/Storage")
 local UI = require("Leko/UI")
 
--- 弱化色（第二行进度文字用）。
+-- 封面阴影色。
 -- ⚠️ Blitbuffer 的颜色是 ffi cdata，且 Color8/ColorRGB32 的 __eq 实现会直接对参数调用
 -- `color:getColorRGB32()`、没有 nil 保护（见 ffi/blitbuffer.lua）。所以**绝不能**用
 -- `color == nil` 判断：LuaJIT 会拿 cdata 跟 nil 触发 __eq(nil) 而直接崩（真机已复现）。
@@ -53,14 +53,18 @@ end
 local function cellCardMetrics(cell_w, cell_h)
     local size_scale = shelfSizeScale()
     local gutter = math.max(1, math.floor(6 * size_scale))
-    local shadow = math.max(1, math.floor(3 * size_scale))
+    local requested_shadow = math.max(1, math.floor(3 * size_scale))
     local title_gap = math.max(1, math.floor(4 * size_scale))
     local title_h = math.max(1, math.floor(22 * size_scale))
-    local sub_gap = math.max(1, math.floor(2 * size_scale))
-    local sub_h = math.max(1, math.floor(16 * size_scale))
     local border = Size.border.thin
-    local max_cw = math.max(1, cell_w - 2 * gutter)
-    local max_ch = math.max(1, cell_h - 2 * gutter - title_gap - title_h - sub_gap - sub_h)
+    local max_cover_w = math.max(1, cell_w - 2 * gutter)
+    -- 封面下方只留书名一行，故不再为第二行预留高度（与 weread 的 CoverLayout.card 一致）
+    local max_cover_h = math.max(1, cell_h - 2 * gutter - title_gap - title_h)
+    -- 阴影不得吃掉整张卡片：小格子上裁到剩余空间（weread 同款防御）
+    local shadow = math.min(requested_shadow,
+        math.max(0, math.min(max_cover_w - 1, max_cover_h - 1)))
+    local max_cw = math.max(1, max_cover_w - shadow)
+    local max_ch = math.max(1, max_cover_h - shadow)
     -- 封面约为 2:3 竖版，卡片锁定同一比例避免四周留白
     local aspect = 0.68
     local card_w, card_h
@@ -78,8 +82,6 @@ local function cellCardMetrics(cell_w, cell_h)
         shadow = shadow,
         title_gap = title_gap,
         title_h = title_h,
-        sub_gap = sub_gap,
-        sub_h = sub_h,
         border = border,
         card_w = card_w,
         card_h = card_h,
@@ -361,27 +363,10 @@ function BookshelfView:buildBookCell(summary, cell_w, cell_h)
     end
     table.insert(cover, self:buildCover(summary, m.card_w, m.card_h, m.radius, m.border, m.shadow))
 
-    -- 第一行：书名，单行展示（超宽截断），左对齐
+    -- 封面下方只有书名一行（与 weread 书架一致）：单行、超宽截断、左对齐
     local title_widget = TextWidget:new{
         text = summary.title or "未命名",
         face = Font:getFace("cfont", 15),
-        max_width = m.cover_w,
-    }
-    -- 第二行：「第 x/y 章」弱化色，保持视觉层级
-    local position = summary.position or { chapter = 1 }
-    local total = math.max(0, tonumber(summary.chapter_count or 0) or 0)
-    local read = tonumber(position.chapter or 1) or 1
-    -- 目录刷新后总章数可能变小，读到的章数不应超过总章数
-    if total > 0 then read = math.min(math.max(1, read), total) end
-    local sub_text = string.format("第 %d/%d 章", read, total)
-    local update_count = tonumber(summary.toc_update_count or 0) or 0
-    if update_count > 0 then
-        sub_text = sub_text .. " · 更新 " .. tostring(update_count) .. " 章"
-    end
-    local sub_widget = TextWidget:new{
-        text = sub_text,
-        face = Font:getFace("smallinfofont", 13),
-        fgcolor = DIM_COLOR,
         max_width = m.cover_w,
     }
 
@@ -393,8 +378,6 @@ function BookshelfView:buildBookCell(summary, cell_w, cell_h)
         },
         VerticalSpan:new{ width = m.title_gap },
         LeftAlignedText:new{ width = m.cover_w, height = m.title_h, content = title_widget },
-        VerticalSpan:new{ width = m.sub_gap },
-        LeftAlignedText:new{ width = m.cover_w, height = m.sub_h, content = sub_widget },
     }
     local content = FrameContainer:new{
         width = cell_w,
