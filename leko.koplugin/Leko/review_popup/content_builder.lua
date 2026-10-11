@@ -14,6 +14,18 @@ levels below match the WeRead reader's footnote styling.
 local Blitbuffer = require("ffi/blitbuffer")
 local util = require("util")
 
+-- 段评正文里的表情是占位码（[奸笑]/[吃瓜]…），渲染前先换成 emoji。
+-- 模块缺失/报错时静默降级为原样文本，绝不能拖垮弹窗。
+local ok_emoticon, Emoticon = pcall(require, "Leko/Emoticon")
+if not ok_emoticon or type(Emoticon) ~= "table" or not Emoticon.decode then
+    Emoticon = nil
+end
+local function decode(s)
+    if not Emoticon then return s end
+    local ok, out = pcall(Emoticon.decode, s)
+    return (ok and out) or s
+end
+
 local ContentBuilder = {}
 
 -- Gray levels used by the popup blocks, indexed 0 (pure black) to 15
@@ -142,7 +154,7 @@ local function buildQuoteText(quote)
             quote = first
         end
     end
-    local q = truncateRunes(quote, 50)
+    local q = truncateRunes(decode(quote), 50)
     return "「" .. q .. "」"
 end
 
@@ -188,7 +200,7 @@ function ContentBuilder.build(items, opts)
             spacing_after = 0.18,
         }
 
-        local content = trimText(item.content or "")
+        local content = decode(trimText(item.content or ""))
         if content ~= "" then
             blocks[#blocks + 1] = {
                 kind = "paragraph",

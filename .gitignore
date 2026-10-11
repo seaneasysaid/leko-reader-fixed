@@ -45,6 +45,13 @@
 /leko.koplugin/book_sources/*
 !/leko.koplugin/book_sources/default-sources.json
 
+# Bundled Noto Emoji font for segmented-review emoticons (OFL-1.1).
+# Parent dir must be re-admitted first, otherwise git never descends into it.
+!/leko.koplugin/fonts/
+/leko.koplugin/fonts/*
+!/leko.koplugin/fonts/NotoEmoji-Regular.ttf
+!/leko.koplugin/fonts/LICENSE
+
 # Reproducible native bridge sources and license.
 !/native/
 /native/*
