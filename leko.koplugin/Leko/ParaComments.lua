@@ -28,8 +28,11 @@
 
 `paragraph_id` 的含义分两种：
 
-  * 番茄 / QQ 是**正文非空段落的 0 基序号**，与 `Util.splitParagraphs` 保留下来的
-    段落一一对应（第 pid 段 = model.paragraphs[pid + 1]）；
+  * 番茄 / QQ 都是**正文非空段落**的序号，但**基准不同**：
+    番茄是 0 基（第 pid 段 = model.paragraphs[pid + 1]）；
+    QQ 是 **1 基，且 pid 0 专门表示章节标题**（不是正文段落）。
+    基准记在 PLATFORMS 的 `pid_base` 上，由 toBackendPid / fromBackendPid 统一换算，
+    模块对外（Paginator / ReaderView / 缓存）**一律只用 0 基段号**；
   * 七猫是**段落文本的内容指纹**（md5(去首尾空白的段落原文)[:8]），后端不认段号。
     所以七猫要把本地段落先换算成指纹，才能把计数挂回正确的段上
     （见 ParaComments.qmFingerprint / qmCountsByParagraph）。
@@ -85,24 +88,61 @@ local counts_cache = {}
 -- （七猫的章节 url 形如 `book_id=219542&item_id=16385010360001&content_md5=9d0c…`，
 -- 而载荷只装 CHAPTER_FIELDS，七猫的 item_id / content_md5 都不在其中），
 -- 要从载荷里的 curl（目录给的原始章节 url）解析。
+--
+-- ⭐ pid_base（改这里前务必先读）：模块内部一律用 **0 基段号**
+-- （第 k 段 = 正文非空行的第 k 行，pid = k - 1），Paginator 与 ReaderView 都按
+-- 这个约定查 model.para_counts。但各家后端的 `paragraph_id` 基准并不一致，
+-- pid_base 记录的正是「后端基准」，换算只在本模块里做：
+--
+--   fq 番茄   pid = 0 基（正文第 pid 行）          → pid_base = 0
+--   qq QQ阅读 pid = 1 基，且 **pid 0 是章节标题**   → pid_base = 1
+--   qm 七猫   pid 是内容指纹，不用段号             → 无所谓（走 qmFingerprint）
+--
+-- 证据出处 = 书源 v5.53 的 jsLib.getComments()：
+--     if (sourceType == 'qq') {
+--         if (paraId == 0) { hasTitleComment = true; … return; }   // 标题评论
+--         lineIndex = parseInt(paraId) - 1;                        // 1 基
+--     } else if (sourceType == 'qm') { lineIndex = index;
+--     } else { lineIndex = sourceType == 'jj' ? parseInt(paraId) - 1 : parseInt(paraId); }
+--                                                       ↑晋江 1 基   ↑番茄 0 基
+-- 后端实测佐证（2026-10-11，《娱乐：朴智妍拉我进圈》bookid=53181878，扫 39 章）：
+--   pid=0 有评论的章节 0/39（0 基的话第一段不可能章章为空）
+--   pid=1 有评论的章节 9/39；ch10 段数 74 且 maxpid=74（1 基下末段正是 pid=段数）
+--
+-- ⚠️ 曾经的 bug：三平台统一按 0 基发 para，于是 QQ 每一段的评论都整体前移一段
+-- （第 k 段显示成第 k-1 段的评论）。别再把 pid_base 拿掉。
 local PLATFORMS = {
     {
         code = "fq", label = "番茄",
         match = "番茄",
         book_field = "bookid", chapter_field = "itemid",
+        pid_base = 0,
     },
     {
         code = "qm", label = "七猫",
         match = "七猫",
         book_field = "bookid", chapter_field = "itemid",
         ids_from_curl = true,
+        pid_base = 0,
     },
     {
         code = "qq", label = "QQ阅读",
         match = "QQ",
         book_field = "bookid", chapter_field = "chapterid",
+        pid_base = 1,
     },
 }
+
+--[[--
+后端 pid ↔ 模块内部 0 基段号 的换算（定义在 intText 之后，见下方）。
+
+* `toBackendPid(platform, pid)`：内部段号 → 发给后端的 `para` 值。
+* `fromBackendPid(platform, raw_pid)`：后端 `paragraph_id` → 内部段号；
+  该 pid 属于「非正文」（QQ 的标题槽）时返回 nil，调用方必须丢弃。
+
+基底差由 platform.pid_base 决定：pid_base = 1 的平台（QQ），后端 pid 1 才是
+正文第 1 段，且 pid 0 被标题占用。
+]]--
 
 local function text(value)
     return tostring(value == nil and "" or value)
@@ -124,6 +164,31 @@ local function intText(value)
     local number = tonumber(value)
     if not number then return "0" end
     return string.format("%d", math.floor(number))
+end
+
+--[[--
+后端 pid ↔ 模块内部 0 基段号 的换算。
+
+* `toBackendPid(platform, pid)`：内部段号 → 发给后端的 `para` 值。
+* `fromBackendPid(platform, raw_pid)`：后端 `paragraph_id` → 内部段号；
+  该 pid 属于「非正文」（QQ 的标题槽）时返回 nil，调用方必须丢弃。
+
+基底差由 platform.pid_base 决定（见 PLATFORMS 的注释）：pid_base = 1 的平台
+（QQ）后端 pid 1 才是正文第 1 段，且 pid 0 被章节标题占用 —— 少加这个 offset
+就会让每一段的评论整体前移一段。
+]]--
+local function toBackendPid(platform, pid)
+    local base = tonumber(platform and platform.pid_base) or 0
+    return intText((tonumber(pid) or 0) + base)
+end
+
+local function fromBackendPid(platform, raw_pid)
+    local number = tonumber(raw_pid)
+    if not number or number ~= math.floor(number) then return nil end
+    local base = tonumber(platform and platform.pid_base) or 0
+    -- pid_base = 1：后端 0 是标题槽，不映射到任何正文段落。
+    if number < base then return nil end
+    return number - base
 end
 
 --[[--
@@ -382,12 +447,12 @@ local function reportFailure(stage, err)
 end
 
 --[[--
-本章「哪些段有评论」。返回值是 `{ [paragraph_id] = comment_count }`（pid 从 0 起）。
+本章「哪些段有评论」。返回值是 `{ [paragraph_id] = comment_count }`（**0 基段号**）。
 
 options.force = true 时忽略内存 / 磁盘缓存重新拉取。
 options.paragraphs = model.paragraphs。**七猫必需**：后端给的是段落内容指纹，
-要先拿本地段落算出指纹才能挂回段号（见 qmCountsByParagraph）；番茄 / QQ 的
-paragraph_id 本来就是段号，用不上。只在真要发请求时才会要求它（命中缓存不必）。
+要先拿本地段落算出指纹才能挂回段号（见 qmCountsByParagraph）；番茄 / QQ 用不上
+（它们的 pid 是段号，基准差由 fromBackendPid 换算）。
 ]]--
 function ParaComments.ensureCounts(book, chapter_index, source, options)
     options = options or {}
@@ -458,11 +523,16 @@ function ParaComments.ensureCounts(book, chapter_index, source, options)
     else
         for _, item in ipairs(payload.data.list) do
             if type(item) == "table" then
-                local pid = tonumber(item.paragraph_id)
                 local count = tonumber(item.comment_count) or 0
-                -- pid 必须是 0 基非负整数；0 条评论的段落在页面上不留标记。
-                if pid and pid >= 0 and pid == math.floor(pid) and count > 0 then
-                    counts[pid] = count
+                -- 0 条评论的段落在页面上不留标记，直接跳过。
+                if count > 0 then
+                    -- 后端基准 → 内部 0 基段号。QQ 的 pid 0 是章节标题，
+                    -- fromBackendPid 会返回 nil，这里自然被丢弃（标题评论
+                    -- 没有可挂靠的正文段落）。
+                    local pid = fromBackendPid(platform, item.paragraph_id)
+                    if pid and pid >= 0 then
+                        counts[pid] = count
+                    end
                 end
             end
         end
@@ -650,9 +720,12 @@ local function fetchCommentPage(platform, book_id, chapter_id, pid, start, sourc
     else
         -- QQ 侧没有分页参数（实测 page/cursor/count/offset 都不生效），
         -- 一次把这一段给全。所以续拉只在番茄上有意义。
+        --
+        -- ⚠️ `para` 用 toBackendPid 换算：QQ 的 paragraph_id 是 1 基
+        -- （pid 0 留给章节标题），直接发 0 基段号会让评论整体前移一段。
         path = "/qq_comment?ajax=1&bid=" .. tostring(book_id)
             .. "&cid=" .. tostring(chapter_id)
-            .. "&para=" .. intText(pid)
+            .. "&para=" .. toBackendPid(platform, pid)
         validate = function(value) return type(value.comments) == "table" end
         parse = parseQqComments
     end
@@ -697,7 +770,11 @@ options.force
     true 时忽略磁盘缓存，重新从开头拉。
 options.paragraphs
     model.paragraphs。**七猫必需**：它按段落内容指纹定位，要拿本地段落现算指纹
-    （见 qmFingerprint）；番茄 / QQ 的 pid 本来就是段号，用不上。
+    （见 qmFingerprint）；番茄 / QQ 用不上（它们的 pid 是段号，基准差在
+    fetchCommentPage 里由 toBackendPid 换算）。
+
+`pid` 一律是**内部 0 基段号**（与 ensureCounts 的键同一套坐标），
+后端基准的差异不会漏给调用方。
 
 返回 `list, para_text, err, page`，其中 `page = { next_cursor, has_more }`：
 `next_cursor` 是下次续拉的起点，`has_more` 表示服务端还有余量。失败时
