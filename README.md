@@ -4,6 +4,7 @@
      数字看起来"没更新"时把 N 加一即可立刻强制重取。 -->
 [![release](https://img.shields.io/github/v/release/seaneasysaid/leko-reader-fixed?v=1)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
 [![downloads](https://img.shields.io/github/downloads/seaneasysaid/leko-reader-fixed/total?v=1)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
+[![changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue)](CHANGELOG.md)
 
 本项目是 [`jnjnnjzch/leko-reader`](https://github.com/jnjnnjzch/leko-reader) 的非官方增强版 Fork。
 
@@ -19,10 +20,6 @@
 - **搜索增强**：修复聚合源搜索只出 1 条 / 全局搜索 0 结果的问题；结果行显示真实来源站点、按同名书作者投票加权排序、过滤非小说内容。
 - **稳定性修复**：Android 开书崩溃兼容、目录缓存格式版本化迁移、正文请求快速失败并透传真实失败原因（如 VIP 专享提示）等。
 - **阅读统计**：对接 KOReader 的统计模块，阅读时长正常计入。
-
-## 更新日志
-
-各版本的改动记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安装
 
