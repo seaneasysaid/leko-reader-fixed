@@ -4,7 +4,7 @@
      数字看起来"没更新"时把 N 加一即可立刻强制重取。 -->
 [![release](https://img.shields.io/github/v/release/seaneasysaid/leko-reader-fixed?v=1)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
 [![downloads](https://img.shields.io/github/downloads/seaneasysaid/leko-reader-fixed/total?v=1)](https://github.com/seaneasysaid/leko-reader-fixed/releases)
-[![changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue)](CHANGELOG.md)
+[![changelog](https://img.shields.io/badge/更新日记-CHANGELOG-blue)](CHANGELOG.md)
 
 本项目是 [`jnjnnjzch/leko-reader`](https://github.com/jnjnnjzch/leko-reader) 的非官方增强版 Fork。
 
