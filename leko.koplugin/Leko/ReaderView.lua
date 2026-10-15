@@ -21,6 +21,7 @@ local TrapWidget = require("ui/widget/trapwidget")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local VerticalGroup = require("ui/widget/verticalgroup")
+local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Screen = Device.screen
 
 local AsyncParaReview = require("Leko/AsyncParaReview")
@@ -418,6 +419,13 @@ function ReaderView:isNightMode()
     return self.style and self.style.night_mode == true
 end
 
+-- 前向声明：段评气泡坐标探针的类定义在文件后半段（见下方 `_ParaMarkerAnchor`
+-- 的注释），但 buildReadingPage 会用到它。若不在此提前声明，第 599 行的
+-- `_ParaMarkerAnchor:new{}` 会绑定到全局 `_ParaMarkerAnchor`（nil），
+-- 一旦页面上有段评气泡、翻页重建页面时就报
+-- `attempt to index global '_ParaMarkerAnchor' (a nil value)` 并崩溃。
+local _ParaMarkerAnchor
+
 function ReaderView:buildReadingPage(page)
     local geometry = page.geometry
     local group = VerticalGroup:new{ align = "left" }
@@ -585,13 +593,23 @@ function ReaderView:buildReadingPage(page)
                     line_container,
                     marker_holder,
                 }
-                marker_rects[#marker_rects + 1] = {
+                local marker_rect = {
                     x = geometry.left + marker_x,
                     y = cursor_y,
                     w = marker_width,
                     h = element.height,
                     paragraph = element.paragraph,
+                    -- 真实落点由 anchor 在 paintTo 时回填；拿不到就退回上面的复算值。
+                    painted_x = nil,
+                    painted_y = nil,
                 }
+                marker_widget = _ParaMarkerAnchor:new{
+                    dimen = Geom:new{ w = marker_width, h = element.height },
+                    marker_widget,
+                    rect = marker_rect,
+                }
+                marker_holder[1] = marker_widget
+                marker_rects[#marker_rects + 1] = marker_rect
             end
             table.insert(group, HorizontalGroup:new{
                 align = "center",
@@ -1071,18 +1089,54 @@ function ReaderView:_paraServerLabel()
     return "镜像：" .. ParaComments.hostLabel(ParaComments.host(source))
 end
 
+-- 段评气泡的坐标探针。
+--
+-- 命中区原来是用「文字实测宽 + gap」复算出来的（x = geometry.left +
+-- inline_offset + text_width + marker_gap），与分页器逐字度量的口径不保证一致；
+-- 日志实证这种失配会让 dy 平均偏出 330~360px，读者点气泡直接变成翻页。
+--
+-- 解法：让气泡自己上报真实落点。这一层夹在 CenterContainer 与 TextWidget 之间，
+-- **不改变任何绘制结果**（dimen 与子 widget 一致，paintTo 直接透传），
+-- 只是在 paintTo 被调用时把屏幕坐标记下来。KOReader 的容器链
+-- （HorizontalGroup -> HorizontalSpan{left} -> OverlapGroup -> overlap_offset ->
+--   CenterContainer -> anchor -> TextWidget）会把真实坐标一路传到这里，
+-- 所以记下来的就是气泡在屏幕坐标系里的真实矩形，每次刷新自愈。
+_ParaMarkerAnchor = WidgetContainer:extend{}
+
+function _ParaMarkerAnchor:getSize()
+    return self[1]:getSize()
+end
+
+function _ParaMarkerAnchor:paintTo(bb, x, y)
+    if self.rect then
+        self.rect.painted_x = x
+        self.rect.painted_y = y
+    end
+    self[1]:paintTo(bb, x, y)
+end
+
 -- 段末气泡的命中判定。返回 1 基段落号，未命中返回 nil。
 function ReaderView:_paraMarkerAt(x, y)
     if self.para_review_enabled ~= true then return nil end
     if self.swipe_refresh and self.swipe_refresh:isRunning() then return nil end
     local rects = self._para_hit_rects
     if type(rects) ~= "table" then return nil end
-    -- 气泡本身只有几十像素宽，给一点横向余量，免得读者点了个寂寞。
-    local slack = Screen:scaleBySize(6)
+    -- 气泡本体只有 37~49px 宽、一行高。指尖落点直径远大于此，而气泡落点又是
+    -- 「文字实测宽 + gap」复算出来的（与分页器逐字度量的口径不保证一致），
+    -- 横向/纵向都可能整体偏移。所以这里给两个方向都留余量：
+    --   * 横向 slack_x：盖住气泡两侧的空白与字体度量误差；
+    --   * 纵向 slack_y：至少一行高 —— 手指点在气泡上下一行内都算这段的。
+    -- 每个 rect 只对应**一段**的最后一行，命中邻行也返回同一段落，无副作用。
+    local slack_x = math.max(Screen:scaleBySize(18), 0)
+    local slack_y = math.max(Screen:scaleBySize(24), 0)
     for index = 1, #rects do
         local rect = rects[index]
-        if x >= rect.x - slack and x <= rect.x + rect.w + slack
-                and y >= rect.y and y <= rect.y + rect.h then
+        -- 方案 B：有 anchor 回填的真实绘制坐标就用它（零假设、每次刷新自愈）；
+        -- 首帧还没绘制过时才退回复算值。
+        local rx = rect.painted_x or rect.x
+        local ry = rect.painted_y or rect.y
+        if x >= rx - slack_x and x <= rx + rect.w + slack_x
+                and y >= ry - slack_y and y <= ry + rect.h + slack_y then
             return rect.paragraph
         end
     end
@@ -1098,13 +1152,26 @@ function ReaderView:_paraMarkerAt(x, y)
         local near, near_dy
         for index = 1, #rects do
             local rect = rects[index]
-            local dy = math.abs((rect.y + rect.h / 2) - y)
+            local cy = (rect.painted_y or rect.y) + rect.h / 2
+            local dy = math.abs(cy - y)
             if near_dy == nil or dy < near_dy then near, near_dy = rect, dy end
+        end
+        -- 兜底：纵向最近的那个气泡，只要落点在它所在行的「正文宽度」范围内
+        -- （左右各留一个气泡宽的余量），就认为用户想点的是这一段。
+        -- 气泡只在段末行，点那段文字附近 = 想看这段的评论；宁可误开弹窗，
+        -- 也不能让一次点击变成翻页（读者只会觉得「点不动」）。
+        local line_slack = math.max(near.w, Screen:scaleBySize(40))
+        local nx = near.painted_x or near.x
+        local ny = near.painted_y or near.y
+        if near_dy <= near.h / 2 + slack_y
+                and x >= nx - line_slack and x <= nx + near.w + line_slack then
+            return near.paragraph
         end
         logger.warn("Leko para review: bubble tap missed", tostring(x), tostring(y),
             "rects=" .. tostring(#rects),
-            string.format("near=%d,%d,%dx%d", near.x, near.y, near.w, near.h),
-            string.format("dx=%d dy=%d", math.floor(x - (near.x + near.w)), math.floor(near_dy)))
+            string.format("near=%d,%d,%dx%d", nx, ny, near.w, near.h),
+            string.format("dx=%d dy=%d", math.floor(x - (nx + near.w)), math.floor(near_dy)),
+            "real=" .. (near.painted_x and "y" or "n"))
     end
     return nil
 end
