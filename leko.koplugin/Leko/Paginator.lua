@@ -5,6 +5,7 @@ local Screen = require("device").screen
 local BookService = require("Leko/BookService")
 local Util = require("Leko/Util")
 local ReaderMargins = require("Leko/ReaderMargins")
+local FontWeight = require("Leko/FontWeight")
 local logger = require("logger")
 
 local Paginator = {}
@@ -104,20 +105,23 @@ local function indentPrefix(style)
 end
 
 local function bodyMetrics(style)
-    local face = resolveReaderFace(style, "body_font", "body_font_index",
+    local base_face = resolveReaderFace(style, "body_font", "body_font_index",
         "body_font_display_name", style.body_font_size or 27)
+    -- 字重（0-3）：返回带仿粗强度的手工 face + 交给控件的 bold 标记。
+    -- 测量与绘制都走同一个 face/bold，行宽才不会两边对不上。
+    local face, bold = FontWeight.apply(base_face, style.body_weight)
     local probe = TextBoxWidget:new{
         text = "测",
         face = face,
         width = math.max(20, Screen:getWidth() - 20),
         line_height = style.line_spacing or 0.28,
         lang = "zh-CN",
-        bold = false,
+        bold = bold or false,
         for_measurement_only = true,
     }
     local height = probe.line_height_px
     if probe.free then probe:free() end
-    return face, height
+    return face, height, bold
 end
 
 local function measuredHeight(widget)
@@ -139,12 +143,12 @@ function Paginator:getGeometry(style)
     local bottom = Screen:scaleBySize(style.margin_bottom or READER_CHROME_BOTTOM_GAP)
     local content_width = math.max(Screen:scaleBySize(120), screen_width - left - right)
 
-    local body_face, body_line_height = bodyMetrics(style)
+    local body_face, body_line_height, body_bold = bodyMetrics(style)
     -- Whole Chinese glyphs can leave unused space at the end of every full
     -- line. Share that remainder between the margins instead of putting all
     -- of it on the right. Use the renderer's measured advance, not font size.
     local width_probe = TextWidget:new{ text = "测", face = body_face, padding = 0,
-        lang = "zh-CN", bold = false }
+        lang = "zh-CN", bold = body_bold or false }
     local cell_width = width_probe:getSize().w
     if width_probe.free then width_probe:free() end
     if cell_width and cell_width > 0 and cell_width <= content_width then
@@ -207,6 +211,7 @@ function Paginator:getGeometry(style)
         content_width = content_width,
         content_height = math.max(body_line_height, content_height),
         body_face = body_face,
+        body_bold = body_bold,
         body_line_height = body_line_height,
         chrome_face = chrome_face,
         para_marker_face = para_marker_face,
@@ -228,7 +233,7 @@ end
 -- 会让预留宽度与气泡实际宽度对不上，气泡就偏出命中区了。
 local function measureTextWidth(value, face, bold)
     local widget = TextWidget:new{ text = tostring(value or ""), face = face,
-        padding = 0, lang = "zh-CN", bold = bold == true }
+        padding = 0, lang = "zh-CN", bold = bold or false }
     local size = widget:getSize()
     local width = math.max(0, math.ceil((size and size.w) or 0))
     if widget.free then widget:free() end
@@ -345,7 +350,7 @@ local function makeMeasureWidget(text, face, width, line_spacing, alignment, bol
         width = width,
         line_height = line_spacing,
         lang = "zh-CN",
-        bold = bold == true,
+        bold = bold or false,
         alignment = alignment or "left",
         alignment_strict = true,
         for_measurement_only = true,
@@ -370,7 +375,7 @@ end
 ]]--
 local function fitBodyLines(text, chars, face, width, bold, tail_reserve)
     local probe = TextWidget:new{ text = text, face = face, padding = 0,
-        lang = "zh-CN", bold = bold == true }
+        lang = "zh-CN", bold = bold or false }
     probe:getSize()
     local function fitEnd(offset, limit)
         local last
@@ -398,7 +403,7 @@ local function fitBodyLines(text, chars, face, width, bold, tail_reserve)
         local tail_start = lines[#lines].offset
         local tail_text = table.concat(chars, "", tail_start, lines[#lines].end_offset)
         local tail_probe = TextWidget:new{ text = tail_text, face = face, padding = 0,
-            lang = "zh-CN", bold = bold == true }
+            lang = "zh-CN", bold = bold or false }
         local tail_size = tail_probe:getSize()
         local tail_width = tail_size and tail_size.w or 0
         if tail_probe.free then tail_probe:free() end
@@ -566,7 +571,7 @@ function Paginator:makePage(book, requested_position, style)
             -- 不传预留宽度，分页结果与没有段评时完全相同。
             local tail_reserve = (marker_width > 0 and not has_more) and marker_width or nil
             local lines = fitBodyLines(layout_text, layout_chars, geometry.body_face,
-                geometry.content_width, false, tail_reserve)
+                geometry.content_width, geometry.body_bold, tail_reserve)
             if has_more and #lines > 1 then
                 -- Refill the final window row before painting it.
                 local tail = table.remove(lines)

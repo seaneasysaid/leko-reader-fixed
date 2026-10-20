@@ -27,6 +27,7 @@ local Screen = Device.screen
 local AsyncParaReview = require("Leko/AsyncParaReview")
 local BookService = require("Leko/BookService")
 local FontSelectionView = require("Leko/FontSelectionView")
+local FontWeight = require("Leko/FontWeight")
 local KOReaderStatisticsBridge = require("Leko/KOReaderStatisticsBridge")
 local Paginator = require("Leko/Paginator")
 local ParaComments = require("Leko/ParaComments")
@@ -208,6 +209,7 @@ function ReaderView:_chapterPageMetrics()
     local cache = self._public_page_metrics
     local signature = tostring(chapter) .. "\0" .. tostring(self.style and self.style.body_font_size or "")
         .. "\0" .. tostring(self.style and self.style.line_spacing or "")
+        .. "\0" .. tostring(self.style and self.style.body_weight or 0)
     if not cache or cache.signature ~= signature then
         cache = { signature = signature, starts = {}, total = 0 }
         local position, safety = { chapter = chapter, paragraph = 1, char = 1 }, 0
@@ -524,7 +526,7 @@ function ReaderView:buildReadingPage(page)
                 padding = 0,
                 line_height = self.style.line_spacing or 0.28,
                 lang = "zh-CN",
-                bold = false,
+                bold = geometry.body_bold or false,
                 fgcolor = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil,
                 alignment = "left",
                 alignment_strict = true,
@@ -1083,24 +1085,8 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
     end)
 end
 
-function ReaderView:_paraServerLabel()
-    local source = BookService:sourceFor(self.book)
-    if not source then return "镜像：无书源" end
-    return "镜像：" .. ParaComments.hostLabel(ParaComments.host(source))
-end
-
--- 段评气泡的坐标探针。
---
--- 命中区原来是用「文字实测宽 + gap」复算出来的（x = geometry.left +
--- inline_offset + text_width + marker_gap），与分页器逐字度量的口径不保证一致；
--- 日志实证这种失配会让 dy 平均偏出 330~360px，读者点气泡直接变成翻页。
---
--- 解法：让气泡自己上报真实落点。这一层夹在 CenterContainer 与 TextWidget 之间，
--- **不改变任何绘制结果**（dimen 与子 widget 一致，paintTo 直接透传），
--- 只是在 paintTo 被调用时把屏幕坐标记下来。KOReader 的容器链
--- （HorizontalGroup -> HorizontalSpan{left} -> OverlapGroup -> overlap_offset ->
---   CenterContainer -> anchor -> TextWidget）会把真实坐标一路传到这里，
--- 所以记下来的就是气泡在屏幕坐标系里的真实矩形，每次刷新自愈。
+-- 段评气泡的坐标探针：命中区按文字宽度复算会偏出几百像素，改为让气泡在
+-- paintTo 时上报真实屏幕落点。这层只透传绘制，不改变任何绘制结果。
 _ParaMarkerAnchor = WidgetContainer:extend{}
 
 function _ParaMarkerAnchor:getSize()
@@ -1121,18 +1107,13 @@ function ReaderView:_paraMarkerAt(x, y)
     if self.swipe_refresh and self.swipe_refresh:isRunning() then return nil end
     local rects = self._para_hit_rects
     if type(rects) ~= "table" then return nil end
-    -- 气泡本体只有 37~49px 宽、一行高。指尖落点直径远大于此，而气泡落点又是
-    -- 「文字实测宽 + gap」复算出来的（与分页器逐字度量的口径不保证一致），
-    -- 横向/纵向都可能整体偏移。所以这里给两个方向都留余量：
-    --   * 横向 slack_x：盖住气泡两侧的空白与字体度量误差；
-    --   * 纵向 slack_y：至少一行高 —— 手指点在气泡上下一行内都算这段的。
-    -- 每个 rect 只对应**一段**的最后一行，命中邻行也返回同一段落，无副作用。
+    -- 气泡只有一行高、几十像素宽，手指落点比它大得多，两向都留余量。
+    -- 每个 rect 只对应一段的最后一行，命中邻行返回同一段落，无副作用。
     local slack_x = math.max(Screen:scaleBySize(18), 0)
     local slack_y = math.max(Screen:scaleBySize(24), 0)
     for index = 1, #rects do
         local rect = rects[index]
-        -- 方案 B：有 anchor 回填的真实绘制坐标就用它（零假设、每次刷新自愈）；
-        -- 首帧还没绘制过时才退回复算值。
+        -- 有真实绘制坐标就用它，首帧还没绘制过时退回复算值。
         local rx = rect.painted_x or rect.x
         local ry = rect.painted_y or rect.y
         if x >= rx - slack_x and x <= rx + rect.w + slack_x
@@ -1140,14 +1121,7 @@ function ReaderView:_paraMarkerAt(x, y)
             return rect.paragraph
         end
     end
-    -- 页面上明明画着气泡却没命中：多半是排版与命中区对不上（换行规则、字体
-    -- 度量、行高任一处变了都会这样）。这种情况必须留下证据 —— 否则读者只会
-    -- 觉得「点气泡变成了翻页」，而日志里什么都没有。
-    --
-    -- 只打第一个矩形没法判断偏在 x 还是 y（读者报「点不动」时只能靠猜），
-    -- 所以打的是「纵向最接近的那个」以及相对它的右边缘 / 中心线差多少：
-    --   dx > 0 说明点在气泡右边（气泡画得比命中区窄，或点在气泡外的空白）
-    --   dy > h/2 说明纵向整行都错位（那才是真的排版与命中区不一致）
+    -- 画着气泡却没命中：留证据，记录纵向最近的气泡与落点差值。
     if #rects > 0 then
         local near, near_dy
         for index = 1, #rects do
@@ -1156,10 +1130,7 @@ function ReaderView:_paraMarkerAt(x, y)
             local dy = math.abs(cy - y)
             if near_dy == nil or dy < near_dy then near, near_dy = rect, dy end
         end
-        -- 兜底：纵向最近的那个气泡，只要落点在它所在行的「正文宽度」范围内
-        -- （左右各留一个气泡宽的余量），就认为用户想点的是这一段。
-        -- 气泡只在段末行，点那段文字附近 = 想看这段的评论；宁可误开弹窗，
-        -- 也不能让一次点击变成翻页（读者只会觉得「点不动」）。
+        -- 纵向在同一行、横向在正文宽度内就算命中：宁可误开弹窗，也不要变成翻页。
         local line_slack = math.max(near.w, Screen:scaleBySize(40))
         local nx = near.painted_x or near.x
         local ny = near.painted_y or near.y
@@ -1931,29 +1902,44 @@ function ReaderView:makeLayoutMenuButtons()
         or { night_button }
 
     local buttons = {
+        -- 文字：字体 / 字号 / 字重 / 行距。
         {
             { text = "字体", callback = chooseFont },
-            { text = "字号：" .. tostring(self.style.body_font_size or 27), callback = promptFontSize },
+            -- 点按 +1，长按输入。
+            { text = "字号：" .. tostring(self.style.body_font_size or 27),
+              callback = function() apply(function(s)
+                  s.body_font_size = math.min(72, (tonumber(s.body_font_size) or 27) + 1)
+              end) end,
+              hold_callback = promptFontSize },
         },
-        light_row,
         {
-            { text = "首行缩进：" .. indentLabel(self.style.indent), callback = function() apply(function(s)
-                s.indent = cycleIndent(s.indent)
-            end) end },
+            -- 字重 0-3（400/500/600/700），长按回「正常」。
+            { id = "body_weight_toggle",
+              text = "字重：" .. FontWeight.label(self.style.body_weight),
+              callback = function() apply(function(s)
+                  s.body_weight = FontWeight.next(s.body_weight)
+              end) end,
+              hold_callback = function() apply(function(s)
+                  s.body_weight = 0
+              end) end },
             { text = "行距：" .. choiceLabel(line_values, line_labels, self.style.line_spacing), callback = function() apply(function(s)
                 s.line_spacing = cycle(line_values, s.line_spacing or 0.28)
             end) end },
         },
         {
-            { text = "页边距：" .. choiceLabel(margin_values, margin_labels, self.style.margin_left), callback = function() apply(function(s)
-                local margin = cycle(margin_values, s.margin_left or 28)
-                s.margin_left, s.margin_right = margin, margin
+            { text = "首行缩进：" .. indentLabel(self.style.indent), callback = function() apply(function(s)
+                s.indent = cycleIndent(s.indent)
             end) end },
             { text = "段间距：" .. choiceLabel(paragraph_values, paragraph_labels, self.style.paragraph_spacing), callback = function() apply(function(s)
                 s.paragraph_spacing = cycle(paragraph_values, s.paragraph_spacing or 10)
             end) end },
         },
+        -- 三种边距并排，省一行。
         {
+            { text = "左右边距：" .. choiceLabel(margin_values, margin_labels, self.style.margin_left), callback = function() apply(function(s)
+                local margin = cycle(margin_values, s.margin_left or 28)
+                s.margin_left, s.margin_right = margin, margin
+            end) end },
             { text = "上边距：" .. choiceLabel(vertical_margin_values, vertical_margin_labels, self.style.margin_top), callback = function() apply(function(s)
                 s.margin_top = cycle(vertical_margin_values, s.margin_top or 12)
             end) end },
@@ -1969,6 +1955,7 @@ function ReaderView:makeLayoutMenuButtons()
                 s.show_footer = not s.show_footer
             end) end },
         },
+        light_row,
         {
             { id = "page_animation_toggle", text = self:isSwipeAnimationEnabled() and "动画效果：开" or "动画效果：关", callback = function()
                 self:setSwipeAnimationEnabled(not self:isSwipeAnimationEnabled())
@@ -1978,28 +1965,41 @@ function ReaderView:makeLayoutMenuButtons()
             end },
         },
     }
-    -- 段评只对支持的平台章节有意义（番茄 / 七猫 / QQ阅读）。不支持的书就不显示
-    -- 这一行，免得读者打开开关却什么都看不到。
+    -- 段评仅番茄 / 七猫 / QQ阅读的章节有，其他书不显示这一行。
     local para_chapter_index = self.page and self.page.chapter_index
     if para_chapter_index and ParaComments.isSupported(self.book, para_chapter_index) then
+        local para_on = self:isParaReviewEnabled()
         buttons[#buttons + 1] = {
-            { id = "para_review_toggle", text = self:isParaReviewEnabled() and "段评：开" or "段评：关", callback = function()
+            { id = "para_review_toggle", text = para_on and "段评：开" or "段评：关", callback = function()
                 self:setParaReviewEnabled(not self:isParaReviewEnabled())
             end },
-            { text = "本页段评", callback = function()
-                close()
-                self:showPageParaCommentList()
-            end },
-        }
-        -- 书山聚合有多台镜像，段评和正文必须落在同一台（原生源自己保证）。
-        -- 这里把当前生效的镜像摆出来，方便读者判断「是不是这台取不到数据」。
-        buttons[#buttons + 1] = {
-            { id = "para_server_button", text = self:_paraServerLabel(), callback = function()
-                UIManager:show(Notification:new{ text = "镜像由书山原生源自动轮换" })
-            end },
+            -- 段评关闭时置灰。
+            { id = "page_para_button",
+              text = para_on and "本页段评" or "本页段评（段评已关）",
+              enabled = para_on,
+              callback = function()
+                  close()
+                  self:showPageParaCommentList()
+              end },
         }
     end
-    buttons[#buttons + 1] = { { text = "关闭", callback = close } }
+    -- 恢复默认：只重置排版，保留已选字体。
+    buttons[#buttons + 1] = {
+        { id = "reset_layout_button", text = "恢复默认", callback = function()
+            apply(function(s)
+                local default = Storage:getDefaultReaderStyle()
+                for _, key in ipairs({
+                    "body_font_size", "body_weight", "line_spacing", "paragraph_spacing",
+                    "indent", "text_align", "margin_left", "margin_right",
+                    "margin_top", "margin_bottom", "show_header", "show_footer",
+                }) do
+                    s[key] = default[key]
+                end
+            end)
+            UIManager:show(Notification:new{ text = "排版已恢复默认" })
+        end },
+        { text = "关闭", callback = close },
+    }
     return buttons
 end
 
@@ -2038,7 +2038,9 @@ function ReaderView:showLayoutMenu()
         local dialog = ButtonDialog:new{
             title = "阅读设置",
             modal = true,
-            rows_per_page = 8,
+            -- 固定 10 行（含段评那两行），一页放得下，不再需要翻页
+            -- 才能点「关闭」。屏幕更矮的机型仍由 ButtonDialog 自动分页。
+            rows_per_page = 10,
             buttons = self:makeLayoutMenuButtons(),
             tap_close_callback = function()
                 self._layout_dialog = nil

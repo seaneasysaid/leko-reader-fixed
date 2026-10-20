@@ -1193,8 +1193,10 @@ function Storage:getDefaultReaderStyle()
         para_review_enabled = false,
         indent = true,
         text_align = "left",
-        -- 字体粗细: false = 正常, true = 粗体.
+        -- 旧字段，仅保留兼容。
         body_bold = false,
+        -- 字重 0-3：正常 / 微粗 / 中粗 / 加粗（见 Leko/FontWeight.lua）。
+        body_weight = 0,
         -- 夜间模式: dark background with light text.
         night_mode = false,
         show_header = true,
@@ -1214,10 +1216,11 @@ function Storage:getReaderStyle()
     local saved = self:getSettings():readSetting("reader_style") or {}
     local style = self:getDefaultReaderStyle()
     for key, value in pairs(saved) do style[key] = value end
-    -- 字体粗细 was removed from the reader UI. Force any legacy numeric
-    -- (1/2/3) or boolean true value back to false so old bold archives do
-    -- not linger once the menu entry is gone.
+    -- 旧字段一律清掉，避免旧粗体存档残留。
     style.body_bold = false
+    -- 字重 0-3，旧配置缺省为「正常」。
+    local weight = math.floor((tonumber(style.body_weight) or 0) + 0.5)
+    style.body_weight = math.max(0, math.min(3, weight))
     -- 0.15.19 persisted the old fixed 44/54 chapter-opening gaps. Migrate
     -- only those title fields; never touch the user's font, horizontal
     -- reading margins, line spacing or indentation preference.
