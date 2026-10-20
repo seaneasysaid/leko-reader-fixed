@@ -64,7 +64,7 @@ try {
     foreach ($name in @('main.lua', '_meta.lua', 'INSTALL.txt')) {
         Copy-Item -LiteralPath (Join-Path $pluginRoot $name) -Destination $stagePlugin
     }
-    foreach ($name in @('Leko', 'book_sources', 'resources')) {
+    foreach ($name in @('Leko', 'book_sources', 'resources', 'fonts')) {
         Copy-Item -LiteralPath (Join-Path $pluginRoot $name) -Destination (Join-Path $stagePlugin $name) -Recurse
     }
     Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $stagePlugin 'README.md')
@@ -121,7 +121,8 @@ try {
         'leko.koplugin/Leko/MemoryGuard.lua',
         'leko.koplugin/Leko/ProcessBudget.lua',
         'leko.koplugin/Leko/Version.lua',
-        'leko.koplugin/Leko/native/liblekoqjs.so'
+        'leko.koplugin/Leko/native/liblekoqjs.so',
+        'leko.koplugin/fonts/NotoEmoji-Regular.ttf'
     )) {
         $entry = $archive.GetEntry($required)
         if ($null -eq $entry -or $entry.Length -le 0) {
