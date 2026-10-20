@@ -230,9 +230,9 @@ function BookInfoView:buildCover(width, height)
                 dimen = Geom:new{ w = width - 6, h = height - 6 },
                 ImageWidget:new{
                     file = path,
-                    width = width - 8,
-                    height = height - 8,
-                    scale_factor = 0,
+                    width = width - 6,
+                    height = height - 6,
+                    -- 不设 scale_factor：ImageWidget 会直接拉伸到 width/height（填满无留白）
                     file_do_cache = false,
                 },
             },
@@ -250,9 +250,8 @@ function BookInfoView:buildCover(width, height)
                 ImageWidget:new{
                     image = self._cover_image,
                     image_disposable = false,
-                    width = width - 8,
-                    height = height - 8,
-                    scale_factor = 0,
+                    width = width - 6,
+                    height = height - 6,
                 },
             },
         }
@@ -288,6 +287,22 @@ function BookInfoView:rebuild()
     local cover_h = math.min(math.floor(cover_w * 1.42), math.floor(body_h * 0.48))
     local info_w = width - margin * 3 - cover_w
     local source_name = self.book.source_name or "本地书籍"
+    local total_chapters = #(self.book.chapters or {})
+    if total_chapters <= 0 then
+        total_chapters = tonumber(self.book.chapter_count or 0) or 0
+    end
+    -- 「章节」行改为阅读进度：读过显示第几章 / 共几章 + 百分比，没读过只显示总章数。
+    local chapter_text = "章节：暂无目录"
+    local read_chapter = tonumber(self.book.position and self.book.position.chapter) or 0
+    if total_chapters > 0 then
+        if read_chapter > 0 and (tonumber(self.book.last_read_at) or 0) > 0 then
+            read_chapter = math.min(read_chapter, total_chapters)
+            chapter_text = "阅读进度：第 " .. read_chapter .. "/" .. total_chapters .. " 章 · "
+                .. math.floor(read_chapter * 100 / total_chapters + 0.5) .. "%"
+        else
+            chapter_text = "章节：共 " .. total_chapters .. " 章"
+        end
+    end
 
     local header = UI.header(width, header_h, {
         left_text = "‹ 返回",
@@ -310,8 +325,7 @@ function BookInfoView:rebuild()
             text = "作者：" .. ((self.book.author and self.book.author ~= "") and self.book.author or "佚名")
                 .. "\n内容源：" .. source_name
                 .. "\n封面源：" .. tostring(self.book.cover_source_name or (self.book.manual_cover and "本地图片") or "跟随内容源")
-                .. "\n章节：" .. tostring((#(self.book.chapters or {}) > 0)
-                    and #(self.book.chapters or {}) or (tonumber(self.book.chapter_count or 0) or 0))
+                .. "\n" .. chapter_text
                 .. (in_library and "\n状态：已在书架" or "\n状态：试读，尚未加入书架"),
             width = info_w,
             face = Font:getFace("smallinfofont", 19),
