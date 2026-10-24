@@ -47,6 +47,7 @@ end
   height_ratio   number  弹窗高度占屏比，默认 0.70
   contrast       number  灰阶位移（越大越黑）
   tap_to_page    bool    点左右半屏翻页
+  doc_font_weight  number  正文字重 0-3，弹窗跟随正文加仿粗
   para_nav       function(dir)  横滑切上一/下一段
   more_text      string  底部「继续加载」按钮文字（nil 则不显示）
   on_more        function 点「继续加载」时的回调
@@ -101,6 +102,7 @@ function M.show(opts)
         height_ratio = opts.height_ratio,
         width_ratio = opts.width_ratio,
         contrast = opts.contrast,
+        doc_font_weight = opts.doc_font_weight,
         tap_to_page = opts.tap_to_page,
         dialog = opts.dialog,
         close_callback = opts.close_callback,

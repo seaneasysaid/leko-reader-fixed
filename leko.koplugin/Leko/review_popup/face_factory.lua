@@ -30,13 +30,18 @@ local FaceFactory = {
     fallback_cache = {}, -- path|size -> FontFaceObj (fallback faces shared across variants)
 }
 
--- Size variants (relative to the base size). quote/meta render one step
--- smaller; meta is the author line.
+-- Size variants (relative to the base size). Sean 定版：评论正文/引文 0.93，
+-- 作者·点赞行（评论 id）小一档 0.9。
 FaceFactory.VARIANTS = {
-    content = 0.9,  -- thought body
-    quote   = 0.9,  -- quoted abstract
-    meta    = 0.9,  -- author line; keep it as readable as the thought body
+    content = 0.93,  -- thought body
+    quote   = 0.93,  -- quoted abstract
+    meta    = 0.9,   -- author line（评论 id）：比正文小一档
 }
+
+-- 正文字重 -> 仿粗强度，与 Leko/FontWeight.lua 的四档一致
+-- （0 正常 / 1 微粗 / 2 中粗 / 3 加粗 = KOReader 标准粗体 3/8）。
+-- 弹窗只跟「字重」，不拿对比度当粗细用（那是栅格 gamma，拿去加粗会糊）。
+FaceFactory.WEIGHT_FACTORS = { [0] = 0, 1 / 8, 1 / 4, 3 / 8 }
 
 function FaceFactory:init()
     if self.initialized then return end
@@ -165,12 +170,26 @@ local function resolveBundledFont(fontname)
     return nil
 end
 
-function FaceFactory:_buildFace(path, size)
+function FaceFactory:_buildFace(path, size, embolden_factor)
     if not path or not size or size <= 0 then return nil end
     local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
     if not ok or not ftsize then
         logger.warn("Leko para popup failed to open font:", path, ftsize)
         return nil
+    end
+    local half
+    if embolden_factor and embolden_factor > 0 then
+        local ok_emb, strength = pcall(ftsize.getEmboldenHalfStrength, ftsize, embolden_factor)
+        if ok_emb and strength then
+            half = strength
+        else
+            logger.warn("Leko para popup embolden failed, fallback to regular:", path)
+        end
+    end
+    local hash = path .. "|" .. size
+    if half then
+        -- hash 必须带强度：同一字体的常规/仿粗 face 在 xtext 缓存里不能撞键。
+        hash = string.format("%s|emb%.3f", hash, embolden_factor)
     end
     local face_obj = {
         orig_font = path,
@@ -178,8 +197,9 @@ function FaceFactory:_buildFace(path, size)
         size = size,
         orig_size = size,
         ftsize = ftsize,
-        hash = path .. "|" .. size,
+        hash = hash,
         is_real_bold = false,
+        embolden_half_strength = half,
         hb_features = { "+kern", "+liga" },
     }
     face_obj.fallbacks = {}
@@ -193,13 +213,14 @@ function FaceFactory:_buildFace(path, size)
     return face_obj
 end
 
---- Fallback faces are shared process-wide: one FT face per (path, size).
-function FaceFactory:_getFallbackFace(path, size)
+--- Fallback faces are shared process-wide: one FT face per (path, size,
+--- embolden strength). 强度不同不复用，否则仿粗会泄漏给常规字重的使用者。
+function FaceFactory:_getFallbackFace(path, size, embolden_factor)
     if not path or not size or size <= 0 then return nil end
-    local key = path .. "|" .. size
+    local key = path .. "|" .. size .. "|" .. tostring(embolden_factor)
     local cached = self.fallback_cache[key]
     if cached then return cached end
-    local face = self:_buildFace(path, size)
+    local face = self:_buildFace(path, size, embolden_factor)
     if face then
         self.fallback_cache[key] = face
     end
@@ -229,7 +250,7 @@ local FALLBACK_FONT_NAMES = {
     "NotoEmoji-Regular.ttf", -- special: resolved via self.emoji_path; must stay last
 }
 
-function FaceFactory:_addFallbacks(face, size)
+function FaceFactory:_addFallbacks(face, size, embolden_factor)
     local fallbacks = {}
     local n = 0
     for _, fontname in ipairs(FALLBACK_FONT_NAMES) do
@@ -241,7 +262,7 @@ function FaceFactory:_addFallbacks(face, size)
             path = resolveBundledFont(fontname)
         end
         if path then
-            local fb = self:_getFallbackFace(path, size)
+            local fb = self:_getFallbackFace(path, size, embolden_factor)
             if fb then
                 n = n + 1
                 fallbacks[n] = fb
@@ -256,22 +277,26 @@ end
 --- @param font_name string|nil KOReader 字体标识（"cfont" 或字体文件路径）
 --- @param size number 已按屏幕 DPI 缩放的像素字号（取 body_face.size）
 --- @param variant string key of VARIANTS
-function FaceFactory:getFace(font_name, size, variant)
+--- @param doc_weight number|nil 正文字重 0-3（0/nil = 常规）
+function FaceFactory:getFace(font_name, size, variant, doc_weight)
     variant = variant or "content"
-    local key = string.format("%s|%d|%s", font_name or "", size or 0, variant)
+    doc_weight = math.max(0, math.min(3, math.floor((tonumber(doc_weight) or 0) + 0.5)))
+    local key = string.format("%s|%d|%s|w%d", font_name or "", size or 0, variant, doc_weight)
     local cached = self.face_cache[key]
     if cached then return cached end
 
     local ratio = self.VARIANTS[variant] or 1.0
     local v_size = math.max(8, math.floor(size * ratio + 0.5))
+    local embolden = self.WEIGHT_FACTORS[doc_weight]
+    if not embolden or embolden <= 0 then embolden = nil end
     local face
 
     local paths = self:getFontPaths(font_name)
     local path = paths[1] and paths[1].path
     if path then
-        face = self:_buildFace(path, v_size)
+        face = self:_buildFace(path, v_size, embolden)
         if face then
-            self:_addFallbacks(face, v_size)
+            self:_addFallbacks(face, v_size, embolden)
         end
     end
 
@@ -281,9 +306,9 @@ function FaceFactory:getFace(font_name, size, variant)
         local fallback_path = resolveBundledFont("NotoSans-Regular.ttf")
             or resolveBundledFont("NotoSansCJKsc-Regular.otf")
         if fallback_path then
-            face = self:_buildFace(fallback_path, v_size)
+            face = self:_buildFace(fallback_path, v_size, embolden)
             if face then
-                self:_addFallbacks(face, v_size)
+                self:_addFallbacks(face, v_size, embolden)
             end
         end
     end

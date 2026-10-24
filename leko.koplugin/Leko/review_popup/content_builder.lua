@@ -185,6 +185,17 @@ function ContentBuilder.build(items, opts)
     end
 
     for item_index, item in ipairs(items) do
+        -- 一级评论之间加淡灰分隔线（番茄插件 2.2.0-fixed.6 移植）：扫一眼就能
+        -- 看出两条评论的分界。间距全交给 separator，所以下面 meta 不再设
+        -- spacing_before（否则双重叠加显得过松）。
+        if item_index > 1 then
+            blocks[#blocks + 1] = {
+                kind = "separator",
+                fg = grayForLevel(10),   -- 灰阶约 #AAA
+                spacing_before = 0.54,
+                spacing_after = 0.54,
+            }
+        end
         local meta = "▸ " .. tostring(item.author or "匿名")
         local likes = tonumber(item.likes_count) or 0
         if likes > 0 then
@@ -196,7 +207,6 @@ function ContentBuilder.build(items, opts)
             variant = "meta",
             text = meta,
             fg = grayForLevel(5),
-            spacing_before = item_index > 1 and 0.45 or nil,
             spacing_after = 0.18,
         }
 

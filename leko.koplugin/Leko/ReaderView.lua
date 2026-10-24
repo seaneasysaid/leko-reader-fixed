@@ -1301,7 +1301,11 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
             bottom = Screen:scaleBySize(8),
         },
         height_ratio = 0.7,
-        contrast = 7,
+        -- 番茄 2.2.0-fixed.6：弹窗字色与正文对齐。旧值 7 会把作者行的浅灰
+        -- 全部压成纯黑，层级全毁；0 = 内容纯黑、辅助信息保持浅灰。
+        contrast = 0,
+        -- 弹窗字重跟随正文（0-3），face_factory 按 FontWeight 四档仿粗。
+        doc_font_weight = self.style.body_weight or 0,
         tap_to_page = true,
         more_text = more_text,
         on_more = on_more,

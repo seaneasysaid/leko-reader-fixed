@@ -15,7 +15,6 @@ bottom/tap/Back gestures.
 local Blitbuffer = require("ffi/blitbuffer")
 local BottomContainer = require("ui/widget/container/bottomcontainer")
 local Button = require("ui/widget/button")
-local ButtonDialog = require("ui/widget/buttondialog")
 local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
@@ -52,6 +51,8 @@ local ThoughtPopupWidget = InputContainer:extend{
     -- When true, tapping the left/right half of the bar pages up/down through
     -- the review list (handled in onTapClose, like the weread centered popup).
     tap_to_page = true,
+    -- 正文字重 0-3（style.body_weight）：弹窗跟随正文加仿粗，见 face_factory。
+    doc_font_weight = 0,
     close_callback = nil,
     dialog = nil,
     -- Optional Leko navigation: when set, a horizontal swipe calls
@@ -96,12 +97,8 @@ function ThoughtPopupWidget:init()
                     range = range,
                 }
             },
-            HoldThought = {
-                GestureRange:new{
-                    ges = "hold",
-                    range = range,
-                }
-            },
+            -- 长按不做任何事（番茄 2.2.0-fixed.6：读评论的手感接近普通正文），
+            -- hold 不注册，长按落到阅读器自己的手势里也无副作用。
         }
     end
 
@@ -118,6 +115,7 @@ function ThoughtPopupWidget:init()
         doc_margins = self.doc_margins,
         height_ratio = self.height_ratio,
         contrast = self.contrast,
+        doc_weight = self.doc_font_weight,
     }
     self._pages:ensureLayout()
     self:_buildLayout()
@@ -145,6 +143,7 @@ function ThoughtPopupWidget:_reopen(opts)
     if opts.doc_margins then self.doc_margins = opts.doc_margins end
     if opts.height_ratio then self.height_ratio = opts.height_ratio end
     if opts.contrast ~= nil then self.contrast = opts.contrast end
+    if opts.doc_font_weight ~= nil then self.doc_font_weight = opts.doc_font_weight end
     if opts.tap_to_page ~= nil then self.tap_to_page = opts.tap_to_page end
     if opts.dialog then self.dialog = opts.dialog end
     self.close_callback = opts.close_callback
@@ -158,7 +157,7 @@ function ThoughtPopupWidget:_reopen(opts)
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
 
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, nil, self.contrast)
+        self.doc_margins, self.height_ratio, nil, self.contrast, self.doc_font_weight)
     self:_buildLayout()
     if prev_offset > 0 and self._scroll_container then
         self._scroll_container:_setOffset(prev_offset)
@@ -223,9 +222,6 @@ function ThoughtPopupWidget:_buildLayout()
         margin_left = self.doc_margins.left,
         text_w = text_w,
         dialog = self,
-        -- Tap paging is handled by ThoughtPopupWidget.onTapClose (it owns the
-        -- tap gesture, so the ScrollContainer's own TapScrollText would never
-        -- fire). Keep it disabled here to avoid a dead gesture registration.
         tap_to_page = false,
         boundaries = self._pages.boundaries,
         page_bb_getter = function(page_idx)
@@ -316,87 +312,6 @@ function ThoughtPopupWidget:onSwipeClose(_, ges)
         return true
     end
     return false
-end
-
-function ThoughtPopupWidget:onHoldThought(_, ges)
-    local scroll = self._scroll_container
-    if scroll and scroll.dimen and ges.pos:intersectWith(scroll.dimen) then
-        local content_y = (ges.pos.y - scroll.dimen.y) + (scroll.scroll_offset or 0)
-        local item = self:_findItemAtContentY(content_y)
-        if item then
-            self:_showThoughtActionMenu(item)
-        end
-    end
-    return true
-end
-
-function ThoughtPopupWidget:_findItemAtContentY(y)
-    local pieces = self._pages and self._pages.layout and self._pages.layout.pieces
-    if not pieces then return nil end
-    local item_idx = 0
-    for _, piece in ipairs(pieces) do
-        if piece.variant == "meta" then
-            item_idx = item_idx + 1
-        end
-        if piece.y and piece.piece_h and piece.y <= y and y < piece.y + piece.piece_h then
-            if piece.variant == "quote" then
-                return self.items and self.items[1]
-            end
-            if item_idx >= 1 and self.items and item_idx <= #self.items then
-                return self.items[item_idx]
-            end
-            return nil
-        end
-    end
-    return nil
-end
-
-function ThoughtPopupWidget:_showThoughtActionMenu(item)
-    local popup = self
-    local action_dialog
-    action_dialog = ButtonDialog:new{
-        buttons = {
-            {
-                {
-                    text = _("Copy"),
-                    callback = function()
-                        UIManager:close(action_dialog)
-                        popup:_copyThoughtContent(item)
-                    end,
-                },
-                {
-                    text = _("Generate QR code"),
-                    callback = function()
-                        UIManager:close(action_dialog)
-                        popup:_generateQRCode(item)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(action_dialog)
-end
-
-function ThoughtPopupWidget:_copyThoughtContent(item)
-    local text = tostring(item and item.content or "")
-    if text == "" then return end
-    if Device.hasClipboard and Device:hasClipboard() then
-        Device.input.setClipboardText(text)
-    end
-end
-
-function ThoughtPopupWidget:_generateQRCode(item)
-    local text = tostring(item and item.content or "")
-    if text == "" then return end
-    if Device.hasClipboard and Device:hasClipboard() then
-        Device.input.setClipboardText(text)
-    end
-    local QRMessage = require("ui/widget/qrmessage")
-    UIManager:show(QRMessage:new{
-        text = text,
-        width = Screen:getWidth(),
-        height = Screen:getHeight(),
-    })
 end
 
 function ThoughtPopupWidget:free(full)
