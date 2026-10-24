@@ -152,7 +152,12 @@ function Paginator.renderTextPiece(piece)
                 if not xglyph.no_drawing then
                     local glyph_face = face.getFallbackFont(xglyph.font_num)
                     if glyph_face then
-                        local glyph = RenderText:getGlyphByIndex(glyph_face, xglyph.glyph, false, false)
+                        -- 仿粗标志必须传给 getGlyphByIndex：KOReader 只在 bold
+                        -- 时才按 face.embolden_half_strength 渲染粗字形，写死
+                        -- false 会把正文跟随的字重全部丢掉。回退字面与主字面
+                        -- 带同一强度，逐 face 判断。
+                        local bold = (tonumber(glyph_face.embolden_half_strength) or 0) > 0
+                        local glyph = RenderText:getGlyphByIndex(glyph_face, xglyph.glyph, bold, false)
                         if glyph and glyph.bb then
                             local dx = xglyph.x0 + glyph.l + xglyph.x_offset
                             local dy = y - glyph.t - xglyph.y_offset

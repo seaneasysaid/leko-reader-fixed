@@ -39,6 +39,8 @@ local PADDING_BOTTOM = Size.padding.large
 local ThoughtPopupWidget = InputContainer:extend{
     items = nil,
     doc_font_name = nil,
+    -- 同一字体文件内的字面选择（TTC 等，style.body_font_index）：nil = 默认字面。
+    doc_font_index = nil,
     doc_font_size = Screen:scaleBySize(18),
     doc_margins = {
         left = Screen:scaleBySize(20),
@@ -111,6 +113,7 @@ function ThoughtPopupWidget:init()
     self._pages = PageRenderer:new{
         items = self.items,
         doc_font_name = self.doc_font_name,
+        doc_font_index = self.doc_font_index,
         doc_font_size = self.doc_font_size,
         doc_margins = self.doc_margins,
         height_ratio = self.height_ratio,
@@ -139,6 +142,7 @@ function ThoughtPopupWidget:_reopen(opts)
     self._more_pending = false
     self.items = opts.items or {}
     if opts.doc_font_name then self.doc_font_name = opts.doc_font_name end
+    if opts.doc_font_index ~= nil then self.doc_font_index = opts.doc_font_index end
     if opts.doc_font_size then self.doc_font_size = opts.doc_font_size end
     if opts.doc_margins then self.doc_margins = opts.doc_margins end
     if opts.height_ratio then self.height_ratio = opts.height_ratio end
@@ -157,7 +161,8 @@ function ThoughtPopupWidget:_reopen(opts)
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
 
     self._pages:setContent(self.items, self.doc_font_name, self.doc_font_size,
-        self.doc_margins, self.height_ratio, nil, self.contrast, self.doc_font_weight)
+        self.doc_margins, self.height_ratio, nil, self.contrast, self.doc_font_weight,
+        self.doc_font_index)
     self:_buildLayout()
     if prev_offset > 0 and self._scroll_container then
         self._scroll_container:_setOffset(prev_offset)

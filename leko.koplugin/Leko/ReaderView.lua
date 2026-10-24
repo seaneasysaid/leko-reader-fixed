@@ -1293,6 +1293,9 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
         -- 段标识：区分「同一段继续加载」与「换了新一段」，决定弹窗是否保留滚动位置。
         paragraph_key = tostring(ctx.chapter_index) .. ":" .. tostring(paragraph_index),
         doc_font_name = self.style.body_font,
+        -- 同一字体文件内的字面选择（TTC 等）：正文用 body_font_index 取字面，
+        -- 弹窗必须同 index，否则多字面字体下弹窗字形与正文不一致。
+        doc_font_index = self.style.body_font_index,
         doc_font_size = (body_face and body_face.size) or Screen:scaleBySize(20),
         doc_margins = {
             left = (geometry and geometry.left) or Screen:scaleBySize(16),

@@ -71,15 +71,16 @@ local function itemsKey(items)
     return table.concat(parts, "\n")
 end
 
-local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, content_width, contrast, doc_weight)
+local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, content_width, contrast, doc_weight, doc_font_index)
     local m = margins or {}
-    return string.format("%s|%d|%d_%d_%d_%d|%.4f|%d|%d|%d",
+    return string.format("%s|%d|%d_%d_%d_%d|%.4f|%d|%d|%d|%s",
         doc_font_name or "", doc_font_size or 0,
         m.left or 0, m.right or 0, m.top or 0, m.bottom or 0,
         height_ratio or 0.35,
         content_width or 0,
         tonumber(contrast) or 0,
-        tonumber(doc_weight) or 0)
+        tonumber(doc_weight) or 0,
+        tostring(doc_font_index))
 end
 
 local PageRenderer = {}
@@ -94,6 +95,7 @@ function PageRenderer:new(opts)
     local self_obj = setmetatable({}, { __index = PageRenderer })
     self_obj.items = opts.items or {}
     self_obj.doc_font_name = opts.doc_font_name
+    self_obj.doc_font_index = opts.doc_font_index
     self_obj.doc_font_size = opts.doc_font_size or Screen:scaleBySize(18)
     self_obj.doc_margins = opts.doc_margins or {
         left = Screen:scaleBySize(20),
@@ -112,7 +114,7 @@ function PageRenderer:new(opts)
     self_obj._items_key = itemsKey(self_obj.items)
     self_obj._geom_key = geomKey(self_obj.doc_font_name, self_obj.doc_font_size,
         self_obj.doc_margins, self_obj.height_ratio, self_obj.content_width,
-        self_obj.contrast, self_obj.doc_weight)
+        self_obj.contrast, self_obj.doc_weight, self_obj.doc_font_index)
     self_obj._bb_key = self_obj._items_key .. "|" .. self_obj._geom_key
     self_obj._page_pieces = {}
     self_obj._page_pieces_key = nil
@@ -131,9 +133,10 @@ end
 --- because the colors are baked into the pieces.
 --- doc_weight (optional) body font weight 0-3; a change re-lays out because
 --- the embolden strength is baked into the faces.
-function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margins, height_ratio, content_width, contrast, doc_weight)
+function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margins, height_ratio, content_width, contrast, doc_weight, doc_font_index)
     self.items = items or {}
     if doc_font_name ~= nil then self.doc_font_name = doc_font_name end
+    if doc_font_index ~= nil then self.doc_font_index = doc_font_index end
     if doc_font_size ~= nil then self.doc_font_size = doc_font_size end
     if doc_margins ~= nil then self.doc_margins = doc_margins end
     if height_ratio ~= nil then self.height_ratio = height_ratio end
@@ -143,7 +146,7 @@ function PageRenderer:setContent(items, doc_font_name, doc_font_size, doc_margin
     local new_items_key = itemsKey(self.items)
     local new_geom_key = geomKey(self.doc_font_name, self.doc_font_size,
         self.doc_margins, self.height_ratio, self.content_width, self.contrast,
-        self.doc_weight)
+        self.doc_weight, self.doc_font_index)
     local new_bb_key = new_items_key .. "|" .. new_geom_key
     if new_bb_key ~= self._bb_key then
         self._items_key = new_items_key
@@ -170,7 +173,7 @@ function PageRenderer:paginate()
 
     local function addTextPiece(variant, text, fg, width, x, keep_next)
         local face = FaceFactory:getFace(self.doc_font_name, base_size, variant,
-            self.doc_weight)
+            self.doc_weight, self.doc_font_index)
         if not face then return false end
         local line_h, extra, baseline = Paginator.textPieceMetrics(face)
         local paginated = Paginator.paginateText(text, face, width)

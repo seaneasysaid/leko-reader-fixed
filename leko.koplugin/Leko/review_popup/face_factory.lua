@@ -31,11 +31,11 @@ local FaceFactory = {
 }
 
 -- Size variants (relative to the base size). Sean 定版：评论正文/引文 0.93，
--- 作者·点赞行（评论 id）小一档 0.9。
+-- 作者·点赞行（评论 id）再小一档 0.88。
 FaceFactory.VARIANTS = {
     content = 0.93,  -- thought body
     quote   = 0.93,  -- quoted abstract
-    meta    = 0.9,   -- author line（评论 id）：比正文小一档
+    meta    = 0.88,  -- author line（评论 id）：比正文再小一档
 }
 
 -- 正文字重 -> 仿粗强度，与 Leko/FontWeight.lua 的四档一致
@@ -170,9 +170,15 @@ local function resolveBundledFont(fontname)
     return nil
 end
 
-function FaceFactory:_buildFace(path, size, embolden_factor)
+function FaceFactory:_buildFace(path, size, embolden_factor, face_index)
     if not path or not size or size <= 0 then return nil end
-    local ok, ftsize = pcall(Freetype.newFaceSize, path, size)
+    -- face_index：同一字体文件（TTC/OTC）内的字面选择，与正文
+    -- Font:getFace(path, size, index) 的取面保持一致；nil/0 = 默认字面。
+    local ok, ftsize = pcall(Freetype.newFaceSize, path, size, tonumber(face_index) or 0)
+    if not ok or not ftsize then
+        -- 个别构建的 FreeType 不支持 index 参数时退回默认字面。
+        ok, ftsize = pcall(Freetype.newFaceSize, path, size)
+    end
     if not ok or not ftsize then
         logger.warn("Leko para popup failed to open font:", path, ftsize)
         return nil
@@ -186,7 +192,7 @@ function FaceFactory:_buildFace(path, size, embolden_factor)
             logger.warn("Leko para popup embolden failed, fallback to regular:", path)
         end
     end
-    local hash = path .. "|" .. size
+    local hash = path .. "|" .. tostring(tonumber(face_index) or 0) .. "|" .. size
     if half then
         -- hash 必须带强度：同一字体的常规/仿粗 face 在 xtext 缓存里不能撞键。
         hash = string.format("%s|emb%.3f", hash, embolden_factor)
@@ -278,10 +284,13 @@ end
 --- @param size number 已按屏幕 DPI 缩放的像素字号（取 body_face.size）
 --- @param variant string key of VARIANTS
 --- @param doc_weight number|nil 正文字重 0-3（0/nil = 常规）
-function FaceFactory:getFace(font_name, size, variant, doc_weight)
+--- @param face_index number|nil 字体文件内字面序号（TTC，style.body_font_index）
+function FaceFactory:getFace(font_name, size, variant, doc_weight, face_index)
     variant = variant or "content"
     doc_weight = math.max(0, math.min(3, math.floor((tonumber(doc_weight) or 0) + 0.5)))
-    local key = string.format("%s|%d|%s|w%d", font_name or "", size or 0, variant, doc_weight)
+    face_index = tonumber(face_index)
+    local key = string.format("%s|%d|%s|w%d|i%s",
+        font_name or "", size or 0, variant, doc_weight, tostring(face_index))
     local cached = self.face_cache[key]
     if cached then return cached end
 
@@ -294,7 +303,7 @@ function FaceFactory:getFace(font_name, size, variant, doc_weight)
     local paths = self:getFontPaths(font_name)
     local path = paths[1] and paths[1].path
     if path then
-        face = self:_buildFace(path, v_size, embolden)
+        face = self:_buildFace(path, v_size, embolden, face_index)
         if face then
             self:_addFallbacks(face, v_size, embolden)
         end

@@ -97,6 +97,7 @@ function M.show(opts)
         items = opts.items,
         -- 兼容原版字段名：doc_font_name / doc_font_size。
         doc_font_name = opts.doc_font_name or opts.font_name,
+        doc_font_index = opts.doc_font_index,
         doc_font_size = opts.doc_font_size or opts.font_size,
         doc_margins = opts.doc_margins,
         height_ratio = opts.height_ratio,
