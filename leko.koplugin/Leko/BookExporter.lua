@@ -830,7 +830,12 @@ function BookExporter:export(book, format, progress)
     if format == "txt" then result, err = exportTxt(book, path, progress)
     elseif format == "epub" then result, err = exportEpub(book, path, progress, cover)
     else result, err = exportMobi(book, path, progress, cover) end
-    if result then reportProgress(progress, progress_total, progress_total, "正在完成文件写入") end
+    if result then
+        reportProgress(progress, progress_total, progress_total, "正在完成文件写入")
+        -- Exports may live in a shared folder (Kindle documents root); record
+        -- the exact path so cache cleanup only ever removes our own files.
+        pcall(Storage.recordExport, Storage, result)
+    end
     local metadata = cover_warning and { cover_warning = tostring(cover_warning) } or nil
     return result, err, metadata
 end

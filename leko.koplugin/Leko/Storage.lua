@@ -208,7 +208,9 @@ local function sourceRuntimePayload(source)
     }
 end
 
-Storage.TOC_FORMAT = 2 -- bump to invalidate cached TOCs when chapter descriptor encoding changes
+Storage.TOC_FORMAT = 3 -- bump to invalidate cached TOCs when chapter descriptor encoding changes
+-- v3 strips the runtime-only chapter fields (_raw_url duplicate, _request_base_url)
+-- on write; v2 caches still load because the fields are rehydrated from `url`.
 
 function Storage:init()
     Util.mkdirp(self.root_dir)
@@ -790,14 +792,20 @@ function Storage:writeCache(kind, key, value)
 end
 
 function Storage:readCache(kind, key, ttl_seconds)
-    local raw = Util.readFile(self:getCachePath(kind, key))
+    local path = self:getCachePath(kind, key)
+    local raw = Util.readFile(path)
     if not raw then return nil end
     local ok, payload = pcall(rapidjson.decode, raw)
-    if not ok or type(payload) ~= "table" then return nil end
+    if not ok or type(payload) ~= "table" then
+        -- A truncated or partially written entry can never decode again, so
+        -- drop it instead of re-reading the same broken file on every open.
+        pcall(os.remove, path)
+        return nil
+    end
     local created_at = tonumber(payload.created_at or 0) or 0
     local ttl = tonumber(ttl_seconds or 0) or 0
     if ttl > 0 and os.time() - created_at > ttl then
-        os.remove(self:getCachePath(kind, key))
+        pcall(os.remove, path)
         return nil
     end
     return payload.value, created_at
@@ -805,36 +813,39 @@ end
 
 function Storage:clearCache(kind)
     local target = self:getCacheDir(kind)
-    Util.removeTree(target)
+    local state = Util.removeTreeDetailed(target)
     Util.mkdirp(target)
     if not kind then
-        for _, name in ipairs({ "http", "search", "bookinfo", "toc", "images", "tmp" }) do
+        for _, name in ipairs({ "http", "search", "bookinfo", "toc", "images", "tmp", "source-js" }) do
             Util.mkdirp(self:getCacheDir(name))
         end
     end
-    return true
+    return #state.failures == 0, state.files, state.failures
 end
 
 function Storage:pruneCacheKind(kind, limits)
     limits = limits or {}
     local dir = self:getCacheDir(kind)
-    if lfs.attributes(dir, "mode") ~= "directory" then return 0 end
+    if lfs.attributes(dir, "mode") ~= "directory" then return 0, 0 end
     local now_time = os.time()
-    local items, total, removed = {}, 0, 0
+    local items, total, removed, freed = {}, 0, 0, 0
     -- Maintenance must yield to foreground interaction. Bound deletions per pass
     -- so a large stale cache cannot create a long flash-I/O burst.
     local max_remove = math.max(1, tonumber(limits.max_remove or 8) or 8)
     for name in lfs.dir(dir) do
         if name ~= "." and name ~= ".." then
+            local keep = limits.keep and limits.keep(name) or false
             local path = Util.joinPath(dir, name)
             local attr = lfs.attributes(path)
-            if attr and attr.mode == "file" then
+            if attr and attr.mode == "file" and not keep then
+                local size = tonumber(attr.size or 0) or 0
                 local age = math.max(0, now_time - (tonumber(attr.modification or 0) or 0))
                 if limits.max_age and age > limits.max_age and removed < max_remove then
-                    os.remove(path)
-                    removed = removed + 1
+                    if os.remove(path) then
+                        removed = removed + 1
+                        freed = freed + size
+                    end
                 else
-                    local size = tonumber(attr.size or 0) or 0
                     total = total + size
                     items[#items + 1] = { path = path, size = size, modified = tonumber(attr.modification or 0) or 0 }
                 end
@@ -848,24 +859,46 @@ function Storage:pruneCacheKind(kind, limits)
         local item = table.remove(items, 1)
         if not item then break end
         total = math.max(0, total - item.size)
-        os.remove(item.path)
-        removed = removed + 1
+        if os.remove(item.path) then
+            removed = removed + 1
+            freed = freed + item.size
+        end
     end
-    return removed
+    return removed, freed
 end
 
-function Storage:pruneCaches()
-    local removed = 0
-    removed = removed + self:pruneCacheKind("http", { max_files = 256, max_bytes = 8 * 1024 * 1024, max_age = 2 * 24 * 60 * 60, max_remove = 4 })
-    removed = removed + self:pruneCacheKind("search", { max_files = 600, max_bytes = 6 * 1024 * 1024, max_age = 24 * 60 * 60, max_remove = 4 })
-    removed = removed + self:pruneCacheKind("bookinfo", { max_files = 300, max_bytes = 4 * 1024 * 1024, max_age = 3 * 24 * 60 * 60, max_remove = 4 })
-    removed = removed + self:pruneCacheKind("toc", { max_files = 80, max_bytes = 20 * 1024 * 1024, max_age = 3 * 24 * 60 * 60, max_remove = 4 })
+-- Per-kind ceilings. They are enforced a few files at a time by the
+-- maintenance pass, so a fresh install never stalls the reader with one big
+-- delete burst. "images" is deliberately absent: CoverService owns that cache
+-- and keeps a much tighter LRU, so a second ceiling here would never trigger.
+local PRUNE_LIMITS = {
+    http = { max_files = 192, max_bytes = 8 * 1024 * 1024, max_age = 2 * 24 * 60 * 60 },
+    search = { max_files = 400, max_bytes = 6 * 1024 * 1024, max_age = 24 * 60 * 60 },
+    bookinfo = { max_files = 240, max_bytes = 4 * 1024 * 1024, max_age = 3 * 24 * 60 * 60 },
+    toc = { max_files = 80, max_bytes = 20 * 1024 * 1024, max_age = 3 * 24 * 60 * 60 },
+    ["source-js"] = { max_files = 80, max_bytes = 2 * 1024 * 1024, max_age = 7 * 24 * 60 * 60 },
     -- Never clear the whole temporary directory while a newly opened page may
-    -- already own live worker files. Only reap abandoned files older than one hour.
-    removed = removed + self:pruneCacheKind("tmp", {
-        max_files = 256, max_bytes = 2 * 1024 * 1024, max_age = 60 * 60, max_remove = 4,
-    })
-    return removed
+    -- already own live worker files. Only reap abandoned files older than an hour.
+    tmp = { max_files = 128, max_bytes = 2 * 1024 * 1024, max_age = 60 * 60 },
+}
+
+local PRUNE_ORDER = { "http", "search", "bookinfo", "toc", "source-js", "tmp" }
+
+function Storage:pruneCaches(options)
+    options = options or {}
+    local removed, freed = 0, 0
+    local max_remove = math.max(1, tonumber(options.max_remove or 64) or 64)
+    for _, kind in ipairs(PRUNE_ORDER) do
+        if removed >= max_remove then break end
+        local limits = {}
+        for key, value in pairs(PRUNE_LIMITS[kind]) do limits[key] = value end
+        limits.max_remove = math.min(limits.max_remove or max_remove, max_remove - removed)
+        limits.keep = options.keep
+        local kind_removed, kind_freed = self:pruneCacheKind(kind, limits)
+        removed = removed + kind_removed
+        freed = freed + kind_freed
+    end
+    return removed, freed
 end
 
 local function pathSize(path)
@@ -895,6 +928,45 @@ local function directoryBreakdown(path)
     return result, total
 end
 
+-- TOC caches are reported separately because they dwarf the chapter files
+-- themselves: a 2928-chapter book measured 2.9 MB of toc.lua against 58 KB of
+-- downloaded chapters, so "clear downloaded chapters" used to free almost
+-- nothing while the real weight sat in the parsed directory.
+local function booksBreakdown(path)
+    local chapters, toc, metadata = 0, 0, 0
+    if lfs.attributes(path, "mode") ~= "directory" then return chapters, toc, metadata end
+    for entry in lfs.dir(path) do
+        if entry ~= "." and entry ~= ".." then
+            local item = Util.joinPath(path, entry)
+            local attr = lfs.attributes(item)
+            if attr and attr.mode == "directory" then
+                local chapter_size = pathSize(Util.joinPath(item, "chapters"))
+                local toc_size = pathSize(Util.joinPath(item, "toc.lua"))
+                local profile_size = pathSize(Util.joinPath(item, "source-tocs"))
+                chapters = chapters + chapter_size
+                toc = toc + toc_size + profile_size
+                metadata = metadata + math.max(0, pathSize(item) - chapter_size - toc_size - profile_size)
+            elseif attr then
+                metadata = metadata + (tonumber(attr.size or 0) or 0)
+            end
+        end
+    end
+    return chapters, toc, metadata
+end
+
+-- These files are the only way to diagnose a failure after the fact, so the
+-- log breakdown reports them separately and clearLogs never touches them.
+local LOG_KEEP_NAMES = { ["last-error.log"] = true, ["cover-diagnostics.csv"] = true, ["cover-stats.json"] = true }
+
+local function logsBreakdown(path)
+    local breakdown, total = directoryBreakdown(path)
+    local keep = 0
+    for name in pairs(LOG_KEEP_NAMES) do
+        keep = keep + (tonumber(breakdown[name] or 0) or 0)
+    end
+    return total, keep
+end
+
 function Storage:getPathSize(path)
     return pathSize(path)
 end
@@ -907,11 +979,107 @@ function Storage:formatBytes(bytes)
     return string.format("%.2f GB", bytes / (1024 * 1024 * 1024))
 end
 
+function Storage:getExportManifestPath()
+    return Util.joinPath(self.root_dir, "exports.json")
+end
+
+-- Exported books may land in a directory this plugin does not own (Kindle's
+-- documents root, or any user picked folder). Remember the exact files we
+-- wrote so cache maintenance can never delete an unrelated document and so the
+-- storage numbers stay honest.
+function Storage:listExports()
+    local raw = Util.readFile(self:getExportManifestPath())
+    if not raw then return {} end
+    local ok, data = pcall(rapidjson.decode, raw)
+    if not ok or type(data) ~= "table" then return {} end
+    local entries = {}
+    for _, item in ipairs(data) do
+        if type(item) == "table" and type(item.path) == "string" and item.path ~= "" then
+            entries[#entries + 1] = { path = item.path, at = tonumber(item.at or 0) or 0 }
+        end
+    end
+    return entries
+end
+
+local function writeExportManifest(entries)
+    local ok, body = pcall(rapidjson.encode, entries)
+    if not ok then return false end
+    return Util.writeFile(Storage:getExportManifestPath(), body)
+end
+
+function Storage:recordExport(path)
+    path = tostring(path or "")
+    if path == "" then return false end
+    local entries = self:listExports()
+    local found
+    for _, item in ipairs(entries) do
+        if item.path == path then
+            item.at = os.time()
+            found = true
+            break
+        end
+    end
+    if not found then entries[#entries + 1] = { path = path, at = os.time() } end
+    while #entries > 500 do table.remove(entries, 1) end
+    return writeExportManifest(entries)
+end
+
+function Storage:getExportsInfo()
+    local entries, total = {}, 0
+    for _, item in ipairs(self:listExports()) do
+        local attr = lfs.attributes(item.path)
+        if attr and attr.mode == "file" then
+            entries[#entries + 1] = item
+            total = total + (tonumber(attr.size or 0) or 0)
+        end
+    end
+    return entries, total
+end
+
+function Storage:clearExports()
+    local entries, total = self:getExportsInfo()
+    local removed, freed, kept, failures = 0, 0, {}, 0
+    for _, item in ipairs(entries) do
+        local attr = lfs.attributes(item.path)
+        local size = attr and (tonumber(attr.size or 0) or 0) or 0
+        if os.remove(item.path) then
+            removed = removed + 1
+            freed = freed + size
+        else
+            failures = failures + 1
+            kept[#kept + 1] = item
+        end
+    end
+    writeExportManifest(kept)
+    return failures == 0, removed, math.min(freed, total), failures
+end
+
+function Storage:clearLogs()
+    local dir = self:getLogsDir()
+    if lfs.attributes(dir, "mode") ~= "directory" then return true, 0, 0 end
+    local removed, freed = 0, 0
+    for entry in lfs.dir(dir) do
+        if entry ~= "." and entry ~= ".." and not LOG_KEEP_NAMES[entry] then
+            local path = Util.joinPath(dir, entry)
+            local size = pathSize(path)
+            local state = Util.removeTreeDetailed(path)
+            if #state.failures == 0 then
+                removed = removed + 1
+                freed = freed + size
+            end
+        end
+    end
+    return true, removed, freed
+end
+
 function Storage:getStorageStats()
     local cache_kinds, temp_cache = directoryBreakdown(self:getCacheDir())
     local books = self:getPathSize(self:getBooksDir())
+    local books_chapters, books_toc, books_metadata = booksBreakdown(self:getBooksDir())
     local covers = self:getPathSize(self:getCoversDir())
     local sources = self:getPathSize(self:getSourcesDir())
+    local logs, logs_keep = logsBreakdown(self:getLogsDir())
+    local _, exports = self:getExportsInfo()
     local source_stats = self:getSourceStats()
     return {
         cache = temp_cache,
@@ -922,21 +1090,28 @@ function Storage:getStorageStats()
         cache_tmp = tonumber(cache_kinds.tmp or 0) or 0,
         cache_http = tonumber(cache_kinds.http or 0) or 0,
         books = books,
+        books_chapters = books_chapters,
+        books_toc = books_toc,
+        books_metadata = books_metadata,
         covers = covers,
         sources = sources,
+        logs = logs,
+        logs_keep = logs_keep,
+        exports = exports,
         backup_count = #self:listSourceBackups(),
         source_count = source_stats.total or 0,
         source_enabled = source_stats.enabled or 0,
         source_supported = source_stats.supported or 0,
         source_unsupported = source_stats.unsupported or 0,
-        total = temp_cache + books + covers + sources,
+        total = temp_cache + books + covers + sources + logs + exports,
         updated_at = os.time(),
     }
 end
 
 local STORAGE_STATS_FIELDS = {
     "cache", "cache_search", "cache_bookinfo", "cache_toc", "cache_images",
-    "cache_tmp", "cache_http", "books", "covers", "sources", "backup_count",
+    "cache_tmp", "cache_http", "books", "books_chapters", "books_toc", "books_metadata",
+    "covers", "sources", "logs", "logs_keep", "exports", "backup_count",
     "source_count", "source_enabled", "source_supported", "source_unsupported", "total",
 }
 
@@ -1285,12 +1460,55 @@ function Storage:loadBookProgress(book_id)
     }
 end
 
+-- Chapter descriptors carry runtime-only fields.  _raw_url is a verbatim copy
+-- of `url` on every source measured so far (2928/2928 chapters identical), and
+-- _request_base_url is rebuilt from the book/source on the next parse.  Keeping
+-- them on disk doubled the TOC payload, so they are stripped on write and
+-- rehydrated on read.  _toc_reuse_key / _toc_item_key / _deferred_url are NOT
+-- stripped: they drive TOC reuse and next-chapter resolution, and losing them
+-- would rehash chapter ids and invalidate downloaded chapter files.
+local TOC_STRIP_WHEN_DUPLICATE = { _raw_url = true }
+local TOC_STRIP_ALWAYS = { _request_base_url = true }
+
+local function stripTocTransients(chapters)
+    if type(chapters) ~= "table" then return chapters end
+    local copy = {}
+    for index, chapter in ipairs(chapters) do
+        if type(chapter) ~= "table" then
+            copy[index] = chapter
+        else
+            local item = {}
+            for key, value in pairs(chapter) do
+                if TOC_STRIP_ALWAYS[key] then
+                    -- dropped unconditionally
+                elseif TOC_STRIP_WHEN_DUPLICATE[key] and value == chapter.url then
+                    -- identical to a field we keep; rehydrated on load
+                else
+                    item[key] = value
+                end
+            end
+            copy[index] = item
+        end
+    end
+    return copy
+end
+
+local function hydrateTocTransients(chapters)
+    if type(chapters) ~= "table" then return chapters end
+    for _, chapter in ipairs(chapters) do
+        if type(chapter) == "table" and chapter._raw_url == nil and chapter.url ~= nil then
+            chapter._raw_url = chapter.url
+        end
+    end
+    return chapters
+end
+
 function Storage:saveBookToc(book)
     if not book or not book.id then return false, "book.id is required" end
     Util.mkdirp(self:getBookDir(book.id))
     local chapters = book.chapters or {}
     local settings = LuaSettings:open(self:getBookTocPath(book.id))
-    settings.data = { chapters = chapters, updated_at = os.time() }
+    settings.data = { chapters = stripTocTransients(chapters), updated_at = os.time() }
     settings:flush()
     book.chapter_count = #chapters
     book.toc_ready = #chapters > 0
@@ -1302,14 +1520,15 @@ function Storage:loadBookToc(book_id)
     local path = self:getBookTocPath(book_id)
     if lfs.attributes(path, "mode") ~= "file" then return nil end
     local data = LuaSettings:open(path).data or {}
-    return type(data.chapters) == "table" and data.chapters or nil
+    if type(data.chapters) ~= "table" then return nil end
+    return hydrateTocTransients(data.chapters)
 end
 
 function Storage:saveBookProfileToc(book_id, profile_key, chapters)
     if not book_id or not profile_key or type(chapters) ~= "table" then return false end
     Util.mkdirp(self:getBookProfileTocDir(book_id))
     local settings = LuaSettings:open(self:getBookProfileTocPath(book_id, profile_key))
-    settings.data = { chapters = chapters, updated_at = os.time(), toc_format = self.TOC_FORMAT }
+    settings.data = { chapters = stripTocTransients(chapters), updated_at = os.time(), toc_format = self.TOC_FORMAT }
     settings:flush()
     return true
 end
@@ -1319,7 +1538,8 @@ function Storage:loadBookProfileToc(book_id, profile_key)
     if lfs.attributes(path, "mode") ~= "file" then return nil end
     local data = LuaSettings:open(path).data or {}
     if tonumber(data.toc_format) ~= self.TOC_FORMAT then return nil end
-    return type(data.chapters) == "table" and data.chapters or nil
+    if type(data.chapters) ~= "table" then return nil end
+    return hydrateTocTransients(data.chapters)
 end
 
 function Storage:listBooks()
@@ -1606,6 +1826,26 @@ function Storage:clearAllBookChapters()
         Util.removeTree(self:getChapterDir(id))
     end
     return #ids
+end
+
+-- Drop one book's parsed TOC caches.  Reading progress lives in progress.lua
+-- and shelf metadata in book.lua; both are untouched.  The cost is that the
+-- next open must re-parse the directory online, so an offline reader cannot
+-- open a book until it is connected again.
+function Storage:clearBookTocs(book_id, state)
+    state = state or { files = 0, dirs = 0, failures = {} }
+    Util.removeTreeDetailed(self:getBookTocPath(book_id), state)
+    Util.removeTreeDetailed(self:getBookProfileTocDir(book_id), state)
+    return state
+end
+
+function Storage:clearAllBookTocs()
+    local ids = self:listBookDataIds()
+    local state = { files = 0, dirs = 0, failures = {} }
+    for _, id in ipairs(ids) do
+        self:clearBookTocs(id, state)
+    end
+    return #ids, state.files, #state.failures
 end
 
 function Storage:getCoverPath(book_id, extension)

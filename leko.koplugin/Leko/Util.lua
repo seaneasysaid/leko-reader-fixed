@@ -241,18 +241,36 @@ function Util.writeFile(path, content, binary)
     return true
 end
 
-function Util.removeTree(path)
+-- Collect removal statistics instead of stopping at the first failure: flash
+-- storage can refuse a delete while the directory as a whole is still usable.
+function Util.removeTreeDetailed(path, state)
+    state = state or { files = 0, dirs = 0, failures = {} }
     local mode = lfs.attributes(path, "mode")
-    if not mode then return true end
+    if not mode then return state end
     if mode == "file" or mode == "link" then
-        return os.remove(path)
+        if os.remove(path) then
+            state.files = state.files + 1
+        else
+            state.failures[#state.failures + 1] = path
+        end
+        return state
     end
     for entry in lfs.dir(path) do
         if entry ~= "." and entry ~= ".." then
-            Util.removeTree(Util.joinPath(path, entry))
+            Util.removeTreeDetailed(Util.joinPath(path, entry), state)
         end
     end
-    return lfs.rmdir(path)
+    if lfs.rmdir(path) then
+        state.dirs = state.dirs + 1
+    else
+        state.failures[#state.failures + 1] = path
+    end
+    return state
+end
+
+function Util.removeTree(path)
+    local state = Util.removeTreeDetailed(path)
+    return #state.failures == 0, state.files, state.failures
 end
 
 function Util.slug(value)
