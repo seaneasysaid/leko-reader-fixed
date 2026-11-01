@@ -309,8 +309,189 @@ function ReaderView:_scheduleFooterRefresh(force)
     end)
 end
 
+-- ⭐ 本章页数（页脚 N/M 页）。
+-- leko 本身是惰性分页：makePage 从任意位置往后填满一屏。这里用**同一个**
+-- Paginator:makePage 从章首顺序跑一遍，得到 {页起点 -> 页号} 与总页数，
+-- 所以「第 N 页」和真实翻页严格对齐（另写一套排版必然错位）。
+-- 代价是每章要排一次版：分片跑（每 tick 几页），首屏照旧走惰性分页，
+-- 页表就绪前页脚仍显示百分比，就绪后自动刷新成 N/M。样式一变签名失配即重排。
+local CHAPTER_PAGES_PER_TICK = 3
+local CHAPTER_PAGES_MAX = 4000
+
+local function chapterPageKey(position)
+    position = position or {}
+    return table.concat({
+        tostring(position.chapter or 1),
+        tostring(position.paragraph or 1),
+        tostring(position.char or 1),
+    }, ":")
+end
+
+local function normalizeChapterPosition(position)
+    position = position or {}
+    return {
+        chapter = tonumber(position.chapter) or 1,
+        paragraph = tonumber(position.paragraph) or 1,
+        char = tonumber(position.char) or 1,
+    }
+end
+
+-- 精确命中「这一页的起点」最好；不是跨页位置时（改字体/字号后页面是从旧位置
+-- 重排的，起点通常不落在新分页的页边界上）退化为「包含该位置的页」：
+-- 取最后一个 <= 当前位置的页起点。这和 KOReader 自带阅读器的口径一致，
+-- 也是唯一能避免「一改字体就永远只剩百分比」的做法。
+local function chapterPageLookup(cache, position)
+    if not cache then return nil end
+    position = normalizeChapterPosition(position)
+    if tonumber(cache.chapter) and position.chapter ~= tonumber(cache.chapter) then
+        return nil
+    end
+    local exact = cache.starts[chapterPageKey(position)]
+    if exact then return exact end
+    local order = cache.order
+    if not order or #order == 0 then return nil end
+    local low, high, found = 1, #order, nil
+    while low <= high do
+        local mid = math.floor((low + high) / 2)
+        if Util.positionLess(order[mid], position) or Util.positionEqual(order[mid], position) then
+            found = mid
+            low = mid + 1
+        else
+            high = mid - 1
+        end
+    end
+    return found
+end
+
+function ReaderView:_chapterPagesSignature(chapter)
+    local style = self.style or {}
+    return table.concat({
+        tostring(self.book and self.book.id or ""),
+        tostring(chapter),
+        tostring(Screen:getWidth()), tostring(Screen:getHeight()),
+        tostring(style.body_font or ""), tostring(style.body_font_index or 0),
+        tostring(style.body_font_size or 0), tostring(style.body_weight or 0),
+        tostring(style.line_spacing or 0), tostring(style.paragraph_spacing or 0),
+        tostring(style.margin_left or 0), tostring(style.margin_right or 0),
+        tostring(style.margin_top or 0), tostring(style.margin_bottom or 0),
+        tostring(style.show_header and 1 or 0),
+    }, "|")
+end
+
+-- 页表可用就返回 (页号, 总页数)，否则返回 nil 并在后台开始构建。
+function ReaderView:_footerChapterPages(page)
+    if not self.book or not page then return nil, nil end
+    local chapter = tonumber(page.chapter_index) or 1
+    local signature = self:_chapterPagesSignature(chapter)
+    local cache = self._chapter_page_cache
+    if not cache or cache.signature ~= signature then
+        if self._chapter_pages_failed_sig ~= signature then
+            self:_startChapterPageTable(chapter, signature)
+        end
+        return nil, nil
+    end
+    local number = chapterPageLookup(cache, page.start_position)
+    if not number then return nil, nil end
+    return number, cache.total > 0 and cache.total or nil
+end
+
+function ReaderView:_startChapterPageTable(chapter, signature)
+    local pending = self._chapter_page_build
+    if pending and pending.signature == signature then return end
+    local state = {
+        signature = signature,
+        chapter = chapter,
+        starts = {},
+        order = {},
+        total = 0,
+        position = { chapter = chapter, paragraph = 1, char = 1 },
+    }
+    self._chapter_page_build = state
+    self:_stepChapterPageTable(state)
+end
+
+function ReaderView:_stepChapterPageTable(state)
+    if self._closing or self._chapter_page_build ~= state then return end
+    local chapter = state.chapter
+    local finished = false
+    local produced = 0
+    while produced < CHAPTER_PAGES_PER_TICK and state.total < CHAPTER_PAGES_MAX do
+        local generated = Paginator:makePage(self.book, state.position, self.style)
+        if not generated then
+            finished = true
+            break
+        end
+        local start = generated.start_position or {}
+        state.total = state.total + 1
+        state.starts[chapterPageKey(start)] = state.total
+        state.order[state.total] = normalizeChapterPosition(start)
+        produced = produced + 1
+        local next_position = generated.next_position
+        if generated.at_end or not next_position
+                or tonumber(next_position.chapter) ~= chapter
+                or Util.positionEqual(next_position, start) then
+            finished = true
+            break
+        end
+        state.position = next_position
+    end
+    if not finished and state.total < CHAPTER_PAGES_MAX then
+        UIManager:nextTick(function()
+            if self._chapter_page_build == state then
+                self:_stepChapterPageTable(state)
+            end
+        end)
+        return
+    end
+
+    self._chapter_page_build = nil
+    if state.total > 0 then
+        self._chapter_page_cache = state
+        self._chapter_pages_failed_sig = nil
+    else
+        -- 排不出来就记住，避免每次重绘都重试一遍拖慢翻页。
+        self._chapter_pages_failed_sig = state.signature
+        return
+    end
+    -- 菜单/弹窗开着时不重绘（下次重建自然会吃到新页表），避免叠加刷新。
+    if self.page and tonumber(self.page.chapter_index) == chapter and not self._closing
+            and not self.menu_visible then
+        self:refreshFooterFromCache("ui")
+    end
+end
+
+-- 页眉时间不刷新就会停在翻开那一刻。每到一个整分钟只重绘页眉那条窄带，
+-- 不做整屏刷新；不在前台/关页/隐藏页眉时自动停表。
+function ReaderView:_ensureClockTimer()
+    if self._clock_timer or self._closing then return end
+    if not self.page or not self.page.show_header then return end
+    local ok, seconds = pcall(os.date, "%S")
+    local delay = 60 - (tonumber(seconds) or 0)
+    if delay < 1 then delay = 1 end
+    self._clock_timer = function()
+        self._clock_timer = nil
+        if self._closing or not self.page or not self.page.show_header then return end
+        if UIManager.isWidgetShown and not UIManager:isWidgetShown(self) then return end
+        -- 时间在页眉右侧：只重绘页眉区域，正文和页脚都不动。
+        self:rebuild("ui", self:_headerRegion() or self.dimen)
+        self:_ensureClockTimer()
+    end
+    UIManager:scheduleIn(delay, self._clock_timer)
+end
+
+-- Wi-Fi / 充电状态变化时重绘页眉（图标就在那儿）。这类事件很少，整页 ui 重绘可接受。
+function ReaderView:_refreshStatusChrome()
+    if self._closing or not self.page then return end
+    self:_settleSwipeRefresh()
+    self:rebuild("ui")
+end
+
+function ReaderView:onCharging() self:_refreshStatusChrome() end
+function ReaderView:onNotCharging() self:_refreshStatusChrome() end
+function ReaderView:onNetworkConnected() self:_refreshStatusChrome() end
+function ReaderView:onNetworkDisconnected() self:_refreshStatusChrome() end
+
 function ReaderView:buildFooterStatus(page, geometry)
-    local total_chapters = #(self.book.chapters or {})
     self._footer_dirty = false
     local chapter_index = tonumber(page.chapter_index or 1) or 1
     local chapter_percentage = 0
@@ -325,8 +506,24 @@ function ReaderView:buildFooterStatus(page, geometry)
         chapter_percentage = 1
     end
 
-    local left_text = string.format("第 %d / %d 章", chapter_index, total_chapters)
-    local right_text = string.format("本章 %d%%", math.floor(chapter_percentage * 100 + 0.5))
+    -- 页脚：左书名 / 中留空 / 右「本章页/总页 全书%」。
+    -- Sean 定版（2026-11-01）：不带「本章」「全书」这些中文字，只留数字 ——
+    --   `12/37 32.15%`
+    -- 所以这里既不用章序（页眉章节标题已含「第 N 章」），也不加任何标签。
+    local chapter_count = #(self.book.chapters or {})
+    local book_progress = chapter_count > 0
+        and clamp01(((chapter_index - 1) + chapter_percentage) / chapter_count) or 0
+    local left_text = tostring(self.book.title or "")
+    -- 全书进度精确到小数点后两位。
+    local book_text = string.format("%.2f%%", book_progress * 100)
+    -- 四舍五入会把「最后一章读到 99.996%」显示成 100.00%，看着像读完了。
+    if book_progress < 1 and book_progress * 100 >= 99.995 then book_text = "99.99%" end
+    -- 页表就绪时是「12/37」，未就绪用等宽的占位符，避免右列文字左右跳动。
+    local page_number, page_total = self:_footerChapterPages(page)
+    local page_text = page_number and page_total and string.format("%d/%d", page_number, page_total)
+        or "--/--"
+    -- 「12/37」和「32.15%」之间留两个空格：一个空格太挤，两个才分得开（Sean 要求）。
+    local right_text = page_text .. "  " .. book_text
     -- The footer no longer renders any cache/prefetch indicator. A progress bar
     -- here meant one footer-only repaint per prefetch tick, and those regional
     -- refreshes could race the chapter-turn full refresh on E Ink.
@@ -335,10 +532,21 @@ function ReaderView:buildFooterStatus(page, geometry)
     local width = math.max(1, geometry.content_width or (geometry.screen_width
         - geometry.left - geometry.right))
     local height = geometry.footer_height
-    local left_width = math.floor(width * 0.34)
-    local right_width = math.floor(width * 0.24)
-    local middle_width = math.max(1, width - left_width - right_width)
     local chrome_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil
+
+    -- ⭐ 右边那串数字长度不固定（「9/12 3.05%」和「456/789 88.88%」差很多），
+    -- 所以不再按固定比例切左右，而是**先量右格实际宽度，剩下的全给书名**。
+    -- 这样书名能占满右侧数字左边的所有空间，长书名尽量显示完整（真放不下才截断）。
+    local right_text_widget = TextWidget:new{
+        text = right_text,
+        face = geometry.chrome_face,
+        padding = 0,
+        max_width = width,
+        fgcolor = chrome_color,
+    }
+    local gap = Screen:scaleBySize(10)
+    local right_width = math.max(1, right_text_widget:getSize().w)
+    local left_width = math.max(1, width - right_width - gap)
 
     local left = LeftContainer:new{
         dimen = Geom:new{ w = left_width, h = height },
@@ -352,27 +560,17 @@ function ReaderView:buildFooterStatus(page, geometry)
     }
     local right = RightContainer:new{
         dimen = Geom:new{ w = right_width, h = height },
-        TextWidget:new{
-            text = right_text,
-            face = geometry.chrome_face,
-            padding = 0,
-            max_width = right_width,
-            fgcolor = chrome_color,
-        },
+        right_text_widget,
     }
 
-    -- Middle column stays empty: the footer only shows 「第 x / y 章」 and
-    -- 「本章 n%」. Nothing about the background prefetch is rendered anymore.
-    local middle_content = TextWidget:new{ text = "", face = geometry.chrome_face, padding = 0 }
-
+    -- 页脚就两格：书名 + 右侧数字。中间那格（原「第 x / y 章」）已经不需要了，
+    -- 空着反而白占宽，直接去掉，把宽度让给书名。
     local footer = HorizontalGroup:new{
         left,
-        CenterContainer:new{
-            dimen = Geom:new{ w = middle_width, h = height },
-            middle_content,
-        },
+        HorizontalSpan:new{ width = gap },
         right,
     }
+    self:_ensureClockTimer()
     return CenterContainer:new{
         dimen = Geom:new{ w = geometry.screen_width, h = height },
         footer,
@@ -390,6 +588,15 @@ function ReaderView:_footerRegion()
     }
 end
 
+-- 页眉条（含顶部偏移）：页眉里的时间每分钟重绘这里，不碰正文。
+function ReaderView:_headerRegion()
+    if not self.page or not self.page.geometry then return nil end
+    local geometry = self.page.geometry
+    local height = (geometry.header_offset or 0) + (geometry.header_height or 0)
+    if height <= 0 then return nil end
+    return Geom:new{ x = 0, y = 0, w = geometry.screen_width, h = height }
+end
+
 -- The footer no longer shows anything about the background prefetch, so a
 -- progress tick must not trigger a repaint. Each tick used to rebuild the whole
 -- reading page and then flush only the footer strip; on E Ink those regional
@@ -398,22 +605,60 @@ function ReaderView:onPrefetchProgress(state)
     self.prefetch_state = state
 end
 
--- Time + battery for the right side of the header. Battery is shown as
--- "[nn%]" (bracketed percent) when available; otherwise only the time shows.
-function ReaderView:_headerStatusText()
-    local time_text = ""
-    local ok_time, time = pcall(os.date, "%H:%M")
-    if ok_time and time then time_text = time end
+-- ⭐ 页眉状态图标：直接复用 KOReader 自带 `nerdfonts/symbols.ttf` 里的私有码位
+-- （和原生阅读器 footer 的「icons」模式同一套字形），不用额外打包图片资源，
+-- 夜间模式跟着文字颜色反色。
+local WIFI_SYMBOL_ON = "\xEE\xB2\xA8"   -- U+ECA8 Wi-Fi 已连接
+local WIFI_SYMBOL_OFF = "\xEE\xB2\xA9"  -- U+ECA9 Wi-Fi 未连接/已关闭
 
-    local battery_text = ""
-    local ok, powerd = pcall(function() return Device:getPowerDevice() end)
-    if ok and powerd and type(powerd.getCapacity) == "function" then
-        local ok_cap, capacity = pcall(powerd.getCapacity, powerd)
-        if ok_cap and capacity ~= nil then
-            battery_text = string.format("[%d%%]", math.max(0, math.min(100, math.floor(capacity))))
-        end
+function ReaderView:_clockText()
+    local ok, text = pcall(os.date, "%H:%M")
+    if ok and text then return text end
+    return ""
+end
+
+-- Wi-Fi 状态：拿不到就返回 nil（不显示图标），不要瞎猜成「已断开」。
+function ReaderView:_wifiSymbol()
+    if type(Device.hasWifiToggle) ~= "function" or not Device:hasWifiToggle() then return nil end
+    if type(Device.hasFastWifiStatusQuery) ~= "function" or not Device:hasFastWifiStatusQuery() then
+        return nil
     end
-    return time_text .. battery_text
+    if type(Device.isAndroid) == "function" and Device:isAndroid() then return nil end
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if not ok or type(NetworkMgr) ~= "table" or type(NetworkMgr.isWifiOn) ~= "function" then
+        return nil
+    end
+    local ok_state, is_on = pcall(NetworkMgr.isWifiOn, NetworkMgr)
+    if not ok_state or type(is_on) ~= "boolean" then return nil end
+    return is_on and WIFI_SYMBOL_ON or WIFI_SYMBOL_OFF
+end
+
+-- 电池图标：交给 powerd:getBatterySymbol()，它按电量 10% 一档给出字形，
+-- 充电/充满也有各自字形 —— 不用我们自己维护映射表。
+function ReaderView:_batterySymbol()
+    if type(Device.hasBattery) == "function" and not Device:hasBattery() then return nil end
+    local ok, powerd = pcall(function() return Device:getPowerDevice() end)
+    if not ok or not powerd or type(powerd.getBatterySymbol) ~= "function" then return nil end
+    local ok_cap, capacity = pcall(powerd.getCapacity, powerd)
+    if not ok_cap or type(capacity) ~= "number" then return nil end
+    local ok_charged, charged = pcall(powerd.isCharged, powerd)
+    local ok_charging, charging = pcall(powerd.isCharging, powerd)
+    local ok_symbol, symbol = pcall(powerd.getBatterySymbol, powerd,
+        (ok_charged and charged) or false, (ok_charging and charging) or false, capacity)
+    if ok_symbol and type(symbol) == "string" and symbol ~= "" then return symbol end
+    return nil
+end
+
+-- 页眉右侧：时间 + Wi-Fi 图标 + 电池图标（章节号在页脚左下角）。
+function ReaderView:_headerStatusText()
+    local parts = {}
+    local clock = self:_clockText()
+    if clock ~= "" then parts[#parts + 1] = clock end
+    local wifi = self:_wifiSymbol()
+    if wifi then parts[#parts + 1] = wifi end
+    local battery = self:_batterySymbol()
+    if battery then parts[#parts + 1] = battery end
+    return table.concat(parts, " ")
 end
 
 -- 夜间模式: dark background with light text (黑底白字).
@@ -1697,6 +1942,8 @@ function ReaderView:applyStyleChange(callback)
     self:_settleSwipeRefresh()
     callback(self.style)
     self.history = {}
+    -- 排版变了：页表必然重排，顺手清掉「这版排不出来」的记忆，避免旧签名卡住。
+    self._chapter_pages_failed_sig = nil
     BookService:clearBookCache(self.book.id)
     local page, err = Paginator:makePage(self.book, self.page.start_position, self.style)
     self:consumeFontFallbackNotice()
@@ -2389,6 +2636,11 @@ end
 function ReaderView:onCloseWidget()
     self._para_request_token = nil
     self._para_counts_token = nil
+    -- 页脚时钟：关页必须停表，否则回调会在已销毁的视图上重绘。
+    if self._clock_timer then
+        UIManager:unschedule(self._clock_timer)
+        self._clock_timer = nil
+    end
     self:_endParaWait()
     AsyncParaReview:release()
     self:_cancelSwipeRefresh()
