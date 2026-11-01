@@ -635,6 +635,7 @@ end
 
 -- 电池图标：交给 powerd:getBatterySymbol()，它按电量 10% 一档给出字形，
 -- 充电/充满也有各自字形 —— 不用我们自己维护映射表。
+-- 顺带把电量百分比一起返回，页眉要在图标右边跟一个「85%」。
 function ReaderView:_batterySymbol()
     if type(Device.hasBattery) == "function" and not Device:hasBattery() then return nil end
     local ok, powerd = pcall(function() return Device:getPowerDevice() end)
@@ -645,19 +646,27 @@ function ReaderView:_batterySymbol()
     local ok_charging, charging = pcall(powerd.isCharging, powerd)
     local ok_symbol, symbol = pcall(powerd.getBatterySymbol, powerd,
         (ok_charged and charged) or false, (ok_charging and charging) or false, capacity)
-    if ok_symbol and type(symbol) == "string" and symbol ~= "" then return symbol end
+    if ok_symbol and type(symbol) == "string" and symbol ~= "" then
+        return symbol, math.max(0, math.min(100, math.floor(capacity + 0.5)))
+    end
     return nil
 end
 
--- 页眉右侧：时间 + Wi-Fi 图标 + 电池图标（章节号在页脚左下角）。
+-- 页眉右侧：时间 + Wi-Fi 图标 + 电池图标 + 电量百分比（章节号在页脚左下角）。
 function ReaderView:_headerStatusText()
     local parts = {}
     local clock = self:_clockText()
     if clock ~= "" then parts[#parts + 1] = clock end
     local wifi = self:_wifiSymbol()
     if wifi then parts[#parts + 1] = wifi end
-    local battery = self:_batterySymbol()
-    if battery then parts[#parts + 1] = battery end
+    local battery, battery_percent = self:_batterySymbol()
+    -- 百分比紧贴图标（「🔋85%」），不额外加空格：页眉左边还要留位置给章节名。
+    if battery then
+        if battery_percent then
+            battery = battery .. string.format("%d%%", battery_percent)
+        end
+        parts[#parts + 1] = battery
+    end
     return table.concat(parts, " ")
 end
 
