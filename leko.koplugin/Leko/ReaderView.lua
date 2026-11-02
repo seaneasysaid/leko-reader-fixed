@@ -464,16 +464,17 @@ end
 -- 不做整屏刷新；不在前台/关页/隐藏页眉时自动停表。
 function ReaderView:_ensureClockTimer()
     if self._clock_timer or self._closing then return end
-    if not self.page or not self.page.show_header then return end
+    -- 时间已经挪到页脚左下角（Sean 2026-11-02），所以生命线跟着页脚走。
+    if not self.page or not self.style.show_footer then return end
     local ok, seconds = pcall(os.date, "%S")
     local delay = 60 - (tonumber(seconds) or 0)
     if delay < 1 then delay = 1 end
     self._clock_timer = function()
         self._clock_timer = nil
-        if self._closing or not self.page or not self.page.show_header then return end
+        if self._closing or not self.page or not self.style.show_footer then return end
         if UIManager.isWidgetShown and not UIManager:isWidgetShown(self) then return end
-        -- 时间在页眉右侧：只重绘页眉区域，正文和页脚都不动。
-        self:rebuild("ui", self:_headerRegion() or self.dimen)
+        -- 时间在页脚左下角：只重绘页脚那条，正文和页眉都不动。
+        self:rebuild("ui", self:_footerRegion() or self.dimen)
         self:_ensureClockTimer()
     end
     UIManager:scheduleIn(delay, self._clock_timer)
@@ -506,14 +507,15 @@ function ReaderView:buildFooterStatus(page, geometry)
         chapter_percentage = 1
     end
 
-    -- 页脚：左书名 / 中留空 / 右「本章页/总页 全书%」。
+    -- 页脚：左时间 / 中留空 / 右「本章页/总页 全书%」。
     -- Sean 定版（2026-11-01）：不带「本章」「全书」这些中文字，只留数字 ——
-    --   `12/37 32.15%`
-    -- 所以这里既不用章序（页眉章节标题已含「第 N 章」），也不加任何标签。
+    --   `09:20   12/37 32.15%`
+    -- 2026-11-02 调整：页眉左上仍是章节名，左下的书名换成时间
+    -- （时间从页眉右侧挪下来），右侧数字列不变。
     local chapter_count = #(self.book.chapters or {})
     local book_progress = chapter_count > 0
         and clamp01(((chapter_index - 1) + chapter_percentage) / chapter_count) or 0
-    local left_text = tostring(self.book.title or "")
+    local left_text = self:_clockText()
     -- 全书进度精确到小数点后两位。
     local book_text = string.format("%.2f%%", book_progress * 100)
     -- 四舍五入会把「最后一章读到 99.996%」显示成 100.00%，看着像读完了。
@@ -535,8 +537,8 @@ function ReaderView:buildFooterStatus(page, geometry)
     local chrome_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil
 
     -- ⭐ 右边那串数字长度不固定（「9/12 3.05%」和「456/789 88.88%」差很多），
-    -- 所以不再按固定比例切左右，而是**先量右格实际宽度，剩下的全给书名**。
-    -- 这样书名能占满右侧数字左边的所有空间，长书名尽量显示完整（真放不下才截断）。
+    -- 所以不按固定比例切左右，而是**先量右格实际宽度，剩下的全给左格**。
+    -- 左格现在是时间（固定 5 字符宽），不会因为宽度变化而左右跳动。
     local right_text_widget = TextWidget:new{
         text = right_text,
         face = geometry.chrome_face,
@@ -563,8 +565,8 @@ function ReaderView:buildFooterStatus(page, geometry)
         right_text_widget,
     }
 
-    -- 页脚就两格：书名 + 右侧数字。中间那格（原「第 x / y 章」）已经不需要了，
-    -- 空着反而白占宽，直接去掉，把宽度让给书名。
+    -- 页脚就两格：时间 + 右侧数字。中间那格（原「第 x / y 章」）已经不需要了，
+    -- 空着反而白占宽，直接去掉。
     local footer = HorizontalGroup:new{
         left,
         HorizontalSpan:new{ width = gap },
@@ -652,11 +654,10 @@ function ReaderView:_batterySymbol()
     return nil
 end
 
--- 页眉右侧：时间 + Wi-Fi 图标 + 电池图标 + 电量百分比（章节号在页脚左下角）。
+-- 页眉右侧：Wi-Fi 图标 + 电池图标 + 电量百分比。
+-- 时间已经挪到页脚左下角（Sean 2026-11-02 调整），页眉只留状态图标。
 function ReaderView:_headerStatusText()
     local parts = {}
-    local clock = self:_clockText()
-    if clock ~= "" then parts[#parts + 1] = clock end
     local wifi = self:_wifiSymbol()
     if wifi then parts[#parts + 1] = wifi end
     local battery, battery_percent = self:_batterySymbol()
@@ -702,7 +703,7 @@ function ReaderView:buildReadingPage(page)
         -- Small gap so the header does not touch the physical top edge.
         table.insert(group, UI.vspace(geometry.header_offset or 0))
         cursor_y = cursor_y + vspace_height(geometry.header_offset or 0)
-        -- Header: chapter title left-aligned, time + battery on the right.
+        -- Header: chapter title left-aligned, Wi-Fi + battery (no clock) on the right.
         local chrome_color = self:isNightMode() and Blitbuffer.COLOR_WHITE or nil
         local status = self:_headerStatusText()
         local status_widget = TextWidget:new{
