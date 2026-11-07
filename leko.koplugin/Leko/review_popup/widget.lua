@@ -61,8 +61,9 @@ local ThoughtPopupWidget = InputContainer:extend{
     -- para_nav("next") / para_nav("prev") instead of closing. Swiping to
     -- close stays available through tap-outside and the Back key.
     para_nav = nil,
-    -- 「继续加载」：段评一条通道最多取 50 条（服务端上限），还有剩余时底部
-    -- 挂一个按钮。more_text 是按钮文字（含剩余条数），on_more 是回调。
+    -- 「继续加载」：服务端还有余量时底部挂一个按钮，more_text 是按钮文字
+    -- （含剩余条数），on_more 是回调。番茄按条数偏移续拉，QQ 按毫秒时间戳
+    -- 游标续拉（2026-11-07 接通），七猫一次给全、不挂按钮。
     more_text = nil,
     on_more = nil,
 

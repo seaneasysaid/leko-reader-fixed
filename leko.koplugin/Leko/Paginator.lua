@@ -25,11 +25,12 @@ local READER_BODY_TOP_GAP = 24
 local IDEOGRAPHIC_SPACE = "\u{3000}"
 local NO_BREAK_SPACE = "\u{00A0}"
 local SYSTEM_FONT = "cfont"
--- 段评气泡的样式对齐番茄插件（那边是 crengine 的行内 `<a class="para-comment">`，
--- CSS 为 `font-size: 0.8em !important; font-weight: bold; margin: 0 1px`）：
+-- 段评气泡的样式参考番茄插件（那边是 crengine 的行内 `<a class="para-comment">`，
+-- 原版 CSS 为 `font-size: 0.8em !important; font-weight: bold; margin: 0 1px`）：
 -- 字号 = 正文字号 × 这个比例，字体族用正文那一套，并加粗。
 -- 见 getGeometry 里的 para_marker_face / para_marker_bold。
-local PARA_MARKER_FONT_RATIO = 0.80
+-- Sean 2026-11-02：0.80 -> 0.90（比番茄原版大一号），气泡太小不好点。
+local PARA_MARKER_FONT_RATIO = 0.90
 local PARA_MARKER_BOLD = true
 -- 气泡与段末文字之间的缝（≈ CSS 的 margin-left: 1px）。分页器把它算进预留宽度、
 -- 渲染层按 geometry 里同一个值摆放，两边不会打架。

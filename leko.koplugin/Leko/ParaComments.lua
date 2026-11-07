@@ -18,9 +18,11 @@
 
   评论正文      番茄 GET {host}/idea_comment?api=1&book_id=&item_id=&para=&cursor=0&count=&sort=1
                 -> {data:{para_src_content:"<原文段落>", data_list:[{comment:{...}}]}}
-                QQ   GET {host}/qq_comment?ajax=1&bid=&cid=&para=
+                QQ   GET {host}/qq_comment?ajax=1&bid=&cid=&para=[&cursor=]
                 -> {comments:[{nick, replyContent, agree, createTime, ...}],
                     hasNext, nextCursor, currentCount}
+                ⚠️ QQ 的 cursor 是**毫秒时间戳**（上一页回的 nextCursor），
+                   不是条数偏移；首屏不带 cursor。实测连翻 7 页时间严格递减。
                 七猫 GET {host}/paras/proxy_qmidea?action=paragraph_first
                          &book_id=&item_id=&paragraph_id=<段落内容指纹>
                 -> {data:{hot_zone:{comment_list,comment_count},
@@ -76,6 +78,11 @@ ParaComments.PAGE_SIZE = 20
 -- 代价说清楚：服务端每页稳定 4–5 秒，所以首屏要等约 9 秒。这个等待必须放在
 -- 子进程里（见 Leko/AsyncParaReview），否则整台机器会僵住约 9 秒。
 ParaComments.FIRST_OPEN_PAGES = 2
+-- QQ 评论缓存的格式版本。续拉位置从「条数偏移」改成「毫秒时间戳游标」后
+--  升到 2：旧缓存里的 next_cursor 是 11、22 这种小整数，当时间戳发回去会被
+--  服务端当作极早的时间点、拉回首屏，于是同一批评论被反复追加。检测到版本
+--  不符就把整条缓存丢掉重新从首屏拉一次（一次性代价，TTL 6h 内只发生一次）。
+local COMMENTS_CACHE_VERSION = 2
 -- 段评是阅读路径上的附加请求，宁可失败也不要长时间卡住翻页。
 ParaComments.TIMEOUT = 15
 ParaComments.CACHE_KIND = "para_review"
@@ -163,7 +170,10 @@ end
 local function intText(value)
     local number = tonumber(value)
     if not number then return "0" end
-    return string.format("%d", math.floor(number))
+    -- ⚠️ 不能用 "%d"：32 位 LuaJIT 的 int 装不下 QQ 的毫秒时间戳游标
+    -- （约 1.7e12），会溢出成负数或 0，续拉直接打回最前面一页。
+    -- "%.0f" 走 double（能精确表示到 2^53），大数小数都输出纯十进制整数串。
+    return string.format("%.0f", math.floor(number))
 end
 
 --[[--
@@ -400,16 +410,21 @@ end
 --[[--
 这个平台的评论接口是不是「一次给全、没有下一页」。
 
-  QQ   分页参数被无视（page / cursor / count / offset 实测都不生效）。
-  七猫 `paragraph_more` 实测无论怎么传 next_id / hot 都回 0 条，而
-        `paragraph_first` 的顶层 next_id 一直是空 —— 网页端的「加载更多」
-        因此也出不来。
+  七猫 `paragraph_more` 恒定回 44010102「请求参数错误」，且 `paragraph_first`
+        的响应里从没有 next_id —— 网页端的「加载更多」按钮因此永远不显示
+        （2026-11-07 重新实测确认，见项目笔记）。
 
-两家都续不了，所以对它们而言「继续加载」这个语义不成立。
+  QQ 曾经也在这份名单里，2026-11-07 翻案：/qq_comment 支持
+        `cursor=<nextCursor>`，值是**毫秒时间戳**（上一页最早一条的
+        createTime），不是条数偏移。当年拿 cursor=20 去试，服务端把它当成
+        极小时间戳，看起来「不生效」；改成时间戳后实测连翻 7 页、createTime
+        严格递减、评论 ID 无重复。现在 QQ 与番茄一样走续拉。
+
+现在只剩七猫一家续不了，对它而言「继续加载」这个语义不成立。
 ]]--
 local function platformSingleShot(platform)
     if type(platform) ~= "table" then return false end
-    return platform.code == "qq" or platform.code == "qm"
+    return platform.code == "qm"
 end
 
 --[[--
@@ -422,8 +437,8 @@ local function pageInfo(record, platform)
     local has_more = record.has_more
     if next_cursor == nil then next_cursor = #list end
     if has_more == nil then
-        -- 番茄：没有续拉位置也当「还有」——点一次就能把后面的取回来。
-        -- 一次给全的平台：说「还有」只会让同一批评论被追加一遍。
+        -- 能续拉的平台（番茄 / QQ）：没有续拉位置也当「还有」——点一次就能
+        -- 把后面的取回来。七猫一次给全：说「还有」只会让同一批被追加一遍。
         has_more = not platformSingleShot(platform)
     end
     return { next_cursor = next_cursor, has_more = has_more == true }
@@ -620,9 +635,11 @@ end
 30 条），合起来 35 条。网页端也是 `[...hot, ...time]` 之后按 comment_id 去重，
 这里照做：先 hot、后 time，重复的只留第一条出现的位置。
 
-没有分页：`/paras/proxy_qmidea?action=paragraph_more` 实测无论怎么传 next_id /
-hot 都回 0 条，`paragraph_first` 的顶层 next_id 也一直是空 —— 网页端的「加载
-更多」因此同样出不来。所以七猫是「一次给全」（与 QQ 一样），首屏即全部。
+没有分页（2026-11-07 重测确认）：`action=paragraph_more` 无论怎么传
+next_id / hot / chapter_md5 / page 都恒定回 44010102「请求参数错误」，且
+`paragraph_first` 响应里全量扫描也没有任何 next/cursor 字段 —— 网页端的
+「加载更多」按钮因拿不到 next_id 而永远不显示。所以七猫是「一次给全」，
+首屏即全部。QQ 不同，它走毫秒时间戳游标续拉（见 platformSingleShot）。
 ]]--
 local function parseQmComments(payload)
     local list, seen = {}, {}
@@ -718,14 +735,17 @@ local function fetchCommentPage(platform, book_id, chapter_id, pid, start, sourc
         end
         parse = parseQmComments
     else
-        -- QQ 侧没有分页参数（实测 page/cursor/count/offset 都不生效），
-        -- 一次把这一段给全。所以续拉只在番茄上有意义。
-        --
         -- ⚠️ `para` 用 toBackendPid 换算：QQ 的 paragraph_id 是 1 基
         -- （pid 0 留给章节标题），直接发 0 基段号会让评论整体前移一段。
         path = "/qq_comment?ajax=1&bid=" .. tostring(book_id)
             .. "&cid=" .. tostring(chapter_id)
             .. "&para=" .. toBackendPid(platform, pid)
+        -- cursor 是**毫秒时间戳**（上一页响应里的 nextCursor），不是条数偏移。
+        -- 首屏不带 cursor；续拉把它原样发回去。实测 page/count/offset 无效，
+        -- 只有 cursor 生效，而且值必须是时间戳 —— 传 20 会被当成极小时间。
+        if (tonumber(start) or 0) > 0 then
+            path = path .. "&cursor=" .. intText(start)
+        end
         validate = function(value) return type(value.comments) == "table" end
         parse = parseQqComments
     end
@@ -737,9 +757,10 @@ local function fetchCommentPage(platform, book_id, chapter_id, pid, start, sourc
     end
 
     local list, para_text = parse(payload)
-    local next_cursor = start + #list
+    local next_cursor = start
     local has_more = false
     if platform.code == "fq" then
+        next_cursor = start + #list
         -- 实测：游标信息在响应**顶层** common_list_info，
         -- 而 data 里只有 { data_list, para_src_content }。
         local info = payload.common_list_info
@@ -755,6 +776,34 @@ local function fetchCommentPage(platform, book_id, chapter_id, pid, start, sourc
         if type(info) ~= "table" or info.has_more == nil then
             has_more = #list >= ParaComments.PAGE_SIZE
         end
+    elseif platform.code == "qq" then
+        -- 游标信息在响应顶层：hasNext / nextCursor / currentCount。
+        -- nextCursor 是毫秒时间戳（≈ 本页最早一条的 createTime），下一页带
+        -- cursor=<它> 就能拿到更早的评论。绝不能用 start + #list 当游标 ——
+        -- 那是番茄的条数偏移语义，在这里会被当成极小时间戳、拉回首屏。
+        local server_cursor = tonumber(payload.nextCursor)
+        if server_cursor and server_cursor > 0 then
+            next_cursor = math.floor(server_cursor)
+        else
+            -- 镜像偶尔不给 nextCursor：退回本页最小的 createTime，方向一致。
+            local oldest = nil
+            for _, comment in ipairs(type(payload.comments) == "table" and payload.comments or {}) do
+                if type(comment) == "table" then
+                    local created = tonumber(comment.createTime)
+                    if created and created > 0 and (not oldest or created < oldest) then
+                        oldest = created
+                    end
+                end
+            end
+            if oldest then next_cursor = math.floor(oldest) end
+        end
+        local flag = payload.hasNext
+        has_more = flag == true or tonumber(flag) == 1
+        -- 游标没前进（服务端没给、也没法从 createTime 推出来）就别让调用方
+        -- 一直点：宁可如实收尾，也不要原地打转把同一页反复追加。
+        if has_more and next_cursor == (tonumber(start) or 0) then
+            has_more = false
+        end
     end
     return list, para_text, next_cursor, has_more, nil
 end
@@ -766,6 +815,7 @@ options.cursor
     续拉提示（= 上次拿到的 page.next_cursor）。只在「本地这批已经覆盖到那里」
     时才从该位置续拉，否则从本地这批的尾部接着拉，绝不交出中间缺条的列表。
     省略表示「首次打开这一段」：缓存有效就直接用缓存，不打网络。
+    值的语义按平台：番茄是条数偏移，QQ 是毫秒时间戳，七猫不用。
 options.force
     true 时忽略磁盘缓存，重新从开头拉。
 options.paragraphs
@@ -817,12 +867,20 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
         cached = readDiskCache(key, ParaComments.COMMENTS_TTL)
     end
     if cached and type(cached.list) ~= "table" then cached = nil end
+    -- QQ 的续拉位置换过语义（条数 -> 毫秒时间戳）。旧缓存里那个小整数一旦被
+    -- 当成时间戳发出去就会拉回首屏、把同一批反复追加，所以**只对 QQ** 做格式
+    -- 校验：版本不符就整个丢弃，重新从首屏拉一次。番茄 / 七猫的游标语义没变，
+    -- 旧缓存照常复用（pageInfo 也认得），不该连累它们多打一次后端。
+    if cached and platform.code == "qq"
+        and cached.cache_version ~= COMMENTS_CACHE_VERSION then
+        cached = nil
+    end
 
     -- 调用方带了 cursor = 这是「继续加载」，不能拿缓存快照糊弄它。
     local caller_continues = tonumber(options.cursor) ~= nil
-    -- 一次给全的平台（QQ / 七猫）一律走缓存：照着 cursor 再拉一次只会把同一批
-    -- 评论在尾部追加一遍。番茄则是「没带 cursor 就吃缓存」（TTL 6h，翻回同一段
-    -- 不必再打后端）。
+    -- 七猫一次给全：一律走缓存，照着 cursor 再拉一次只会把同一批评论在尾部
+    -- 追加一遍。能续拉的平台（番茄 / QQ）则是「没带 cursor 就吃缓存」
+    -- （TTL 6h，翻回同一段不必再打后端），带了 cursor 才真的去拉下一页。
     local single_shot = platformSingleShot(platform)
     if cached and (not caller_continues or single_shot) then
         return cached.list, cached.para_text, nil, pageInfo(cached, platform)
@@ -850,7 +908,8 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     local start = math.max(0, math.floor(resume))
 
     -- 从 0 开始（首次打开）就多连一页；续拉（caller 带着 cursor 来）只取一页。
-    -- 一次给全的平台（QQ / 七猫）本来就只该请求 1 次 —— 第二页拿回来的是同一批。
+    -- QQ 的续拉点是毫秒时间戳而非 0，这里同样只会取 1 页。
+    -- 七猫一次给全，本来就只该请求 1 次 —— 第二页拿回来的是同一批。
     local page_budget = (start == 0) and ParaComments.FIRST_OPEN_PAGES or 1
     if single_shot then page_budget = 1 end
 
@@ -896,6 +955,7 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     end
     cached.next_cursor = next_cursor
     cached.has_more = has_more
+    cached.cache_version = COMMENTS_CACHE_VERSION
     -- 一条都没取到就别写缓存：大概率是服务端抽风（实测出现过整个请求被拒），
     -- 写进去只会让读者在 TTL 内一直看到空。
     if #cached.list > 0 then
