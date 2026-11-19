@@ -146,7 +146,60 @@ local sha256_k = {
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
 }
 
+-- ── libcrypto 加速的 SHA-256（2026-11-20）───────────────────────────────
+-- 纯 Lua 版单次 sha256 ≈ 80µs（Sean 双机基准：20 万次 Kindle 8.3s / Kobo 16.5s）。
+-- 书山段评的 altcha PoW 迭代数方差很大（期望 ~65k 次，尾部可到 40 万），Kobo 上
+-- 整个求解 20~40s，直接撞死段评的 60s 子进程超时。KOReader 自带 libcrypto
+-- （LibreSSL/OpenSSL），ffi 直调单次 ≈1µs，把 PoW 压回 1 秒级。
+-- 加载时用 SHA256("abc") 的标准摘要自检；任何一步不成就整体禁用，
+-- sha256Binary 无缝退回下面的纯 Lua 实现 —— 行为完全一致，只差速度。
+local _crypto_SHA256, _sha256_md, _sha256_string
+do
+    local ok_ffi, ffi = pcall(require, "ffi")
+    if ok_ffi and type(ffi) == "table" then
+        local ok_cdef = pcall(ffi.cdef,
+            -- 用 const char * 声明：LuaJIT 只对 char 指针做 Lua string 自动转换；
+            -- 与 lib 里真正的 unsigned char * 形参在 ABI 上完全等价。
+            "unsigned char *SHA256(const char *d, size_t n, unsigned char *md);")
+        if ok_cdef then
+            for _, name in ipairs({ "libcrypto.so.57", "libcrypto.so.1.1", "libcrypto.so.3", "libcrypto" }) do
+                local ok_load, lib = pcall(ffi.load, name)
+                -- ⚠️ 不能用 type(lib) == "cdata" 判断：KOReader 的 luajit 上
+                -- ffi.load 返回值 type() 实测是 "userdata"（2026-11-20 Kobo 实测，
+                -- 守卫写 cdata 导致快路径在所有设备上静默失效）。直接试符号。
+                if ok_load and lib ~= nil and pcall(function() return lib.SHA256 end) then
+                    _crypto_SHA256 = lib.SHA256
+                    break
+                end
+            end
+        end
+    end
+    if _crypto_SHA256 then
+        local known = "\xba\x78\x16\xbf\x8f\x01\xcf\xea\x41\x41\x40\xde\x5d\xae\x22\x23"
+            .. "\xb0\x03\x61\xa3\x96\x17\x7a\x9c\xb4\x10\xff\x61\xf2\x00\x15\xad" -- SHA256("abc")
+        local ok_test, md = pcall(ffi.new, "unsigned char[32]")
+        -- md 同样不查 type（同上，可能是 userdata）；能 new 出来就能用。
+        if ok_test and md ~= nil then
+            local ok_call = pcall(_crypto_SHA256, "abc", 3, md)
+            if not ok_call or ffi.string(md, 32) ~= known then
+                _crypto_SHA256 = nil
+            else
+                _sha256_md = md
+                _sha256_string = ffi.string
+            end
+        else
+            _crypto_SHA256 = nil
+        end
+    end
+end
+
+local function sha256BinaryFast(value)
+    _crypto_SHA256(value, #value, _sha256_md)
+    return _sha256_string(_sha256_md, 32)
+end
+
 function Digest:sha256Binary(value)
+    if _crypto_SHA256 then return sha256BinaryFast(value) end
     local message = tostring(value or "")
     local bit_length = #message * 8
     message = message .. string.char(0x80)

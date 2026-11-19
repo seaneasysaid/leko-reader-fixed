@@ -36,6 +36,7 @@ local MemoryGuard = require("Leko/MemoryGuard")
 local ParaComments = require("Leko/ParaComments")
 local ProcessBudget = require("Leko/ProcessBudget")
 local Shushan = require("Leko/Shushan")
+local ShushanAuth = require("Leko/ShushanAuth")
 local Storage = require("Leko/Storage")
 local SubprocessPayload = require("Leko/SubprocessPayload")
 local logger = require("logger")
@@ -55,10 +56,10 @@ local AsyncParaReview = {
 }
 
 -- 同一类任务只留一个在飞（见 start）。
-local workers = { counts = nil, comments = nil }
+local workers = { counts = nil, comments = nil, auth = nil }
 
-local LANES = { counts = "background", comments = "foreground" }
-local LABELS = { counts = "段评计数", comments = "段评正文" }
+local LANES = { counts = "background", comments = "foreground", auth = "background" }
+local LABELS = { counts = "段评计数", comments = "段评正文", auth = "段评凭证" }
 
 --[[--
 计数表是 `{ [pid] = count }`，pid 从 0 起。
@@ -107,11 +108,21 @@ local function runJob(job)
     local book = job.book
     if type(book) ~= "table" then return { ok = false, error = "没有正在阅读的书籍" } end
 
+    if job.kind == "auth" then
+        -- 凭证预热：确认手上有可用 JWT，缺了就在这个子进程里完成 PoW 登录。
+        -- login() 内部会把 JWT 写进 runtime 文件（Shushan:setLoginInfo 落盘），
+        -- 父进程下次走 ShushanAuth:storedLoginInfo 就能捡回来 —— 读者点第一段
+        -- 气泡时不再付「PoW + 登录往返」这笔等待。
+        local jwt, err = ShushanAuth:jwt(source)
+        if not jwt then return { ok = false, error = tostring(err or "段评凭证获取失败") } end
+        return { ok = true, host = ParaComments.hostKey(source) }
+    end
+
     if job.kind == "counts" then
+        -- 计数从 review=on 正文的气泡里按段号取，不需要段落文本
+        -- （只有「取评论正文」才要用 paragraphs 给七猫算指纹）。
         local counts, err = ParaComments.ensureCounts(book, job.chapter_index, source,
-            -- paragraphs 只有七猫用得上（它按段落内容指纹定位，见 ParaComments）。
-            -- 它是 fork 下来的内存副本，不经过序列化，所以直接带过来即可。
-            { force = job.force, paragraphs = job.paragraphs })
+            { force = job.force })
         if type(counts) ~= "table" then
             return { ok = false, error = tostring(err or "段评计数获取失败") }
         end
@@ -250,6 +261,7 @@ end
 开始一个段评请求。
 
 kind       "counts"（本章评论计数）| "comments"（某一段的评论正文）
+           | "auth"（凭证预热：确保书山 JWT 可用，缺了就后台登录）
 job.book   当前 book 表（fork 后子进程会拿到同一份副本）
 job.source 当前书源（同上）
 job.chapter_index / job.pid / job.cursor / job.force
@@ -263,7 +275,7 @@ callback   function(ok, payload, err)。payload.counts_map（counts）或
 同一类任务重复发起时，前一个会被取消（superseded）。返回 worker 句柄。
 ]]--
 function AsyncParaReview:start(kind, job, callback)
-    if kind ~= "counts" and kind ~= "comments" then
+    if kind ~= "counts" and kind ~= "comments" and kind ~= "auth" then
         return nil, "未知的段评任务类型"
     end
     job = job or {}
@@ -445,6 +457,7 @@ end
 function AsyncParaReview:release()
     self:cancel("counts", "released")
     self:cancel("comments", "released")
+    self:cancel("auth", "released")
 end
 
 return AsyncParaReview

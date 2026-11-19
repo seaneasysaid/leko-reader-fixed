@@ -1380,8 +1380,8 @@ function Storage:getDefaultReaderStyle()
         -- The visual page transition is optional. ReaderView does not add a
         -- separate full-surface clearing pass after a page transition.
         page_transition_enabled = true,
-        -- 同章翻页动画速度（slow / normal / fast）。只改条带之间的帧间隔，
-        -- 见 Leko/ReaderView.lua 顶部的 SWIPE_SPEEDS；缺省为标准。
+        -- 同章翻页动画档位（off / fast / normal / slow），同时决定条带数与
+        -- 帧间隔，见 Leko/ReaderView.lua 顶部的 SWIPE_MODES；缺省为正常。
         page_animation_speed = "normal",
         -- Cross-chapter cleanup is deliberately opt-in: it uses several
         -- scoped UI submissions and is slower than the ordinary page swipe.

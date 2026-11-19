@@ -33,6 +33,7 @@ local Paginator = require("Leko/Paginator")
 local ParaComments = require("Leko/ParaComments")
 local ReaderMargins = require("Leko/ReaderMargins")
 local ReaderFooter = require("Leko/ReaderFooter")
+local ShushanAuth = require("Leko/ShushanAuth")
 local Storage = require("Leko/Storage")
 local TocView = require("Leko/TocView")
 local UI = require("Leko/UI")
@@ -61,30 +62,31 @@ local function loadSwipeRefresh()
     return module
 end
 
--- 翻页动画速度档位：只改「相邻两条带之间等多久」，条带数（竖屏 8 / 横屏 6）
--- 保持固定，所以快速档不会牺牲画面完整度。电子墨水来不及完成局部刷新时
--- 画面会糊，因此快速档的下限取 8 ms。
-local SWIPE_SPEEDS = {
-    slow = { label = "慢", delay = 0.030 },
-    normal = { label = "标准", delay = 0.015 },
-    fast = { label = "快", delay = 0.008 },
+-- 翻页动画四档：关 / 快 / 正常 / 慢。
+--
+-- 关键：电子墨水每画一条带就要提交一次局部刷新，一次刷新本身就要几十毫秒
+-- 并且等波形完成，所以只调「两条带之间等多久」（8~30 ms）几乎看不出来。
+-- 真正决定总时长的是**刷新的次数**，所以档位主要改条带数：快 4 条、慢 12 条，
+-- 间隔只作微调。正常档不写条带数，沿用 SwipeRefresh 的默认值（竖屏 8 /
+-- 横屏 6）—— 横竖屏的最优条带数本来就不一样，写死一个反而两边都不合适。
+local SWIPE_MODES = {
+    off = { label = "关", delay = 0 },
+    fast = { label = "快", delay = 0.006, strips = 4 },
+    normal = { label = "正常", delay = 0.012 },
+    slow = { label = "慢", delay = 0.028, strips = 12 },
 }
-local SWIPE_SPEED_ORDER = { "slow", "normal", "fast" }
+local SWIPE_MODE_ORDER = { "off", "fast", "normal", "slow" }
 
-local function normalizeSwipeSpeed(value)
-    if SWIPE_SPEEDS[value] then return value end
+local function normalizeSwipeMode(value)
+    if SWIPE_MODES[value] then return value end
     return "normal"
 end
 
-local function swipeDelayFor(value)
-    return SWIPE_SPEEDS[normalizeSwipeSpeed(value)].delay
-end
-
-local function nextSwipeSpeed(value)
-    local current = normalizeSwipeSpeed(value)
-    for index, key in ipairs(SWIPE_SPEED_ORDER) do
+local function nextSwipeMode(value)
+    local current = normalizeSwipeMode(value)
+    for index, key in ipairs(SWIPE_MODE_ORDER) do
         if key == current then
-            return SWIPE_SPEED_ORDER[index % #SWIPE_SPEED_ORDER + 1]
+            return SWIPE_MODE_ORDER[index % #SWIPE_MODE_ORDER + 1]
         end
     end
     return "normal"
@@ -109,9 +111,10 @@ function ReaderView:init()
     self._footer_dirty = true
     self.page_generation = 0
     self._pending_rebuild = nil
-    self.swipe_animation_enabled = self.style.page_transition_enabled ~= false
-    -- 同章翻页动画速度（slow / normal / fast），见文件顶部的 SWIPE_SPEEDS。
-    self.swipe_speed = normalizeSwipeSpeed(self.style.page_animation_speed)
+    -- 同章翻页动画档位（off / fast / normal / slow），见文件顶部的 SWIPE_MODES。
+    -- 老配置只有 page_transition_enabled，按它决定开/关，档位缺省为正常。
+    self.swipe_mode = (self.style.page_transition_enabled == false)
+        and "off" or normalizeSwipeMode(self.style.page_animation_speed)
     self.chapter_clean_wave_enabled = self.style.chapter_clean_wave_enabled ~= false
     -- 段评默认关闭。开启后为番茄 / 七猫 / QQ阅读章节拉取评论计数，并在段末显示 [N] 气泡。
     self.para_review_enabled = self.style.para_review_enabled == true
@@ -1056,14 +1059,31 @@ function ReaderView:_cancelSwipeRefresh()
     return self.swipe_refresh and self.swipe_refresh:cancel() or false
 end
 
+-- 翻页动画只有一个真源：self.swipe_mode（off / fast / normal / slow）。
+-- 旧代码另存一个 bool 镜像并让两者互相推导，改档位时很容易不同步。
 function ReaderView:isSwipeAnimationEnabled()
-    return self.swipe_animation_enabled ~= false
+    return self:getPageAnimationMode() ~= "off"
 end
 
-function ReaderView:setSwipeAnimationEnabled(enabled)
-    enabled = enabled == true
-    self.swipe_animation_enabled = enabled
+function ReaderView:getPageAnimationMode()
+    return normalizeSwipeMode(self.swipe_mode)
+end
+
+function ReaderView:swipeFrameDelay()
+    return SWIPE_MODES[self:getPageAnimationMode()].delay
+end
+
+-- 条带数上限；nil = 用 SwipeRefresh 的默认值（竖屏 8 / 横屏 6）。
+function ReaderView:swipeStrips()
+    return SWIPE_MODES[self:getPageAnimationMode()].strips
+end
+
+function ReaderView:setPageAnimationMode(mode)
+    mode = normalizeSwipeMode(mode)
+    local enabled = mode ~= "off"
+    self.swipe_mode = mode
     self.style.page_transition_enabled = enabled
+    self.style.page_animation_speed = mode
     Storage:saveReaderStyle(self.style)
     if not enabled and self.swipe_refresh and self.swipe_refresh:isRunning() then
         -- Disabling animation must not wait for the physical waveform.  Drop
@@ -1073,31 +1093,11 @@ function ReaderView:setSwipeAnimationEnabled(enabled)
         self._pending_rebuild = nil
         if self.page then self:rebuild("partial") end
     end
-    if not self:_refreshLayoutToggle("page_animation_toggle",
-            enabled and "动画效果：开" or "动画效果：关") then
+    local label = "翻页动画：" .. SWIPE_MODES[self:getPageAnimationMode()].label
+    if not self:_refreshLayoutToggle("page_animation_mode", label) then
         self:refreshLayoutMenu()
     end
-    return enabled
-end
-
-function ReaderView:getSwipeSpeed()
-    return normalizeSwipeSpeed(self.swipe_speed or self.style.page_animation_speed)
-end
-
-function ReaderView:swipeFrameDelay()
-    return swipeDelayFor(self:getSwipeSpeed())
-end
-
-function ReaderView:setSwipeSpeed(speed)
-    speed = normalizeSwipeSpeed(speed)
-    self.swipe_speed = speed
-    self.style.page_animation_speed = speed
-    Storage:saveReaderStyle(self.style)
-    local label = "速度：" .. SWIPE_SPEEDS[speed].label
-    if not self:_refreshLayoutToggle("page_animation_speed", label) then
-        self:refreshLayoutMenu()
-    end
-    return speed
+    return mode
 end
 
 -- 「跨章净屏」现在直接调用 KOReader 的全局刷新（整屏 full 刷新，即
@@ -1362,6 +1362,9 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
     local source = BookService:sourceFor(self.book)
     if self:_paraCountsFresh(model, source) then
         -- 这一代的计数已经在手上了：不必再打后端，直接把现成的给调用方。
+        if type(model.para_counts) == "table" and next(model.para_counts) then
+            self:preheatParaAuth(source)
+        end
         if on_ready then
             local existing = model.para_counts
             on_ready(type(existing) == "table" and existing or nil)
@@ -1371,7 +1374,7 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
     local chapter_index = page.chapter_index
     if not ParaComments.isSupported(self.book, chapter_index) then
         if interactive then
-            UIManager:show(Notification:new{ text = "本章没有段评（目前支持番茄 / 七猫 / QQ阅读）" })
+            UIManager:show(Notification:new{ text = "本章所在书源没有段评（支持番茄 / QQ阅读 / 七猫 / 书旗 / 半夏）" })
         end
         return
     end
@@ -1382,8 +1385,22 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
         return
     end
     if AsyncParaReview:isRunning("counts") then
-        -- 已经有一批在飞（同一章重复触发很常见：打开开关 + 刚进章节各一次）。
-        -- 再发一次只会让两批计数抢同一份缓存，等前一批回来就够了。
+        -- 已经有一批在飞（预取、或打开开关 + 刚进章节各触发一次）。再发一次
+        -- 只会让两批计数抢同一份缓存；但也不能直接 return —— 交互式调用方
+        -- （「本页段评」列表）的 on_ready 会永远等不到。这里等它落地再判一次：
+        -- 那时 _paraCountsFresh 已成立，直接回现成结果。
+        local attempts = (self._para_counts_wait or 0) + 1
+        if attempts > 24 then  -- 0.25s × 24 ≈ 6s 还没回：放弃，别无限排
+            self._para_counts_wait = nil
+            return
+        end
+        self._para_counts_wait = attempts
+        UIManager:scheduleIn(0.25, function()
+            if self._closing then return end
+            if not (self.page and self.page.chapter_index == chapter_index) then return end
+            self._para_counts_wait = nil
+            self:ensureParaCounts(interactive, on_ready)
+        end)
         return
     end
 
@@ -1401,9 +1418,6 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
         book = self.book,
         source = source,
         chapter_index = chapter_index,
-        -- 七猫的计数是按段落内容指纹给的，子进程要用同一份段落文本才能换算成
-        -- 段号（见 ParaComments.qmCountsByParagraph）。
-        paragraphs = model and model.paragraphs,
     }, function(ok, payload, err)
         if self._para_counts_token ~= token then return end
         self._para_counts_token = nil
@@ -1426,7 +1440,46 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
         AsyncParaReview.rememberSourceHost(source, payload.host)
 
         local counts = self:_applyParaCounts(model, payload.counts_map or {}, source)
+        if counts and next(counts) then self:preheatParaAuth(source) end
         if on_ready then on_ready(counts) end
+    end)
+end
+
+--[[--
+段评凭证后台预热。
+
+JWT 只在取评论正文时用得上，而它是子进程登录后写进 runtime 文件的 —— 不预热
+的话，读者点下第一段气泡的那一刻才开始「PoW + 登录往返」（没有 libcrypto 快
+路径的慢设备上可能要等几十秒）。这里在计数到手（说明本章真有段评可看）之后
+就悄悄把凭证备好，首点零等待。
+
+触发是廉价的：hasValidJwt 命中（绝大多数情况）只读一次内存 / 小文件就返回；
+只有真缺凭证才会 fork 子进程。10 分钟内不重复检查，失败（比如没配账号）也
+不会反复打扰。
+]]--
+function ReaderView:preheatParaAuth(source)
+    if self.para_review_enabled ~= true then return end
+    if type(source) ~= "table" then return end
+    local now = os.time()
+    if self._para_auth_checked_at and now - self._para_auth_checked_at < 600 then return end
+    self._para_auth_checked_at = now
+    if ShushanAuth:hasValidJwt(source) then return end
+    if AsyncParaReview:isRunning("auth") then return end
+    AsyncParaReview:start("auth", {
+        book = self.book,
+        source = source,
+        -- PoW 没有 ffi 快路径时（libcrypto 缺失回退纯 Lua）可能要跑几十秒，
+        -- 兜底放宽到 150s；有快路径时几秒内就回来。
+        timeout_seconds = 150,
+    }, function(ok, payload, err)
+        if self._closing then return end
+        if ok then
+            AsyncParaReview.rememberSourceHost(source, payload and payload.host)
+            logger.info("Leko para review: auth preheated")
+        else
+            -- 静默失败：多半是没配书山账号，等读者真点气泡时再给他明确提示。
+            logger.warn("Leko para review: auth preheat failed", tostring(err))
+        end
     end)
 end
 
@@ -1506,14 +1559,14 @@ function ReaderView:_paraMarkerAt(x, y)
             local dy = math.abs(cy - y)
             if near_dy == nil or dy < near_dy then near, near_dy = rect, dy end
         end
-        -- 纵向在同一行、横向在正文宽度内就算命中：宁可误开弹窗，也不要变成翻页。
-        local line_slack = math.max(near.w, Screen:scaleBySize(40))
-        local nx = near.painted_x or near.x
-        local ny = near.painted_y or near.y
-        if near_dy <= near.h / 2 + slack_y
-                and x >= nx - line_slack and x <= nx + near.w + line_slack then
+        -- 纵向落在气泡所在行就命中，横向不再设小窗口：2026-11-20 Kobo 实测，
+        -- rects 坐标可能与显示帧错位，气泡附近的小窗口照样 miss。正文区域
+        -- 即命中 —— 宁可误开弹窗，也不要让一次点气泡变成翻页。
+        if near_dy <= near.h / 2 + slack_y then
             return near.paragraph
         end
+        local nx = near.painted_x or near.x
+        local ny = near.painted_y or near.y
         logger.warn("Leko para review: bubble tap missed", tostring(x), tostring(y),
             "rects=" .. tostring(#rects),
             string.format("near=%d,%d,%dx%d", nx, ny, near.w, near.h),
@@ -1624,8 +1677,17 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
     if type(list) ~= "table" then return end
 
     local local_text = model and model.paragraphs and model.paragraphs[paragraph_index] or ""
-    -- 引文：优先用服务端回传的段落原文（拿不到就退回本地正文）。
-    local quote = Util.trim(tostring(remote_text ~= "" and remote_text or local_text))
+    -- 引文：**优先本地正文**。读者点的是屏幕上这一段，本地段落就是他眼里的
+    -- 原文，永远不会与服务端分段版本对不上；服务端回传的原文只在本地缺失
+    -- （章节模型还没就绪）时兜底。曾经反过来「服务端优先」，结果后端把 quote
+    -- 包成对象、被 tostring 成 `table: 0x…`，弹窗顶部那行引文就没了。
+    local quote = Util.trim(tostring(local_text))
+    if quote == "" then quote = Util.trim(tostring(remote_text)) end
+    if quote:match("^table: %-?0?x?%x*$") then quote = "" end
+    if quote == "" then
+        logger.warn("Leko para review: empty quote for pid", tostring(paragraph_index - 1),
+            "remote_len", tostring(#tostring(remote_text)))
+    end
 
     local items = {}
     for _, item in ipairs(list) do
@@ -1641,19 +1703,6 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
     end
     if #items == 0 then
         local known = ctx.known_count
-        -- 「平台压根没有段评正文」与「这一段真的没人评论」是两件事。前者是
-        -- 书山后端 sq / qm 的 paras 通道没数据（气泡计数来自正文接口，两条路
-        -- 不同），如果沿用「目前拿不到」这种模糊说法，读者只会反复点。
-        local page_info = payload.page
-        if page_info and page_info.unsupported then
-            local label = page_info.platform_label or "该书源"
-            local head = (known and known > 0)
-                and ("这一段在" .. label .. "有 " .. tostring(known) .. " 条段评（气泡计数），")
-                or (label .. "的段评正文目前没有数据，")
-            UIManager:show(Notification:new{ text = head
-                .. "但服务端还没接入段评正文，暂时看不到内容。" })
-            return
-        end
         UIManager:show(Notification:new{ text = (known and known > 0)
             and ("这一段共有 " .. tostring(known) .. " 条评论，目前拿不到可显示的正文。")
             or "这一段还没有评论。" })
@@ -1822,6 +1871,7 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
             {
                 page_animation_enabled = self:isSwipeAnimationEnabled(),
                 frame_delay = self:swipeFrameDelay(),
+                strips = self:swipeStrips(),
             })
         if not begin_ok then
             begin_err = tostring(started)
@@ -2359,11 +2409,8 @@ function ReaderView:makeLayoutMenuButtons()
         },
         light_row,
         {
-            { id = "page_animation_toggle", text = self:isSwipeAnimationEnabled() and "动画效果：开" or "动画效果：关", callback = function()
-                self:setSwipeAnimationEnabled(not self:isSwipeAnimationEnabled())
-            end },
-            { id = "page_animation_speed", text = "速度：" .. SWIPE_SPEEDS[self:getSwipeSpeed()].label, callback = function()
-                self:setSwipeSpeed(nextSwipeSpeed(self:getSwipeSpeed()))
+            { id = "page_animation_mode", text = "翻页动画：" .. SWIPE_MODES[self:getPageAnimationMode()].label, callback = function()
+                self:setPageAnimationMode(nextSwipeMode(self:getPageAnimationMode()))
             end },
             { id = "chapter_clean_toggle", text = self:isChapterCleanEnabled() and "跨章净屏：开" or "跨章净屏：关", callback = function()
                 self:setChapterCleanEnabled(not self:isChapterCleanEnabled())

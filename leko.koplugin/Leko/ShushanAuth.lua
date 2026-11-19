@@ -30,6 +30,8 @@ local Http = require("Leko/Http")
 local Digest = require("Leko/Digest")
 local CryptoCompat = require("Leko/CryptoCompat")
 local Shushan = require("Leko/Shushan")
+local Storage = require("Leko/Storage")
+local LuaSettings = require("luasettings")
 
 local ShushanAuth = {}
 
@@ -120,13 +122,22 @@ function ShushanAuth:solveChallenge(host)
     local prefix = text(params.keyPrefix)
     local cost = math.max(1, tonumber(params.cost) or 1)
     local key_length = math.max(1, tonumber(params.keyLength) or 32)
+    -- 前缀的十六进制串转成二进制，热循环里直接比字节：sha256 已经是 ~1µs/次
+    -- （libcrypto 直调），每轮再做一次 hex 反而变成最贵的一步。
+    local prefix_bytes = unhex(prefix)
     local counter = 0
     local derived = nil
     while counter <= ShushanAuth.MAX_COUNTER do
         local key = sha256(salt .. nonce .. u32be(counter))
         for _ = 2, cost do key = sha256(key) end
         if #key > key_length then key = key:sub(1, key_length) end
-        if hex(key):sub(1, #prefix) == prefix then
+        if prefix_bytes then
+            if key:sub(1, #prefix_bytes) == prefix_bytes then
+                derived = hex(key)
+                break
+            end
+        elseif hex(key):sub(1, #prefix) == prefix then
+            -- 前缀长度是奇数转不成二进制时，退回十六进制比较（几乎不会发生）。
             derived = hex(key)
             break
         end
@@ -218,6 +229,20 @@ function ShushanAuth:login(source)
     return nil, "段评登录失败\n" .. table.concat(errors, "\n")
 end
 
+--- 从 runtime 文件里读登录态（只读，不改 source 的其它字段）。
+-- 子进程登录后会把 login_info 写进 `<source runtime>/<id>.lua`，父进程下次
+-- fork 之前靠这里把它捡回来。
+function ShushanAuth:storedLoginInfo(source)
+    if type(source) ~= "table" or source.id == nil then return nil end
+    if type(Storage.getSourceRuntimePath) ~= "function" then return nil end
+    local ok, path = pcall(Storage.getSourceRuntimePath, Storage, source.id)
+    if not ok or type(path) ~= "string" or path == "" then return nil end
+    local opened, settings = pcall(LuaSettings.open, path)
+    if not opened or type(settings) ~= "table" then return nil end
+    local info = type(settings.data) == "table" and settings.data.login_info or nil
+    return type(info) == "table" and info or nil
+end
+
 --[[--
 Return a valid JWT, refreshing it when missing or near expiry.
 ]]--
@@ -226,10 +251,44 @@ function ShushanAuth:jwt(source, options)
     local info = Shushan:loginInfo(source)
     local jwt = trim(info[self.KEY_JWT])
     local expires = tonumber(info[self.KEY_JWT_EXP]) or 0
+    if jwt == "" and not options.force and type(source) == "table" then
+        -- 段评请求跑在子进程里：JWT 是那个子进程登录后写进 runtime 文件的，
+        -- 父进程内存里的 source.login_info 还是旧的。不补读一次磁盘，下一批
+        -- 子进程 fork 出来又要重新登录（PoW + 一次往返）—— 每点一段都登一次。
+        -- 只取 JWT 这两个键：整份 hydrate 会把父进程里更新的 Cookie / 变量
+        -- 用磁盘上的旧值盖掉。
+        local saved = self:storedLoginInfo(source)
+        if saved then
+            source.login_info = source.login_info or {}
+            source.login_info[self.KEY_JWT] = saved[self.KEY_JWT]
+            source.login_info[self.KEY_JWT_EXP] = saved[self.KEY_JWT_EXP]
+            info = source.login_info
+            jwt = trim(info[self.KEY_JWT])
+            expires = tonumber(info[self.KEY_JWT_EXP]) or 0
+        end
+    end
     if jwt ~= "" and not options.force and expires > os.time() + self.EXPIRY_SKEW then
         return jwt
     end
     return self:login(source)
+end
+
+--- 手上是否已经有可用 JWT（内存或 runtime 文件）。绝不触发登录。
+-- 预热判断用：有效就直接不打扰子进程，没有才值得起一个后台登录。
+function ShushanAuth:hasValidJwt(source)
+    if type(source) ~= "table" then return false end
+    local info = Shushan:loginInfo(source)
+    local jwt = trim(info[self.KEY_JWT])
+    local expires = tonumber(info[self.KEY_JWT_EXP]) or 0
+    if jwt == "" then
+        -- 与 jwt() 同款补读：子进程登录后写在 runtime 文件里，父进程内存没有。
+        local saved = self:storedLoginInfo(source)
+        if saved then
+            jwt = trim(saved[self.KEY_JWT])
+            expires = tonumber(saved[self.KEY_JWT_EXP]) or 0
+        end
+    end
+    return jwt ~= "" and expires > os.time() + self.EXPIRY_SKEW
 end
 
 return ShushanAuth

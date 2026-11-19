@@ -62,6 +62,7 @@ function SwipeRefresh:new(options)
         strip_index = 0,
         strip_count = 0,
         frame_delay = nil,
+        strip_override = nil,
         _on_complete = nil,
     }, self)
     instance.native_swipe = SwipeAnimation:new{
@@ -160,6 +161,7 @@ function SwipeRefresh:_invalidate()
     self.strip_index = 0
     self.strip_count = 0
     self.frame_delay = nil
+    self.strip_override = nil
     self._on_complete = nil
     self.target_framebuffer = nil
     freeBuffer(target)
@@ -252,11 +254,17 @@ function SwipeRefresh:_completeSoftware(token)
     self.strip_index = 0
     self.strip_count = 0
     self.frame_delay = nil
+    self.strip_override = nil
     freeBuffer(target)
     if type(callback) == "function" then pcall(callback, token) end
 end
 
 function SwipeRefresh:_softwareSteps(width, height)
+    -- 档位给定的条带数优先：电子墨水一次局部刷新就要几十毫秒，「刷新几次」
+    -- 才是总时长的决定因素，只改间隔几乎看不出来。
+    -- begin() 已经夹过范围（<2 会被清成 nil），这里直接信它。
+    local override = self.strip_override
+    if override then return override end
     if width > height then return LANDSCAPE_STRIPS end
     return PORTRAIT_STRIPS
 end
@@ -348,16 +356,24 @@ function SwipeRefresh:begin(widget, direction, on_complete, options)
         return nil, "页面动画已关闭"
     end
 
-    -- 帧间隔由调用方（ReaderView 的「速度」设置）给定；条带数量固定，只改
-    -- 相邻两条带之间等多久。下限 8ms 是电子墨水局部刷新的下限，再快只会糊。
+    -- 帧间隔与条带数都由调用方（ReaderView 的翻页动画档位）给定。
+    -- 间隔夹在 8~80ms：8ms 是电子墨水局部刷新的下限，再快只会糊。
     local frame_delay = tonumber(options.frame_delay)
     if not frame_delay then frame_delay = SOFTWARE_FRAME_DELAY end
     frame_delay = math.max(0.008, math.min(0.080, frame_delay))
+
+    -- 条带数由档位给定（快 4 / 慢 12；正常档不给，用竖屏 8 / 横屏 6 的默认）。
+    -- 上限 16：再多就是把一次翻页拆成几十次局部刷新；<2 视为没给。
+    local strips = tonumber(options.strips)
+    if strips then strips = math.floor(strips) end
+    if strips and strips < 2 then strips = nil end
+    if strips and strips > 16 then strips = 16 end
 
     -- _invalidate 会把 frame_delay 清空（上一次过渡的残留），所以赋值必须
     -- 放在它之后，否则下面排帧读到的永远是默认值。
     self:_invalidate()
     self.frame_delay = frame_delay
+    self.strip_override = strips
     -- The software wipe (擦除渐显) is the primary page-turn animation. The
     -- native hardware swipe is used only when the software backend cannot run.
     local use_software = self:isSoftwareSwipeAvailable()
@@ -427,6 +443,7 @@ function SwipeRefresh:settle()
     self.strip_index = 0
     self.strip_count = 0
     self.frame_delay = nil
+    self.strip_override = nil
     self:_submitTarget(target)
     if mode == "native" then
         -- The MTK backend normally consumes this one-shot flag with the
