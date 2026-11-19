@@ -61,6 +61,35 @@ local function loadSwipeRefresh()
     return module
 end
 
+-- 翻页动画速度档位：只改「相邻两条带之间等多久」，条带数（竖屏 8 / 横屏 6）
+-- 保持固定，所以快速档不会牺牲画面完整度。电子墨水来不及完成局部刷新时
+-- 画面会糊，因此快速档的下限取 8 ms。
+local SWIPE_SPEEDS = {
+    slow = { label = "慢", delay = 0.030 },
+    normal = { label = "标准", delay = 0.015 },
+    fast = { label = "快", delay = 0.008 },
+}
+local SWIPE_SPEED_ORDER = { "slow", "normal", "fast" }
+
+local function normalizeSwipeSpeed(value)
+    if SWIPE_SPEEDS[value] then return value end
+    return "normal"
+end
+
+local function swipeDelayFor(value)
+    return SWIPE_SPEEDS[normalizeSwipeSpeed(value)].delay
+end
+
+local function nextSwipeSpeed(value)
+    local current = normalizeSwipeSpeed(value)
+    for index, key in ipairs(SWIPE_SPEED_ORDER) do
+        if key == current then
+            return SWIPE_SPEED_ORDER[index % #SWIPE_SPEED_ORDER + 1]
+        end
+    end
+    return "normal"
+end
+
 local ReaderView = InputContainer:extend{
     covers_fullscreen = true,
     -- Full-screen application pages must remain non-modal.
@@ -81,6 +110,8 @@ function ReaderView:init()
     self.page_generation = 0
     self._pending_rebuild = nil
     self.swipe_animation_enabled = self.style.page_transition_enabled ~= false
+    -- 同章翻页动画速度（slow / normal / fast），见文件顶部的 SWIPE_SPEEDS。
+    self.swipe_speed = normalizeSwipeSpeed(self.style.page_animation_speed)
     self.chapter_clean_wave_enabled = self.style.chapter_clean_wave_enabled ~= false
     -- 段评默认关闭。开启后为番茄 / 七猫 / QQ阅读章节拉取评论计数，并在段末显示 [N] 气泡。
     self.para_review_enabled = self.style.para_review_enabled == true
@@ -1049,6 +1080,26 @@ function ReaderView:setSwipeAnimationEnabled(enabled)
     return enabled
 end
 
+function ReaderView:getSwipeSpeed()
+    return normalizeSwipeSpeed(self.swipe_speed or self.style.page_animation_speed)
+end
+
+function ReaderView:swipeFrameDelay()
+    return swipeDelayFor(self:getSwipeSpeed())
+end
+
+function ReaderView:setSwipeSpeed(speed)
+    speed = normalizeSwipeSpeed(speed)
+    self.swipe_speed = speed
+    self.style.page_animation_speed = speed
+    Storage:saveReaderStyle(self.style)
+    local label = "速度：" .. SWIPE_SPEEDS[speed].label
+    if not self:_refreshLayoutToggle("page_animation_speed", label) then
+        self:refreshLayoutMenu()
+    end
+    return speed
+end
+
 -- 「跨章净屏」现在直接调用 KOReader 的全局刷新（整屏 full 刷新，即
 -- Screen.refreshFull），不再由本模块播放条带波。样式键沿用历史名字，
 -- 老配置无需迁移。
@@ -1770,6 +1821,7 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
             function() self:_finishSwipeSubmission() end,
             {
                 page_animation_enabled = self:isSwipeAnimationEnabled(),
+                frame_delay = self:swipeFrameDelay(),
             })
         if not begin_ok then
             begin_err = tostring(started)
@@ -2309,6 +2361,9 @@ function ReaderView:makeLayoutMenuButtons()
         {
             { id = "page_animation_toggle", text = self:isSwipeAnimationEnabled() and "动画效果：开" or "动画效果：关", callback = function()
                 self:setSwipeAnimationEnabled(not self:isSwipeAnimationEnabled())
+            end },
+            { id = "page_animation_speed", text = "速度：" .. SWIPE_SPEEDS[self:getSwipeSpeed()].label, callback = function()
+                self:setSwipeSpeed(nextSwipeSpeed(self:getSwipeSpeed()))
             end },
             { id = "chapter_clean_toggle", text = self:isChapterCleanEnabled() and "跨章净屏：开" or "跨章净屏：关", callback = function()
                 self:setChapterCleanEnabled(not self:isChapterCleanEnabled())

@@ -61,6 +61,7 @@ function SwipeRefresh:new(options)
         mode = nil,
         strip_index = 0,
         strip_count = 0,
+        frame_delay = nil,
         _on_complete = nil,
     }, self)
     instance.native_swipe = SwipeAnimation:new{
@@ -158,6 +159,7 @@ function SwipeRefresh:_invalidate()
     self.direction = nil
     self.strip_index = 0
     self.strip_count = 0
+    self.frame_delay = nil
     self._on_complete = nil
     self.target_framebuffer = nil
     freeBuffer(target)
@@ -249,6 +251,7 @@ function SwipeRefresh:_completeSoftware(token)
     self.direction = nil
     self.strip_index = 0
     self.strip_count = 0
+    self.frame_delay = nil
     freeBuffer(target)
     if type(callback) == "function" then pcall(callback, token) end
 end
@@ -327,7 +330,7 @@ function SwipeRefresh:_runSoftwareFrame(token)
     if self.strip_index >= self.strip_count then
         self:_completeSoftware(token)
     else
-        self:_scheduleSoftwareFrame(token, SOFTWARE_FRAME_DELAY)
+        self:_scheduleSoftwareFrame(token, self.frame_delay or SOFTWARE_FRAME_DELAY)
     end
 end
 
@@ -345,7 +348,16 @@ function SwipeRefresh:begin(widget, direction, on_complete, options)
         return nil, "页面动画已关闭"
     end
 
+    -- 帧间隔由调用方（ReaderView 的「速度」设置）给定；条带数量固定，只改
+    -- 相邻两条带之间等多久。下限 8ms 是电子墨水局部刷新的下限，再快只会糊。
+    local frame_delay = tonumber(options.frame_delay)
+    if not frame_delay then frame_delay = SOFTWARE_FRAME_DELAY end
+    frame_delay = math.max(0.008, math.min(0.080, frame_delay))
+
+    -- _invalidate 会把 frame_delay 清空（上一次过渡的残留），所以赋值必须
+    -- 放在它之后，否则下面排帧读到的永远是默认值。
     self:_invalidate()
+    self.frame_delay = frame_delay
     -- The software wipe (擦除渐显) is the primary page-turn animation. The
     -- native hardware swipe is used only when the software backend cannot run.
     local use_software = self:isSoftwareSwipeAvailable()
@@ -414,6 +426,7 @@ function SwipeRefresh:settle()
     self.direction = nil
     self.strip_index = 0
     self.strip_count = 0
+    self.frame_delay = nil
     self:_submitTarget(target)
     if mode == "native" then
         -- The MTK backend normally consumes this one-shot flag with the
