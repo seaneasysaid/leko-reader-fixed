@@ -208,7 +208,7 @@ local function sourceRuntimePayload(source)
     }
 end
 
-Storage.TOC_FORMAT = 3 -- bump to invalidate cached TOCs when chapter descriptor encoding changes
+Storage.TOC_FORMAT = 4 -- bump to invalidate cached TOCs when chapter descriptor encoding changes
 -- v3 strips the runtime-only chapter fields (_raw_url duplicate, _request_base_url)
 -- on write; v2 caches still load because the fields are rehydrated from `url`.
 
@@ -1508,7 +1508,15 @@ function Storage:saveBookToc(book)
     Util.mkdirp(self:getBookDir(book.id))
     local chapters = book.chapters or {}
     local settings = LuaSettings:open(self:getBookTocPath(book.id))
-    settings.data = { chapters = stripTocTransients(chapters), updated_at = os.time() }
+    settings.data = {
+        chapters = stripTocTransients(chapters),
+        updated_at = os.time(),
+        -- Chapter descriptors embed the source's chapter identity.  When that
+        -- encoding changes (v5 -> v6 sing/item_id/content_md5), an old cache
+        -- replays identities the backend now rejects, so tag the file and drop
+        -- mismatches on load.
+        toc_format = self.TOC_FORMAT,
+    }
     settings:flush()
     book.chapter_count = #chapters
     book.toc_ready = #chapters > 0
@@ -1521,6 +1529,7 @@ function Storage:loadBookToc(book_id)
     if lfs.attributes(path, "mode") ~= "file" then return nil end
     local data = LuaSettings:open(path).data or {}
     if type(data.chapters) ~= "table" then return nil end
+    if tonumber(data.toc_format) ~= self.TOC_FORMAT then return nil end
     return hydrateTocTransients(data.chapters)
 end
 

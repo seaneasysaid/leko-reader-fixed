@@ -81,12 +81,46 @@ end
 
 function ProcessBudget:_canStart(ticket)
     if not ticket then return false end
-    if ticket.lane == "foreground" then
-        -- Foreground work is exclusive, not a third concurrent child.
-        return #self.active == 0 and self:_foregroundActiveCount() < self.foreground_capacity
+    local companions, others = 0, 0
+    for _, active in ipairs(self.active) do
+        if active.companion then companions = companions + 1 else others = others + 1 end
     end
+
+    if ticket.lane == "foreground" then
+        -- 前台仍然独占，唯一例外是「伴随」子进程（见 _companionAllowed）：
+        -- 正文在下载的同时，段评计数在另一个子进程里取，读者少等一次往返。
+        if companions > 0 and not self:_companionAllowed() then return false end
+        return others == 0 and self:_foregroundActiveCount() < self.foreground_capacity
+    end
+
+    if ticket.companion then
+        -- 伴随子进程最多一个，且必须内存宽裕；它不占用 background 名额，
+        -- 这样「与前台并行」不会把普通的后台预取挤出去。
+        if not self:_companionAllowed() then return false end
+        if companions >= 1 then return false end
+        if #self.active >= self.capacity then return false end
+        if self:_hasQueuedForeground() and self:_foregroundActiveCount() == 0 then
+            -- 前台还在排队却没开跑：让它先走，别用伴随进程去抢 fork 峰值。
+            return false
+        end
+        return true
+    end
+
     if self:_foregroundActiveCount() > 0 or self:_hasQueuedForeground() then return false end
     return #self.active < self.capacity and self:_backgroundActiveCount() < self:_backgroundLimit()
+end
+
+--[[--
+伴随子进程（段评计数）能不能和前台任务并行。
+
+Kindle 上「父进程 + 多个子进程」的 fork/COW 峰值会把框架顶重启，所以这里不放
+宽普通后台任务的规则，只对「一个短命的、纯 HTTP + 解析的伴随进程」开一个口子，
+而且必须由 MemoryGuard 确认内存确实宽裕（推荐后台 worker 数 ≥ 2）。
+内存吃紧时它退回原来的行为：排在后台，等前台结束再跑。
+]]--
+function ProcessBudget:_companionAllowed()
+    local recommended = MemoryGuard:recommendedBackgroundWorkers()
+    return (tonumber(recommended or 1) or 1) >= 2
 end
 
 function ProcessBudget:_dispatch()
@@ -148,8 +182,12 @@ function ProcessBudget:_considerPreemption(incoming)
     if incoming.lane == "foreground" then
         -- Reclaim every background child. Starting after only one is reaped would
         -- still overlap the foreground child with a mutating search child.
+        -- 伴随进程是例外：它就是设计来和前台并行的，内存宽裕时留着。
+        local keep_companion = self:_companionAllowed()
         for _, active in ipairs(self.active) do
-            if active.lane == "background" then self:_preemptTicket(active, incoming) end
+            if active.lane == "background" and not (active.companion and keep_companion) then
+                self:_preemptTicket(active, incoming)
+            end
         end
         return
     end
@@ -179,6 +217,7 @@ function ProcessBudget:request(options)
         label = tostring(options.label or "background"),
         priority = tonumber(options.priority or 0) or 0,
         lane = options.lane == "foreground" and "foreground" or "background",
+        companion = options.companion == true,
         on_start = options.on_start,
         on_preempt = options.on_preempt,
         on_error = options.on_error,

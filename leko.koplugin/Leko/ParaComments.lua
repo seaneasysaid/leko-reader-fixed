@@ -1,32 +1,35 @@
 --[[--
-段评（段落评论）数据层 —— 原生书山驱动版。
+段评（段落评论）数据层 —— 原生书山驱动版（v6 接口，2026-11-19）。
 
-支持三个平台的章节：
+支持五个平台（chapter.source 为书山给的中文源名）：
 
-  番茄小说  chapter.source 含「番茄」，参数 book_id=bookid & item_id=itemid
-  QQ阅读    chapter.source 含「QQ」，参数 book_id=bookid & chapter_id=chapterid
-  七猫小说  chapter.source 含「七猫」，参数 book_id=bookid & item_id=itemid
-            —— 七猫的 item_id / content_md5 不在章节 url 载荷的固定字段里
-            （那不是能随便加的：载荷字段集一改，已落盘目录就会解包错位），
-            但载荷里的 curl 保留了目录给的原始章节 url，从它解析。
+  番茄小说 / QQ阅读 / 七猫 / 书旗 / 半夏
+  —— 直接把 chapter.source 作为 /api/comment 的 source 参数（服务端认中文名）。
 
-接口（都由书山聚合后端提供）：
+接口（书山 v6，全部带 Bearer JWT，见 Leko/ShushanAuth.lua）：
 
-  计数（气泡）  GET {host}/para?source=<fq|qm|qq>&book_id=<bid>&chapter_id=<cid>
-                七猫另需 &content_md5=<目录给的 content md5>
-                -> {data:{total, list:[{paragraph_id, comment_count, ...}]}}
+  计数（气泡）  后端不再提供独立的段落计数接口（旧 /para 全节点 404）。
+                计数随正文一起返回：POST /api/content 带 review=on 时，
+                每一段正文末尾内嵌一个 SVG 气泡 <img>，base64 里的 <text>
+                就是该段评论数。本模块从正文解析气泡得到 {段号=评论数}。
+                —— 因此 ensureCounts 需要 options.content（本章正文 HTML/文本）；
+                若调用方没给，则用章节 url 经 Shushan:chapter 现取一次并解析。
 
-  评论正文      番茄 GET {host}/idea_comment?api=1&book_id=&item_id=&para=&cursor=0&count=&sort=1
-                -> {data:{para_src_content:"<原文段落>", data_list:[{comment:{...}}]}}
-                QQ   GET {host}/qq_comment?ajax=1&bid=&cid=&para=[&cursor=]
-                -> {comments:[{nick, replyContent, agree, createTime, ...}],
-                    hasNext, nextCursor, currentCount}
-                ⚠️ QQ 的 cursor 是**毫秒时间戳**（上一页回的 nextCursor），
-                   不是条数偏移；首屏不带 cursor。实测连翻 7 页时间严格递减。
-                七猫 GET {host}/paras/proxy_qmidea?action=paragraph_first
-                         &book_id=&item_id=&paragraph_id=<段落内容指纹>
-                -> {data:{hot_zone:{comment_list,comment_count},
-                          time_zone:{comment_list,comment_count,next_id}}}
+  评论正文      GET /api/comment?source=<中文源名>&tab=paras
+                     &book_id=<bid>&item_id=<cid>&para=<0基段号>
+                     &offset=<n>&count=20&sort=hot
+                -> {code:0, data:{items:[{id,content,user_name,likes,time,
+                    para_text,quote,replies,reply_list,segments,...}],
+                    total, has_more, next}}
+                续拉用 offset（服务端返回的 next 是下一页的 offset）。
+
+鉴权：/api/comment 需要 SPA JWT（Authorization: Bearer），JWT 由
+Leko/ShushanAuth.lua 用已存的邮箱/密码 + 可计算的 altcha PoW 自动获取并缓存
+（约 7 天有效，过期自动重登），读者无感。
+
+⚠️ 历史：v5 的 /idea_comment、/qq_comment、/paras/proxy_qmidea 在 v6 全部
+节点恒 404，已彻底废弃；QQ 的「毫秒时间戳游标」也随之成为历史 —— v6 统一
+用 offset 分页。保留下面的 pid 基准注释仅为说明段落坐标语义。
 
 `paragraph_id` 的含义分两种：
 
@@ -50,15 +53,23 @@
 ]]--
 
 local Digest = require("Leko/Digest")
+local LuaSettings = require("luasettings")
 local Shushan = require("Leko/Shushan")
+local ShushanAuth = require("Leko/ShushanAuth")
 local Storage = require("Leko/Storage")
 local Util = require("Leko/Util")
+local CryptoCompat = require("Leko/CryptoCompat")
+local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 
 local ParaComments = {}
 
--- 计数变化很慢：一小时内重复打开同一章不再请求。
-ParaComments.COUNTS_TTL = 60 * 60
+-- 计数缓存拆成两档 TTL，因为这两种「事实」的半衰期完全不同：
+--   * 有评论：评论数是慢变量，7 天内几乎不会从「有」变「没有」；
+--   * 本章确认无评论：新书 / 新章刚上架时评论是陆续冒出来的，记太久会让
+--     气泡一直不出现，所以只认 12 小时。
+ParaComments.COUNTS_TTL_HIT = 7 * 24 * 60 * 60
+ParaComments.COUNTS_TTL_EMPTY = 12 * 60 * 60
 -- 评论正文 TTL 稍长，翻回同一段不该再打一次后端。
 ParaComments.COMMENTS_TTL = 6 * 60 * 60
 -- 单次请求取多少条评论。
@@ -68,6 +79,34 @@ ParaComments.COMMENTS_TTL = 6 * 60 * 60
 -- 20 秒以上（同一台镜像时好时坏），只有 count=20 是 3/3 稳定（2–4 秒）。
 -- 所以「看到更多」不能靠调大这一页，只能靠 cursor 续拉。
 ParaComments.PAGE_SIZE = 20
+
+--[[--
+哪些平台的「段评正文」在书山 v6 后端是空的（气泡计数有、点开没有）。
+
+实测（2026-11-20，v4 镜像，真实账号）：
+  · 书旗《赤心巡天》book_id=9162887，ch1/11/504：`tab=paras` 恒定
+    `code=0, total=0, items=[], quote.text=""`；同一章 `tab=chapter` 有评论。
+  · 七猫《剑来》book_id=143170，ch0/1/2：同样恒空；`tab=chapter` 回 1092 条。
+  · 番茄《剑来，给我斩开这方天地》对照：para=0 有 68 条、para=1 有 10 条 ——
+    说明接口本身没坏，只是 sq / qm 的 paras 通道没有数据。
+
+气泡计数来自 `/api/content?review=on`（上游正文自带的 SVG 计数），和评论正文
+是两条不同的上游通路：前者通、后者没通。所以「有气泡但点开空白」不是网络问题，
+也不该让读者以为是这一段没人评论。
+
+这张表只用于**文案**（说清楚为什么拿不到），不阻止请求 —— 后端哪天真接上了，
+读者点一次就能拿到，不需要发版。
+]]--
+ParaComments.PARAS_EMPTY_PLATFORMS = {
+    -- 七猫 2026-11-20 已修：v6 的 paras 要的是段落内容指纹，不是段号
+    -- （见 fetchCommentPage），改对之后单段能回上万条。
+    -- 书旗 2026-11-20 已改走 tab=chapter + quote 匹配（见 fetchSqComments）。
+}
+
+function ParaComments.parasEmptyPlatformLabel(code)
+    if not ParaComments.PARAS_EMPTY_PLATFORMS[code] then return nil end
+    return ParaComments.platformLabel(code) or code
+end
 
 -- 首次打开时一次连拉几页。
 --
@@ -82,7 +121,10 @@ ParaComments.FIRST_OPEN_PAGES = 2
 --  升到 2：旧缓存里的 next_cursor 是 11、22 这种小整数，当时间戳发回去会被
 --  服务端当作极早的时间点、拉回首屏，于是同一批评论被反复追加。检测到版本
 --  不符就把整条缓存丢掉重新从首屏拉一次（一次性代价，TTL 6h 内只发生一次）。
-local COMMENTS_CACHE_VERSION = 2
+-- v6 换了接口与解析格式（3 家 -> 5 家、offset 游标、JWT 鉴权）。旧缓存里的
+-- 条目无法复用，升到 3 让其自然失效重拉（一次性代价）。
+-- 4：七猫改用段落指纹定位（此前按段号请求恒空，空结果也写进了缓存）。
+local COMMENTS_CACHE_VERSION = 4
 -- 段评是阅读路径上的附加请求，宁可失败也不要长时间卡住翻页。
 ParaComments.TIMEOUT = 15
 ParaComments.CACHE_KIND = "para_review"
@@ -120,23 +162,38 @@ local counts_cache = {}
 -- （第 k 段显示成第 k-1 段的评论）。别再把 pid_base 拿掉。
 local PLATFORMS = {
     {
-        code = "fq", label = "番茄",
+        code = "fq", label = "番茄", source_name = "番茄小说",
         match = "番茄",
         book_field = "bookid", chapter_field = "itemid",
         pid_base = 0,
     },
     {
-        code = "qm", label = "七猫",
+        code = "qq", label = "QQ阅读", source_name = "QQ阅读",
+        match = "QQ",
+        book_field = "bookid", chapter_field = "itemid",
+        pid_base = 0, -- v6 统一 0 基段号（见下 v6 说明）
+    },
+    {
+        code = "qm", label = "七猫", source_name = "七猫",
         match = "七猫",
         book_field = "bookid", chapter_field = "itemid",
         ids_from_curl = true,
         pid_base = 0,
+        -- v6 的 /api/comment 对七猫仍按「段落内容指纹」定位（不是段号），
+        -- 见 fetchCommentPage 里的实测说明。
+        para_mode = "fingerprint",
     },
     {
-        code = "qq", label = "QQ阅读",
-        match = "QQ",
-        book_field = "bookid", chapter_field = "chapterid",
-        pid_base = 1,
+        code = "sq", label = "书旗", source_name = "书旗",
+        match = "书旗",
+        book_field = "bookid", chapter_field = "itemid",
+        pid_base = 0,
+    },
+    {
+        code = "bx", label = "半夏", source_name = "半夏",
+        match = "半夏",
+        book_field = "bookid", chapter_field = "itemid",
+        pid_base = 0,
     },
 }
 
@@ -157,6 +214,13 @@ end
 
 local function trim(value)
     return Util.trim(text(value))
+end
+
+-- URL query 编码（source 是中文名、book_id 可能含大写，必须编码）。
+local function percent_encode(value)
+    return (text(value):gsub("[^A-Za-z0-9%-%._~]", function(char)
+        return string.format("%%%02X", string.byte(char))
+    end))
 end
 
 --[[--
@@ -350,6 +414,62 @@ local function commentsKey(book, chapter_index, host, pid)
     return cacheKey(book, chapter_index, host) .. ":" .. tostring(pid)
 end
 
+--[[--
+本章计数在磁盘上的位置：`<book_cache>/<book_id>/_pc_<item_id>.lua`。
+
+按章分文件，而不是把整本书塞进一个总表：
+
+  * 一章的计数只有几百字节，分开存就自然做到「读到第几章缓存到第几章」；
+  * 单章写坏 / 解析失败只影响那一章，不会把整本书的缓存一起拖下水；
+  * 文件名带 item_id，换书源节点（host）也不会互相覆盖——item_id 是后端
+    的章节身份，比本地章节序号稳。
+
+item_id 取不到时退回章节 url 的 hash：v5 老章节描述符里没有 item_id，
+但 url 逐字节稳定，同样能当身份用。
+]]--
+local function countsPath(book, chapter, values)
+    local item = values and Util.trim(values.itemid or "") or ""
+    if item == "" then item = Util.trim(chapter and chapter.itemid or "") end
+    if item == "" then item = Util.hashId(tostring(chapter and chapter.url or "?")) end
+    item = tostring(item):gsub("[^%w_%-]", "_")
+    local dir = Util.joinPath(Storage:getCacheDir(ParaComments.CACHE_KIND),
+        tostring(book and book.id or "?"))
+    return Util.joinPath(dir, "_pc_" .. item .. ".lua")
+end
+
+-- 读一章的计数。TTL 按内容决定（有评论 7 天 / 无评论 12 小时），所以必须
+-- 先读出来再判新旧，不能像通用缓存那样把 ttl 传进去。
+-- 计数缓存的格式版本。
+-- 2：段号改为「气泡所在段落」（旧版按第几个气泡编号，服务端只给有评论的段
+--    插气泡时整体错位 —— 书旗 228 段只有 5 个气泡，旧缓存里是 0..4）。
+-- 旧缓存直接丢弃重算，不然错位的气泡会一直留到 TTL 过期。
+local COUNTS_FORMAT = 2
+
+local function readCountsFile(path)
+    if lfs.attributes(path, "mode") ~= "file" then return nil end
+    local ok, settings = pcall(LuaSettings.open, LuaSettings, path)
+    if not ok or type(settings) ~= "table" then return nil end
+    local data = settings.data or {}
+    if tonumber(data.counts_format) ~= COUNTS_FORMAT then return nil end
+    local counts = data.counts
+    if type(counts) ~= "table" then return nil end
+    local updated = tonumber(data.updated_at) or 0
+    local ttl = next(counts) ~= nil and ParaComments.COUNTS_TTL_HIT or ParaComments.COUNTS_TTL_EMPTY
+    if updated <= 0 or os.time() - updated > ttl then return nil end
+    return counts
+end
+
+-- 只在取数成功后调用。请求失败 / 登录失败一律不落盘，下次照常重试
+-- ——把失败写成「本章 0 条」会让气泡整整 12 小时不出现。
+local function writeCountsFile(path, counts)
+    pcall(Util.mkdirp, Util.dirname(path))
+    local ok, settings = pcall(LuaSettings.open, LuaSettings, path)
+    if not ok or type(settings) ~= "table" then return false end
+    settings.data = { updated_at = os.time(), counts = counts, counts_format = COUNTS_FORMAT }
+    local saved = pcall(settings.flush, settings)
+    return saved == true
+end
+
 -- 切换书籍 / 重开阅读器 / 换服务器时丢掉内存态。磁盘缓存不受影响。
 function ParaComments.reset()
     counts_cache = {}
@@ -393,18 +513,66 @@ function ParaComments.isSupported(book, chapter_index)
     return platform ~= nil
 end
 
--- 用原生通道发一个 GET，返回 JSON 表（镜像轮换 / 登录刷新由 Shushan 负责）。
+-- 用原生通道发一个带 SPA JWT 的 GET，返回 JSON 表（镜像轮换 / 凭据刷新由
+-- Shushan 负责；JWT 获取与过期重登由 ShushanAuth 负责）。
+-- v6 段评接口需要 `Authorization: Bearer <jwt>`，所以不能直接用 Shushan 的
+-- 默认签名头 —— 这里借用它的 requestJson 走廊，在 extra headers 里加 Bearer。
 local function requestJson(source, path, validate)
     if type(Shushan.requestJson) ~= "function" then
         return nil, "原生书山驱动不可用"
     end
+    local jwt, jwt_err = ShushanAuth:jwt(source)
+    if not jwt then return nil, jwt_err or "段评登录失败" end
     local payload, host_or_err = Shushan:requestJson(source,
-        function(host) return host .. path end,
+        function(host, headers)
+            headers["Authorization"] = "Bearer " .. jwt
+            headers["Accept"] = "application/json"
+            return host .. path
+        end,
         validate,
         { timeout = ParaComments.TIMEOUT })
     if not payload then return nil, tostring(host_or_err or "请求失败") end
     local host = type(host_or_err) == "string" and host_or_err or nil
     return payload, nil, host
+end
+
+--[[--
+从 review=on 的正文里解析每段评论数。
+
+服务端在**有评论的段落**末尾追加一个 SVG 气泡 <img>，base64 里的 <text>N</text>
+就是这一段的评论数。
+
+⚠️ 段号必须按「气泡所在段落」算，不能按「第几个气泡」算。实测（2026-11-20，
+书旗《赤心巡天》ch1，228 段）服务端只插了 5 个气泡，分别落在第 20/49/62/166/201
+段；按出现顺序编号会得到 pid 0..4，气泡显示在前五个段上、点开请求的也是前五段，
+既错位又永远拿不到正文。
+
+于是这里直接用 Util.splitParagraphs 切段 —— 与 BookService 生成
+model.paragraphs 用的是同一个函数，段号天然对齐（0 基，与 Paginator /
+ReaderView 的坐标一致）。
+
+base64 前缀后必须是纯 base64 字符：SVG 模板里含 `${font}` 之类占位符，但
+那些出现在解码后的文本里，不影响 base64 段本身。
+]]--
+function ParaComments.countsFromContent(content)
+    local counts = {}
+    local body = text(content)
+    if body == "" then return counts end
+    local paragraphs = Util.splitParagraphs(body)
+    for index = 1, #paragraphs do
+        local encoded = paragraphs[index]:match("data:image/svg%+xml;base64,([A-Za-z0-9+/]+)")
+        if encoded then
+            local ok, decoded = pcall(function()
+                return CryptoCompat.base64Decode(encoded .. string.rep("=", (4 - #encoded % 4) % 4))
+            end)
+            if ok and decoded then
+                local number = text(decoded):match(">(%d+)</text>")
+                local count = tonumber(number)
+                if count and count > 0 then counts[index - 1] = count end
+            end
+        end
+    end
+    return counts
 end
 
 --[[--
@@ -420,11 +588,11 @@ end
         极小时间戳，看起来「不生效」；改成时间戳后实测连翻 7 页、createTime
         严格递减、评论 ID 无重复。现在 QQ 与番茄一样走续拉。
 
-现在只剩七猫一家续不了，对它而言「继续加载」这个语义不成立。
+v6 起 5 家平台统一走 /api/comment 的 offset 分页，全部支持续拉 ——
+这个函数恒为 false（保留是为了不改动调用它的缓存分页逻辑）。
 ]]--
 local function platformSingleShot(platform)
-    if type(platform) ~= "table" then return false end
-    return platform.code == "qm"
+    return false
 end
 
 --[[--
@@ -441,7 +609,11 @@ local function pageInfo(record, platform)
         -- 把后面的取回来。七猫一次给全：说「还有」只会让同一批被追加一遍。
         has_more = not platformSingleShot(platform)
     end
-    return { next_cursor = next_cursor, has_more = has_more == true }
+    return { next_cursor = next_cursor, has_more = has_more == true,
+        -- 服务端这个平台压根没有 paras 数据（见 PARAS_EMPTY_PLATFORMS）。
+        -- 只影响弹窗文案，不影响「继续加载」是否可点。
+        unsupported = record.unsupported == true,
+        platform_label = ParaComments.platformLabel(platform.code) }
 end
 
 local function readDiskCache(kind_key, ttl)
@@ -474,87 +646,54 @@ function ParaComments.ensureCounts(book, chapter_index, source, options)
     if not book or not source then return nil, "缺少书籍或书源" end
     local chapter = book.chapters and book.chapters[chapter_index]
     if not chapter then return nil, "章节不存在" end
-    local platform, book_id, chapter_id, extra = ParaComments.platform(chapter)
-    if not platform then return nil, "该章节所在平台没有段评（目前支持番茄 / 七猫 / QQ阅读）" end
-    if platform.ids_from_curl and trim(extra and extra.content_md5) == "" then
-        -- 计数接口要 content_md5，缺了后端会直接拒；早说比让读者等一次失败好。
-        return nil, "目录里没有这一章的 content_md5，暂时读不了七猫段评"
-    end
+    local platform = ParaComments.platform(chapter)
+    if not platform then return nil, "该章节所在平台没有段评（目前支持番茄 / QQ阅读 / 七猫 / 书旗 / 半夏）" end
 
-    -- 先定镜像再查缓存：缓存是按镜像分开存的，顺序反了就会把别的镜像的
-    -- 数据当成自己的。
     local host = ParaComments.host(source)
     local key = cacheKey(book, chapter_index, host)
     local entry = counts_cache[key]
     if entry and not options.force then return entry.counts end
 
+    -- 章节身份（item_id）既决定缓存文件名，也是后端认的章节标识，先解析一次。
+    local chapter_values = nil
+    if chapter.url then
+        local ok, action, values = pcall(Shushan.parseUrl, Shushan, chapter.url)
+        if ok and action == "chapter" and type(values) == "table" then chapter_values = values end
+    end
+    local path = countsPath(book, chapter, chapter_values)
+
     if not options.force then
-        local disk = readDiskCache("counts:" .. key, ParaComments.COUNTS_TTL)
-        if disk and type(disk.counts) == "table" then
-            counts_cache[key] = { counts = disk.counts }
-            return disk.counts
+        local disk = readCountsFile(path)
+        if disk then
+            counts_cache[key] = { counts = disk }
+            return disk
         end
     end
 
-    if platform.ids_from_curl and type(options.paragraphs) ~= "table" then
-        return nil, "缺少本章段落文本，无法把七猫段评挂回段落"
-    end
-
-    local path = "/para?source=" .. platform.code
-        .. "&book_id=" .. tostring(book_id)
-        .. "&chapter_id=" .. tostring(chapter_id)
-    if platform.ids_from_curl then
-        path = path .. "&content_md5=" .. extra.content_md5
-    end
-    local payload, err = requestJson(source, path, function(value)
-        return type(value.data) == "table" and type(value.data.list) == "table"
-    end)
-    if not payload then
-        reportFailure("counts request failed", err)
-        return nil, err
-    end
-
-    local counts = {}
-    if platform.ids_from_curl then
-        --[[--
-        七猫的 paragraph_id 是内容指纹，不是段号：先收成 `{指纹 = 计数}`，
-        再拿本地段落换算段号。
-
-        换算是 O(段数) 次纯 Lua md5（一章几百段，在子进程里跑），换来的是
-        「后端分段与本地一致」这件事不再需要假设 —— 段号对不上的两段自然
-        落空，而不会把评论整体错位挂到别的段上。
-        ]]--
-        local by_fingerprint = {}
-        for _, item in ipairs(payload.data.list) do
-            if type(item) == "table" then
-                local fingerprint = trim(item.paragraph_id)
-                local count = tonumber(item.comment_count) or 0
-                if fingerprint ~= "" and count > 0 then
-                    by_fingerprint[fingerprint] = count
-                end
-            end
+    -- v6 计数来自 review=on 的正文气泡。优先用调用方给的正文（ReaderView
+    -- 已经渲染本章时可直接传入，零额外请求）；否则经 Shushan 现取一次。
+    local content = options.content
+    if type(content) ~= "string" or content == "" then
+        if not chapter_values then return nil, "无法解析章节地址，取不到段评计数" end
+        local ok, fetched = pcall(function()
+            return Shushan:chapterWithReview(source, chapter_values, {
+                timeout = options.timeout,
+                max_hosts = options.max_hosts,
+            })
+        end)
+        if not ok or not fetched then
+            local err = (type(fetched) == "string" and fetched) or "正文（含段评气泡）获取失败"
+            reportFailure("counts content failed", err)
+            return nil, tostring(err)
         end
-        counts = ParaComments.qmCountsByParagraph(by_fingerprint, options.paragraphs)
-    else
-        for _, item in ipairs(payload.data.list) do
-            if type(item) == "table" then
-                local count = tonumber(item.comment_count) or 0
-                -- 0 条评论的段落在页面上不留标记，直接跳过。
-                if count > 0 then
-                    -- 后端基准 → 内部 0 基段号。QQ 的 pid 0 是章节标题，
-                    -- fromBackendPid 会返回 nil，这里自然被丢弃（标题评论
-                    -- 没有可挂靠的正文段落）。
-                    local pid = fromBackendPid(platform, item.paragraph_id)
-                    if pid and pid >= 0 then
-                        counts[pid] = count
-                    end
-                end
-            end
-        end
+        content = fetched
     end
 
+    local counts = ParaComments.countsFromContent(content)
     counts_cache[key] = { counts = counts }
-    writeDiskCache("counts:" .. key, { counts = counts })
+    -- 走到这里说明正文（含气泡）已经拿到了：即便 counts 是空表，那也是一条
+    -- 可信的「本章确认无评论」，按 12 小时档落盘。
+    writeCountsFile(path, counts)
     return counts
 end
 
@@ -571,33 +710,39 @@ local function sanitizeParaText(value)
     return body
 end
 
--- 番茄评论条目 -> 统一结构
-local function parseFanqieComments(payload)
+--[[--
+v6 /api/comment 的统一评论解析。
+
+响应 data.items[*] 字段（实测 2026-11-19）：
+  id, content, user_name, avatar, likes, time(unix 秒), score,
+  is_author, is_hot, is_vip, para_text, quote, location,
+  replies, replies_next, replies_has_more, reply_list, segments, badges, images
+segments 是 [{type="text"|"emoji"|"image", text/url/label...}]，纯文字阅读器
+只用 content 串即可（含 [表情] 之类的 token，由 Leko/Emoticon 解码）。
+]]--
+local function parseV6Comments(payload)
     local list = {}
-    local data = payload.data
-    for _, entry in ipairs(type(data) == "table" and data.data_list or {}) do
-        local comment = type(entry) == "table" and entry.comment or nil
-        if type(comment) == "table" then
-            local common = type(comment.common) == "table" and comment.common or {}
-            local content = type(common.content) == "table" and common.content or {}
-            local base = type(common.user_info) == "table" and common.user_info or {}
-            base = type(base.base_info) == "table" and base.base_info or {}
-            local stat = type(comment.stat) == "table" and comment.stat or {}
-            local body = trim(text(content.text))
-            -- 纯图片评论没有文字，当前是纯文字阅读器，直接跳过。
+    local data = payload and type(payload.data) == "table" and payload.data or nil
+    if not data then return list, "" end
+    for _, item in ipairs(type(data.items) == "table" and data.items or {}) do
+        if type(item) == "table" then
+            local body = trim(text(item.content))
             if body ~= "" then
-                local name = trim(text(base.user_name))
+                local name = trim(text(item.user_name))
                 list[#list + 1] = {
                     name = name ~= "" and name or "匿名",
                     text = body,
-                    likes = tonumber(stat.digg_count) or 0,
-                    author = base.is_author == true,
-                    timestamp = tonumber(common.create_timestamp) or 0,
+                    likes = tonumber(item.likes) or 0,
+                    author = item.is_author == true,
+                    timestamp = tonumber(item.time) or 0,
                 }
             end
         end
     end
-    return list, sanitizeParaText(data and data.para_src_content)
+    -- 引文：优先 quote，其次 para_text（都来自响应，用于对齐校验/展示）。
+    local para_text = sanitizeParaText(data.quote)
+    if para_text == "" then para_text = sanitizeParaText(data.para_text) end
+    return list, para_text
 end
 
 -- QQ阅读评论条目 -> 统一结构
@@ -701,109 +846,142 @@ local function fqPageUsable(payload)
 end
 
 --[[--
-按平台拉一页评论。返回 list, para_text, next_cursor, has_more, err。
+书旗（sq）的段评不在 `tab=paras` 里。
 
-paragraph_key 只有七猫用得上：它按「段落内容指纹」定位，不认段号
-（见 qmFingerprint）。番茄 / QQ 忽略它。
+实测（2026-11-20，《赤心巡天》book_id=9162887 item=2557729）：
+  · `tab=paras` 无论给段号还是段落指纹，恒定 `items=[]`；
+  · `tab=chapter` 有数据，条目自带 `quote`（该评论针对的原文）—— 整章评论与
+    段评混在同一个列表里：quote 是本段正文的才是段评，quote 是章节标题的
+    是章评；
+  · 翻页参数是 **`cursor`**（`offset` 被忽略，next 恒为 "20"，会一直返回同一页）。
+
+于是这里退化成「拉章节评论列表 → 用 quote 对齐本地段落」。翻页限量
+SQ_MAX_PAGES 页，避免为了一段评论把整章列表翻到底。
+
+代价说清楚：目标段的评论如果在热门前 N 条之外，这里拿不到；短引文（少于一
+定位阈值）一律不做包含匹配，宁缺勿错。
 ]]--
-local function fetchCommentPage(platform, book_id, chapter_id, pid, start, source, paragraph_key)
-    local path, validate, parse
-    if platform.code == "fq" then
-        path = "/idea_comment?api=1&book_id=" .. tostring(book_id)
-            .. "&item_id=" .. tostring(chapter_id)
-            .. "&para=" .. intText(pid)
-            .. "&cursor=" .. intText(start)
-            .. "&count=" .. intText(ParaComments.PAGE_SIZE)
-            .. "&sort=1"
-        validate = fqPageUsable
-        parse = parseFanqieComments
-    elseif platform.code == "qm" then
-        if type(paragraph_key) ~= "string" or paragraph_key == "" then
-            return nil, nil, nil, nil, "无法定位这一段（七猫按段落内容匹配）"
-        end
-        -- 七猫没有分页参数，一次给全（见 parseQmComments 的注释）。
-        path = "/paras/proxy_qmidea?action=paragraph_first"
-            .. "&book_id=" .. tostring(book_id)
-            .. "&item_id=" .. tostring(chapter_id)
-            .. "&paragraph_id=" .. paragraph_key
-        -- 两区都可能空（这一段确实没人评论）。只要 zone 结构在就算有效响应 ——
-        -- 否则一个正常的空结果会被当成「这台镜像不行」而白白轮换下去。
-        validate = function(value)
-            local data = value.data
-            if type(data) ~= "table" then return false end
-            return type(data.hot_zone) == "table" or type(data.time_zone) == "table"
-        end
-        parse = parseQmComments
-    else
-        -- ⚠️ `para` 用 toBackendPid 换算：QQ 的 paragraph_id 是 1 基
-        -- （pid 0 留给章节标题），直接发 0 基段号会让评论整体前移一段。
-        path = "/qq_comment?ajax=1&bid=" .. tostring(book_id)
-            .. "&cid=" .. tostring(chapter_id)
-            .. "&para=" .. toBackendPid(platform, pid)
-        -- cursor 是**毫秒时间戳**（上一页响应里的 nextCursor），不是条数偏移。
-        -- 首屏不带 cursor；续拉把它原样发回去。实测 page/count/offset 无效，
-        -- 只有 cursor 生效，而且值必须是时间戳 —— 传 20 会被当成极小时间。
-        if (tonumber(start) or 0) > 0 then
-            path = path .. "&cursor=" .. intText(start)
-        end
-        validate = function(value) return type(value.comments) == "table" end
-        parse = parseQqComments
-    end
+local SQ_MAX_PAGES = 3
 
-    local payload, err = requestJson(source, path, validate)
+local function sqQuoteMatches(quote, paragraph, paragraphs)
+    if quote == "" or paragraph == "" then return false end
+    if quote == paragraph then return true end
+    if not paragraph:find(quote, 1, true) then return false end
+    if Util.utf8Length(quote) >= 6 then return true end
+    -- 短引文（「其人」这种）：只有全章**唯一**一个段落包含它才敢认，
+    -- 否则同一句在别处出现就会把评论挂错段。
+    local hits = 0
+    for _, candidate in ipairs(paragraphs) do
+        if candidate:find(quote, 1, true) then
+            hits = hits + 1
+            if hits > 1 then return false end
+        end
+    end
+    return hits == 1
+end
+
+local function fetchSqComments(platform, book_id, chapter_id, pid, source, paragraphs)
+    local target = type(paragraphs) == "table" and paragraphs[(tonumber(pid) or 0) + 1] or ""
+    if target == "" then return nil, nil, "缺少这一段正文，无法匹配书旗段评" end
+    local validate = function(value)
+        local data = value and value.data
+        return type(data) == "table" and type(data.items) == "table"
+    end
+    local collected = {}
+    local cursor = 0
+    for _ = 1, SQ_MAX_PAGES do
+        local query = "/api/comment?source=" .. percent_encode(platform.source_name or "书旗")
+            .. "&tab=chapter"
+            .. "&book_id=" .. percent_encode(book_id)
+            .. "&item_id=" .. percent_encode(chapter_id)
+            .. "&cursor=" .. intText(cursor)
+            .. "&count=" .. intText(ParaComments.PAGE_SIZE)
+            .. "&sort=hot"
+        local payload, err = requestJson(source, query, validate)
+        if not payload then
+            if #collected == 0 then return nil, nil, err end
+            break
+        end
+        local items = (payload.data or {}).items or {}
+        for _, item in ipairs(items) do
+            if type(item) == "table" then
+                local body = trim(text(item.content))
+                local quote = trim(text(item.quote))
+                if quote == "" then quote = trim(text(item.para_text)) end
+                if body ~= "" and sqQuoteMatches(quote, target, paragraphs) then
+                    local name = trim(text(item.user_name))
+                    collected[#collected + 1] = {
+                        name = name ~= "" and name or "匿名",
+                        text = body,
+                        likes = tonumber(item.likes) or 0,
+                        author = item.is_author == true,
+                        timestamp = tonumber(item.time) or 0,
+                    }
+                end
+            end
+        end
+        local next_cursor = tonumber((payload.data or {}).next)
+        if not next_cursor or next_cursor <= cursor or #items == 0 then break end
+        cursor = next_cursor
+    end
+    return collected, target
+end
+
+--[[--
+v6：按平台拉一页评论。返回 list, para_text, next_cursor, has_more, err。
+
+统一走 /api/comment（Bearer JWT），source 用中文源名，para 用 0 基段号，
+offset 分页。next_cursor 语义变为「下一页 offset」。
+]]--
+local function fetchCommentPage(platform, book_id, chapter_id, pid, start, source, paragraphs)
+    local source_name = platform.source_name or source or "番茄小说"
+    --[[--
+    定位这一段用哪个值。
+
+    番茄 / QQ 用段号（QQ 的 1 基偏移由 toBackendPid 换算）。**七猫例外**：
+    v6 的 `para` 仍然收「段落内容指纹」（md5(去首尾空白)[:8]），不是段号 ——
+    实测 2026-11-20，《剑来》book_id=143170 item=36898237，para=0/1/2 恒定
+    total=0，换成对应段落的指纹后同一段分别回 16327 / 1363 / 652 条。
+    所以七猫必须拿本地段落现算指纹（子进程 fork 下来带着 paragraphs）。
+    ]]--
+    local para_value
+    if platform.para_mode == "fingerprint" then
+        local body = type(paragraphs) == "table"
+            and paragraphs[(tonumber(pid) or 0) + 1] or nil
+        para_value = body and ParaComments.qmFingerprint(body) or ""
+        if para_value == "" then
+            return nil, nil, nil, nil, "缺少这一段正文，无法定位七猫段评"
+        end
+    else
+        para_value = toBackendPid(platform, pid)
+    end
+    local query = "/api/comment?source=" .. percent_encode(source_name)
+        .. "&tab=paras"
+        .. "&book_id=" .. percent_encode(book_id)
+        .. "&item_id=" .. percent_encode(chapter_id)
+        .. "&para=" .. para_value
+        .. "&offset=" .. intText(start)
+        .. "&count=" .. intText(ParaComments.PAGE_SIZE)
+        .. "&sort=hot"
+    local validate = function(value)
+        local data = value and value.data
+        return type(data) == "table" and type(data.items) == "table"
+    end
+    local payload, err = requestJson(source, query, validate)
     if not payload then
         reportFailure("comments request failed", err)
         return nil, nil, nil, nil, err
     end
-
-    local list, para_text = parse(payload)
-    local next_cursor = start
-    local has_more = false
-    if platform.code == "fq" then
-        next_cursor = start + #list
-        -- 实测：游标信息在响应**顶层** common_list_info，
-        -- 而 data 里只有 { data_list, para_src_content }。
-        local info = payload.common_list_info
-        if type(info) ~= "table" then
-            info = payload.data and payload.data.common_list_info
-        end
-        if type(info) == "table" then
-            next_cursor = tonumber(info.cursor) or next_cursor
-            if info.has_more ~= nil then has_more = info.has_more == true end
-        end
-        -- 服务端没回 has_more 时按「满一页就还可能有余量」推断。空页到不了
-        -- 这里（fqPageUsable 只放行 has_more=false 的空页），所以不必特判。
-        if type(info) ~= "table" or info.has_more == nil then
-            has_more = #list >= ParaComments.PAGE_SIZE
-        end
-    elseif platform.code == "qq" then
-        -- 游标信息在响应顶层：hasNext / nextCursor / currentCount。
-        -- nextCursor 是毫秒时间戳（≈ 本页最早一条的 createTime），下一页带
-        -- cursor=<它> 就能拿到更早的评论。绝不能用 start + #list 当游标 ——
-        -- 那是番茄的条数偏移语义，在这里会被当成极小时间戳、拉回首屏。
-        local server_cursor = tonumber(payload.nextCursor)
-        if server_cursor and server_cursor > 0 then
-            next_cursor = math.floor(server_cursor)
-        else
-            -- 镜像偶尔不给 nextCursor：退回本页最小的 createTime，方向一致。
-            local oldest = nil
-            for _, comment in ipairs(type(payload.comments) == "table" and payload.comments or {}) do
-                if type(comment) == "table" then
-                    local created = tonumber(comment.createTime)
-                    if created and created > 0 and (not oldest or created < oldest) then
-                        oldest = created
-                    end
-                end
-            end
-            if oldest then next_cursor = math.floor(oldest) end
-        end
-        local flag = payload.hasNext
-        has_more = flag == true or tonumber(flag) == 1
-        -- 游标没前进（服务端没给、也没法从 createTime 推出来）就别让调用方
-        -- 一直点：宁可如实收尾，也不要原地打转把同一页反复追加。
-        if has_more and next_cursor == (tonumber(start) or 0) then
-            has_more = false
-        end
+    local list, para_text = parseV6Comments(payload)
+    local data = payload.data or {}
+    local next_cursor = tonumber(data.next)
+    if not next_cursor or next_cursor < 0 then next_cursor = start + #list end
+    next_cursor = math.floor(next_cursor)
+    local has_more = data.has_more == true
+    -- 服务端没给 has_more 时按「满一页就还可能有余量」推断；空页到此为止。
+    if data.has_more == nil then has_more = #list >= ParaComments.PAGE_SIZE end
+    if not has_more or next_cursor == (tonumber(start) or 0) then
+        has_more = false
     end
     return list, para_text, next_cursor, has_more, nil
 end
@@ -842,21 +1020,7 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     -- chapter_id（= item_id），评论接口不需要 content_md5。
     local platform, book_id, chapter_id = ParaComments.platform(chapter)
     if not platform then
-        return nil, nil, "该章节所在平台没有段评（目前支持番茄 / 七猫 / QQ阅读）"
-    end
-
-    -- 七猫按内容指纹定位这一段；没有段落文本就换不出指纹，只能如实报错。
-    local paragraph_key = ""
-    if platform.ids_from_curl then
-        local paragraphs = options.paragraphs
-        if type(paragraphs) ~= "table" then
-            return nil, nil, "缺少本章段落文本，无法定位七猫段评"
-        end
-        local index = math.floor(tonumber(pid) or 0) + 1
-        paragraph_key = ParaComments.qmFingerprint(paragraphs[index])
-        if paragraph_key == "" then
-            return nil, nil, "这一段没有可用的内容指纹，读不了七猫段评"
-        end
+        return nil, nil, "该章节所在平台没有段评（目前支持番茄 / QQ阅读 / 七猫 / 书旗 / 半夏）"
     end
 
     local host = ParaComments.host(source)
@@ -867,14 +1031,8 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
         cached = readDiskCache(key, ParaComments.COMMENTS_TTL)
     end
     if cached and type(cached.list) ~= "table" then cached = nil end
-    -- QQ 的续拉位置换过语义（条数 -> 毫秒时间戳）。旧缓存里那个小整数一旦被
-    -- 当成时间戳发出去就会拉回首屏、把同一批反复追加，所以**只对 QQ** 做格式
-    -- 校验：版本不符就整个丢弃，重新从首屏拉一次。番茄 / 七猫的游标语义没变，
-    -- 旧缓存照常复用（pageInfo 也认得），不该连累它们多打一次后端。
-    if cached and platform.code == "qq"
-        and cached.cache_version ~= COMMENTS_CACHE_VERSION then
-        cached = nil
-    end
+    -- v6 换了接口/解析/游标语义，所有平台的旧缓存都必须丢弃重拉。
+    if cached and cached.cache_version ~= COMMENTS_CACHE_VERSION then cached = nil end
 
     -- 调用方带了 cursor = 这是「继续加载」，不能拿缓存快照糊弄它。
     local caller_continues = tonumber(options.cursor) ~= nil
@@ -884,6 +1042,23 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     local single_shot = platformSingleShot(platform)
     if cached and (not caller_continues or single_shot) then
         return cached.list, cached.para_text, nil, pageInfo(cached, platform)
+    end
+
+    -- 书旗走另一条路：段评混在 tab=chapter 列表里，用 quote 标段落（详见
+    -- fetchSqComments）。它一次就把能匹配的都给全，没有 offset 续拉。
+    if platform.code == "sq" then
+        local list, para_text, err = fetchSqComments(platform, book_id, chapter_id, pid, source,
+            options.paragraphs)
+        if not list then return nil, nil, err end
+        local record = {
+            list = list,
+            para_text = tostring(para_text or ""),
+            next_cursor = #list,
+            has_more = false,
+            cache_version = COMMENTS_CACHE_VERSION,
+        }
+        if #list > 0 then writeDiskCache(key, record) end
+        return record.list, record.para_text, nil, pageInfo(record, platform)
     end
 
     --[[--
@@ -918,7 +1093,7 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     local extra_error = nil
     for page_index = 1, page_budget do
         local page_list, page_text, page_next, page_more, page_err =
-            fetchCommentPage(platform, book_id, chapter_id, pid, next_cursor, source, paragraph_key)
+            fetchCommentPage(platform, book_id, chapter_id, pid, next_cursor, source, options.paragraphs)
         if not page_list then
             -- 第一页就失败：如实报错（读者点开一段却什么都没有，必须让他
             -- 知道是取不到而不是「这一段没人评论」）。
@@ -955,10 +1130,16 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     end
     cached.next_cursor = next_cursor
     cached.has_more = has_more
+    -- 空页 + 已知无 paras 通道的平台：标记出来，让 UI 说清楚原因（见
+    -- PARAS_EMPTY_PLATFORMS）。有数据时一律不标记 —— 别把偶发的单段空页
+    -- 误判成平台不支持。
+    cached.unsupported = (#cached.list == 0)
+        and (ParaComments.PARAS_EMPTY_PLATFORMS[platform.code] == true) or false
     cached.cache_version = COMMENTS_CACHE_VERSION
     -- 一条都没取到就别写缓存：大概率是服务端抽风（实测出现过整个请求被拒），
-    -- 写进去只会让读者在 TTL 内一直看到空。
-    if #cached.list > 0 then
+    -- 写进去只会让读者在 TTL 内一直看到空。**例外**：已知平台压根没有 paras
+    -- 通道（sq / qm），那空就是稳定事实，缓存 6h 免得读者每点一段都白等一次。
+    if #cached.list > 0 or cached.unsupported then
         writeDiskCache(key, cached)
     end
     return cached.list, cached.para_text, nil, pageInfo(cached, platform)

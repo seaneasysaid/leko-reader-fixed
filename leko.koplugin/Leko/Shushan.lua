@@ -4,8 +4,21 @@
 -- and chapter retrieval inside several megabytes of obfuscated JavaScript.
 -- Running that on a Kindle/Kobo through the QuickJS bridge was the single
 -- point of failure: no WebView for the login H5, evaluation timeouts on the
--- packed jsLib, and a 6 MB realm budget.  Everything that source did can be
--- expressed as six HTTP calls, so this module does exactly that in Lua.
+-- packed jsLib, and a 6 MB realm budget.  Everything that source does can be
+-- expressed as a handful of HTTP calls, so this module does exactly that in
+-- Lua.
+--
+-- Protocol: adapted 2026-11-19 to the v6.20261119.3 source.  The old unauth'd
+-- endpoints (/login /search /catalog /content, static X-Novel-Token) were all
+-- shut down (404 on every mirror).  v6 uses:
+--   POST /api/login            -> data.token (short-lived, not a JWT)
+--   GET  /api/search           -> data.list
+--   POST /api/detail           -> data (book info)
+--   POST /api/catalog          -> data (chapters, with identity fields inline)
+--   POST /api/content          -> data.content
+-- and signs every call with five x-novel-* headers.  Responses observed in
+-- the wild are plain JSON; the JS keeps an AES-256-GCM fallback which we do
+-- not need for the paths used here.
 --
 -- Integration: `Leko/BuiltinSources.lua` owns the local `leko://shushan/...`
 -- URL scheme.  Requests for those URLs never touch the network layer of the
@@ -21,6 +34,7 @@
 
 local rapidjson = require("rapidjson")
 local logger = require("logger")
+local socket = require("socket")
 
 local Util = require("Leko/Util")
 local Http = require("Leko/Http")
@@ -29,23 +43,36 @@ local Shushan = {}
 
 Shushan.PREFIX = "leko://shushan"
 
--- Fixed protocol constants taken from the v5.53 book source itself.
-Shushan.NOVEL_TOKEN = "SHUSAN_READ_2025"
+-- Protocol constants from the v6.20261119.3 source (jsLib localVersion and
+-- buildHeaders).  `version` travels in the /api/content body; `x-novel-version`
+-- is a fixed header value and is NOT the source version.
+Shushan.SOURCE_VERSION = "6.20261119.3"
+Shushan.HEADER_VERSION = "10"
 Shushan.USER_AGENT = "Mozilla/5.0 (Linux; Android 14; 23127PN0CC) "
     .. "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-Shushan.CONTENT_VERSION = "12"
 
 -- The aggregate runs the same service behind several mirrors.  They are NOT
--- interchangeable per endpoint: v1's /search upstream was dead while v2-v4
--- answered normally, so the node list is walked per request instead of being
--- pinned once at build time.
+-- interchangeable per endpoint, so the node list is walked per request instead
+-- of being pinned once at build time.  v5 was added in the v6 source; the two
+-- IP mirrors are still listed there.
+-- 顺序 = 优先顺序。2026-11-20 用真实请求重排（GET /api/site/public ×3）：
+--   v4 0.29s · v5 0.43s · v1 0.65s · v2 1.62s · v3 2.37s ·
+--   113.44.163.166 5.46s（IP 镜像慢一个数量级，只作兜底）。
 Shushan.HOSTS = {
+    "https://v4.vossc.com",
+    "https://v5.vossc.com",
     "https://v1.vossc.com",
     "https://v2.vossc.com",
     "https://v3.vossc.com",
-    "https://v4.vossc.com",
-    "http://1.94.248.5:7001",
     "http://113.44.163.166:7001",
+}
+
+-- 已摘除的节点：`http://1.94.248.5:7001` 实测恒 502 / 10s 超时，2026-11-20
+-- 从池子里拿掉。留这份名单只为一件事：它历史上被 _rememberHost 记成过首选并
+-- 落进用户的 login_info，hostOrder 必须继续忽略这个旧值，否则每次请求又会先
+-- 白等一个超时。
+Shushan.RETIRED_HOSTS = {
+    ["http://1.94.248.5:7001"] = true,
 }
 
 Shushan.REQUEST_TIMEOUT = 20
@@ -56,15 +83,20 @@ Shushan.MAX_BYTES = 4 * 1024 * 1024
 -- used by the 检测节点 button cannot fit in that budget, so the probe gets an
 -- explicit wall-clock allowance instead of relying on per-request timeouts to
 -- add up favourably.  Keep PROBE_BUDGET comfortably below 7.
-Shushan.PROBE_BUDGET = 5
+--
+-- PROBE_TIMEOUT 是「单节点最多等多久」。实测 v3 正常时也要 2.4s、网络抖动时
+-- 3.1–3.5s，设 3s 会把活着的节点判死（表现为「明明能看却报离线」），所以留 5s。
+Shushan.PROBE_BUDGET = 6
 Shushan.PROBE_HOSTS = 2
-Shushan.PROBE_TIMEOUT = 3
+Shushan.PROBE_TIMEOUT = 5
 
 -- loginUi field names, also used as the storage keys inside source.login_info.
 Shushan.FIELD_EMAIL = "邮箱"
 Shushan.FIELD_PASSWORD = "密码"
 Shushan.FIELD_DEVICE = "设备ID"
 -- Internal runtime keys (not declared in loginUi, so the UI never shows them).
+-- v6 returns `token` from /api/login; we keep the old KEY_API slot so an
+-- existing runtime file is reused and re-login simply overwrites it.
 Shushan.KEY_API = "_api_key"
 Shushan.KEY_HOST = "_host"
 
@@ -75,13 +107,21 @@ Shushan.KEY_HOST = "_host"
 -- book is updated, and including them would mint a new book id on every update
 -- (duplicate shelf entries, lost reading progress).  They are not needed here
 -- anyway - `ruleSearch` reads them straight off the search response.
+-- v6 identity: the old `book_url` disappeared; a book is now addressed by
+-- `sing` + `book_id` (+ source/tab).  These fields are stable across searches,
+-- so packing them keeps the derived book id constant.  `word_count` and
+-- `latest_chapter_title` stay out for the same reason as before.
 local DETAIL_FIELDS = {
-    "source", "url", "name", "tab", "author", "cover", "intro", "kind",
+    "source", "sing", "bookid", "name", "tab", "author", "cover", "intro", "kind",
 }
-local CHAPTER_FIELDS = { "source", "cid", "bookid", "itemid", "url", "name", "title", "chapterid", "curl" }
+-- Chapter identity v6: the catalog supplies everything inline.  `curl`,
+-- `itemid`, `title` are kept in the descriptor because ParaComments relies on
+-- them (see Leko/ParaComments.lua chapterFields / platform).
+local CHAPTER_FIELDS = { "source", "sing", "bookid", "itemid", "md5", "index", "tab", "name", "title", "curl" }
 
 local AUTH_ERROR_NEEDLES = {
     "缺少登录凭证", "访问被拒绝", "未登录", "登录已过期", "凭证无效",
+    "缺少认证", "非法请求", "请先登录", "登录失效", "token", "Token",
 }
 local NODE_ERROR_NEEDLES = {
     "服务暂时不可用", "服务不可用", "请尝试切换服务器",
@@ -120,6 +160,14 @@ end
 
 local function crypto()
     return require("Leko/CryptoCompat")
+end
+
+-- v6 request signing: x-novel-public = md5(base64_decode(token) .. device_id .. ts).
+local function md5_hex(value)
+    local ok, Digest = pcall(require, "Leko/Digest")
+    if not ok or not Digest then return "" end
+    local fine, result = pcall(function() return Digest:md5(text(value)) end)
+    return fine and text(result) or ""
 end
 
 local function base64_encode(value)
@@ -168,21 +216,44 @@ local function pack_fields(fields, values)
     return table.concat(parts, "\n")
 end
 
-local function unpack_fields(fields, raw)
-    local values, index = {}, 1
+-- v5 packed the same idea with different field names and no book id:
+--   detail  : source, url, name, tab, author, cover, intro, kind        (8)
+--   chapter : source, cid, bookid, itemid, url, name, title, chapterid, curl (9)
+-- Shelf entries and toc caches written back then are still on devices, so
+-- decode them with the old layout when the part count matches instead of
+-- shifting every value by one (`name` used to come out as "novel").
+local DETAIL_FIELDS_V5 = {
+    "source", "sing", "name", "tab", "author", "cover", "intro", "kind",
+}
+local CHAPTER_FIELDS_V5 = {
+    "source", "cid", "bookid", "itemid", "sing", "name", "title", "chapterid", "curl",
+}
+
+local function unpack_fields(fields, raw, legacy_fields)
     local decoded = base64_decode(raw)
     if not decoded then return nil end
-    local position = 1
-    while index <= #fields do
+    local parts, position = {}, 1
+    while true do
         local stop = decoded:find("\n", position, true)
         if stop then
-            values[fields[index]] = decoded:sub(position, stop - 1)
+            parts[#parts + 1] = decoded:sub(position, stop - 1)
             position = stop + 1
         else
-            values[fields[index]] = decoded:sub(position)
-            position = #decoded + 1
+            parts[#parts + 1] = decoded:sub(position)
+            break
         end
-        index = index + 1
+    end
+    local layout = fields
+    if legacy_fields and #parts == #legacy_fields then layout = legacy_fields end
+    local values = {}
+    for index = 1, #layout do values[layout[index]] = parts[index] or "" end
+    -- Legacy layouts omit keys the rest of the driver reads unconditionally
+    -- (bookid / md5 / index / ...).  Normalise them to "" so no caller has to
+    -- nil-check a descriptor field.
+    for _, key in ipairs({ "source", "sing", "bookid", "itemid", "md5", "index",
+        "tab", "name", "title", "author", "cover", "intro", "kind", "cid",
+        "chapterid", "curl" }) do
+        if values[key] == nil then values[key] = "" end
     end
     return values
 end
@@ -241,6 +312,28 @@ end
 -- Preferred node first (runtime memory, then this process), then everything
 -- else.  A node that answers is remembered; a node that fails is simply
 -- skipped for the rest of the request.
+-- 节点质量的实测漂移很大：同一时刻 catalog v4 0.4s、v2 2.0s、v3 14.3s。
+-- 静态顺序只在「所有节点都快」时成立，所以这里按进程内实测耗时重排：
+-- 快的先试，最近一次超过 SLOW_HOST_SECONDS 的沉底（仍可兜底，只是不再挡路）。
+-- 单次会话内的学习已经足够 —— 一台设备一次开机就有几十次请求。
+Shushan.HOST_STATS = {}
+Shushan.SLOW_HOST_SECONDS = 6
+Shushan.UNKNOWN_HOST_SECONDS = 2.5
+
+function Shushan:noteHostLatency(host, seconds)
+    host = text(host):gsub("/+$", "")
+    seconds = tonumber(seconds)
+    if host == "" or not seconds or seconds <= 0 then return end
+    local entry = self.HOST_STATS[host]
+    if not entry then
+        self.HOST_STATS[host] = { avg = seconds, last = seconds, count = 1 }
+        return
+    end
+    -- 指数滑动平均：节点故障是按小时恢复的，最近几次比历史均值更有意义。
+    entry.avg = entry.avg * 0.6 + seconds * 0.4
+    entry.last, entry.count = seconds, (entry.count or 1) + 1
+end
+
 function Shushan:hostOrder(source)
     local order, seen = {}, {}
     local preferred = self:credentials(source).host
@@ -252,8 +345,28 @@ function Shushan:hostOrder(source)
             order[#order + 1] = host
         end
     end
-    push(preferred)
-    for index = 1, #self.HOSTS do push(self.HOSTS[index]) end
+    -- 退役节点即便被记成 preferred 也不插队：插队等于每次请求先白等一个超时。
+    -- 上次成功过的节点仍然第一优先（它刚刚证明了自己）。
+    if preferred ~= "" and not self.RETIRED_HOSTS[preferred] then push(preferred) end
+
+    local ranked = {}
+    for index = 1, #self.HOSTS do
+        local host = text(self.HOSTS[index]):gsub("/+$", "")
+        local entry = self.HOST_STATS[host]
+        ranked[#ranked + 1] = {
+            host = host,
+            index = index,
+            avg = entry and entry.avg or self.UNKNOWN_HOST_SECONDS,
+            slow = (entry and entry.last and entry.last >= self.SLOW_HOST_SECONDS) and 1 or 0,
+        }
+    end
+    table.sort(ranked, function(a, b)
+        if a.slow ~= b.slow then return a.slow < b.slow end
+        -- 0.5s 以内视为同档，回落到静态顺序，避免被一次抖动长期锁死。
+        if math.abs(a.avg - b.avg) > 0.5 then return a.avg < b.avg end
+        return a.index < b.index
+    end)
+    for index = 1, #ranked do push(ranked[index].host) end
     return order
 end
 
@@ -274,13 +387,40 @@ end
 -- Transport
 -- ---------------------------------------------------------------------------
 
-function Shushan:baseHeaders(api_key)
-    local headers = {
-        ["User-Agent"] = self.USER_AGENT,
-        ["X-Novel-Token"] = self.NOVEL_TOKEN,
-    }
-    api_key = trim(api_key)
-    if api_key ~= "" then headers["X-Api-Key"] = base64_encode(api_key) end
+-- v6 headers are time-sensitive: x-novel-public = md5(decoded_token .. device
+-- .. timestamp).  The token from /api/login is a base64 string; the JS decodes
+-- it back to the "plain" value before hashing, so we do the same here.  When
+-- no token is available yet (login itself) only the UA is sent.
+-- /api/login answers `data.token = base64(plain)`.  Earlier builds saved the
+-- decoded plain value (or an already-decoded token was typed in by hand); the
+-- backend then answers 40102 "Token 错误" forever because the signature is
+-- computed over atob(token).  A genuine token always decodes to printable
+-- ASCII, so that round-trip is the cheapest reliable shape check.
+function Shushan:tokenLooksSigned(value)
+    local token = trim(value)
+    if token == "" then return false end
+    local decoded = base64_decode(token)
+    if not decoded or decoded == "" then return false end
+    for index = 1, #decoded do
+        local byte = decoded:byte(index)
+        if byte < 0x20 or byte > 0x7e then return false end
+    end
+    return true
+end
+
+function Shushan:baseHeaders(source, api_key)
+    local headers = { ["User-Agent"] = self.USER_AGENT }
+    local credentials = self:credentials(source)
+    local token = trim(api_key) ~= "" and trim(api_key) or credentials.api_key
+    if token == "" then return headers end
+
+    local ts = tostring(math.floor(now_seconds()))
+    local plain = base64_decode(token) or ""
+    headers["x-novel-token"] = token
+    headers["x-novel-deviceid"] = credentials.device_id
+    headers["x-novel-timestamap"] = ts
+    headers["x-novel-public"] = md5_hex(plain .. credentials.device_id .. ts)
+    headers["x-novel-version"] = self.HEADER_VERSION
     return headers
 end
 
@@ -295,6 +435,15 @@ function Shushan:fetch(options)
         retries = 0,
         max_bytes = self.MAX_BYTES,
         accept = "application/json,text/html;q=0.9,*/*;q=0.8",
+        -- 全书目录 973 KB / 搜索结果 270 KB，gzip 后分别是 78 KB / 一小部分。
+        -- 设备 WiFi 实测：catalog 6.5s → 1.4s。只在文本接口开启，
+        -- 封面图片仍走 identity（压缩纯浪费 CPU）。
+        compress = true,
+        -- v6 reports every business/auth failure as a real HTTP 4xx *with* a
+        -- JSON body (40001 bad sing, 40102 bad token, ...).  Without this the
+        -- transport swallows the body into a prose error and we can neither
+        -- read `code` nor retry after re-login.
+        allow_http_errors = true,
     })
     if not response then return nil, text(err or "网络请求失败") end
     return response
@@ -316,71 +465,82 @@ function Shushan:requestJson(source, spec, validate, options)
         if tried >= limit then break end
         local host = hosts[index]
         tried = tried + 1
-        local headers = self:baseHeaders(api_key)
+        local headers = self:baseHeaders(source, api_key)
         local url, method, body, extra = spec(host, headers)
         if type(extra) == "table" then
             for key, value in pairs(extra) do headers[key] = value end
         end
 
+        local started = (socket and socket.gettime) and socket.gettime() or nil
         local response, err = self:fetch({
             url = url, method = method, headers = headers, body = body,
             timeout = options.timeout,
+            maxtime = options.maxtime,
         })
+        if started and socket and socket.gettime then
+            local elapsed = socket.gettime() - started
+            -- 失败也记：节点慢到超时正是最该沉底的情况。
+            if response or elapsed >= self.SLOW_HOST_SECONDS then
+                self:noteHostLatency(host, elapsed)
+            end
+        end
 
-        if response and tonumber(response.code) == 200 then
-            local payload = decode_json(response.body)
-            if not payload then
-                errors[#errors + 1] = self:hostLabel(host) .. "：响应不是 JSON"
-            else
-                local message = payload.error or payload.message or payload.msg
-                if contains_any(message, AUTH_ERROR_NEEDLES) and not refreshed then
-                    refreshed = true
-                    api_key = self:apiKey(source, { force = true })
-                    if trim(api_key) ~= "" then
-                        payload, response = self:retryOnce(source, spec, host, api_key, options)
-                    end
-                end
-                if payload and (not validate or validate(payload)) then
-                    self:_rememberHost(source, host)
-                    return payload, host
-                end
-                errors[#errors + 1] = self:hostLabel(host) .. "："
-                    .. (trim(message) ~= "" and trim(message) or "没有返回数据")
+        -- v6 answers auth failures with a real HTTP 401 *and* a JSON body
+        -- ({"code":40102,"message":"Token 错误"}).  Parsing only 200s used to
+        -- hide the auth signal, so a stale token never triggered a re-login.
+        local payload = response and decode_json(response.body) or nil
+        local http_code = response and tonumber(response.code) or 0
+        local message = payload and (payload.error or payload.message or payload.msg) or nil
+        local body_code = payload and tonumber(payload.code) or nil
+        local code_failed = body_code ~= nil and body_code ~= 0 and body_code ~= 200
+        local is_auth = (code_failed and body_code >= 40100 and body_code < 40200)
+            or contains_any(message, AUTH_ERROR_NEEDLES)
+
+        if is_auth and not refreshed then
+            refreshed = true
+            api_key = self:apiKey(source, { force = true })
+            if trim(api_key) ~= "" then
+                payload, response = self:retryOnce(source, spec, host, api_key, options)
+                http_code = response and tonumber(response.code) or 0
+                message = payload and (payload.error or payload.message or payload.msg) or message
+                body_code = payload and tonumber(payload.code) or body_code
+                code_failed = body_code ~= nil and body_code ~= 0 and body_code ~= 200
             end
+        end
+
+        if payload and not code_failed and http_code >= 200 and http_code < 300
+            and (not validate or validate(payload)) then
+            self:_rememberHost(source, host)
+            return payload, host
+        end
+
+        if payload then
+            errors[#errors + 1] = self:hostLabel(host) .. "："
+                .. (trim(message) ~= "" and trim(message)
+                    or (code_failed and ("code " .. tostring(body_code)) or ("HTTP " .. text(http_code))))
         elseif response then
-            local code = tonumber(response.code) or 0
-            -- The aggregate abuses 201/403-style codes to carry a human
-            -- readable business reason (VIP-locked, region blocked, ...).
-            -- Surface it instead of a bare "HTTP 201": every mirror will
-            -- answer the same for this book, so also stop walking the pool.
-            local reason = ""
-            local body_json = decode_json(response.body)
-            local body_text = ""
-            if type(body_json) == "table" then
-                body_text = text(body_json.error or body_json.message or body_json.msg)
-            elseif type(response.body) == "string" then
-                body_text = trim(response.body)
-            end
-            if trim(body_text) ~= "" and #body_text <= 200 then
-                reason = trim(body_text)
-            end
-            if reason ~= "" then
-                errors[#errors + 1] = self:hostLabel(host) .. "：" .. reason
-                if contains_any(reason, { "VIP", "会员", "付费", "版权", "授权" }) then break end
+            local body_text = type(response.body) == "string" and trim(response.body) or ""
+            if body_text ~= "" and #body_text <= 200 then
+                errors[#errors + 1] = self:hostLabel(host) .. "：" .. body_text
             else
-                errors[#errors + 1] = self:hostLabel(host) .. "：HTTP " .. text(code)
+                errors[#errors + 1] = self:hostLabel(host) .. "：HTTP " .. text(http_code)
             end
-            if code >= 400 and code < 500 then break end
         else
             errors[#errors + 1] = self:hostLabel(host) .. "：" .. text(err)
         end
+
+        -- Auth/business codes are identical on every mirror; walking the rest
+        -- cannot help and only burns time.  VIP/region reasons behave the same.
+        if is_auth or code_failed then break end
+        if (payload and message and contains_any(message, { "VIP", "会员", "付费", "版权", "授权" }))
+            or (http_code >= 400 and http_code < 500) then break end
     end
 
     return nil, table.concat(errors, "\n")
 end
 
 function Shushan:retryOnce(source, spec, host, api_key, options)
-    local headers = self:baseHeaders(api_key)
+    local headers = self:baseHeaders(source, api_key)
     local url, method, body, extra = spec(host, headers)
     if type(extra) == "table" then
         for key, value in pairs(extra) do headers[key] = value end
@@ -389,8 +549,13 @@ function Shushan:retryOnce(source, spec, host, api_key, options)
         url = url, method = method, headers = headers, body = body,
         timeout = options and options.timeout,
     })
-    if not response or tonumber(response.code) ~= 200 then return nil, response end
-    return decode_json(response.body), response
+    if not response then return nil, response end
+    local payload = decode_json(response.body)
+    if not payload then return nil, response end
+    local body_code = tonumber(payload.code)
+    if body_code and body_code ~= 0 and body_code ~= 200 then return nil, response end
+    if tonumber(response.code) < 200 or tonumber(response.code) >= 300 then return nil, response end
+    return payload, response
 end
 
 -- ---------------------------------------------------------------------------
@@ -408,40 +573,50 @@ function Shushan:login(source, options)
     local limit = math.min(#hosts, tonumber(options.max_hosts) or 3)
     local errors = {}
 
+    -- v6: POST /api/login with a JSON body; the token lives at data.token
+    -- (a short opaque string, NOT the JWT used by the comment web page).
+    local body = rapidjson.encode({
+        email = credentials.email,
+        password = credentials.password,
+    })
     for index = 1, limit do
         local host = hosts[index]
         local response, err = self:fetch({
-            url = host .. "/login",
+            url = host .. "/api/login",
             method = "POST",
             headers = {
                 ["User-Agent"] = self.USER_AGENT,
-                ["Content-Type"] = "application/x-www-form-urlencoded",
+                ["Content-Type"] = "application/json",
             },
-            body = "email=" .. percent_encode(credentials.email)
-                .. "&password=" .. percent_encode(credentials.password),
+            body = body,
             timeout = 15,
         })
         if not response then
             errors[#errors + 1] = self:hostLabel(host) .. "：" .. text(err)
         else
             local payload = decode_json(response.body)
-            local data = payload and payload.data
-            local user = type(data) == "table" and data.user or nil
-            local api_key = type(user) == "table" and trim(user.api_key) or ""
-            if payload and tonumber(payload.code) == 200 and api_key ~= "" then
-                local device = type(data) == "table" and type(data.device) == "table"
-                    and data.device or {}
+            local data = payload and type(payload.data) == "table" and payload.data or nil
+            local token = data and trim(data.token) or ""
+            local code = payload and tonumber(payload.code) or nil
+            if payload and code == 0 and token ~= "" and self:tokenLooksSigned(token) then
+                local group = type(data.group) == "table" and data.group or {}
+                local member = type(data.membership) == "table" and data.membership or {}
                 self._preferred = host
                 self:setLoginInfo(source, {
-                    [self.KEY_API] = api_key,
+                    [self.KEY_API] = token,
                     [self.KEY_HOST] = host,
                 })
-                return true, string.format(
-                    "登录成功\n节点：%s\n密钥：%s\n设备：%s/%s",
-                    self:hostLabel(host), self:mask(api_key),
-                    text(device.online_count or 0), text(device.device_limit or 0))
+                local group_name = trim(group.name)
+                local expires = trim(member.expires_at)
+                return true, string.format("登录成功\n节点：%s\n令牌：%s%s%s",
+                    self:hostLabel(host), self:mask(token),
+                    group_name ~= "" and ("\n群组：" .. group_name) or "",
+                    expires ~= "" and ("\n到期：" .. expires) or "")
             end
             local message = payload and (payload.message or payload.error or payload.msg)
+            if payload and code == 0 and token ~= "" then
+                message = "服务端返回的令牌格式异常（不是 base64）"
+            end
             errors[#errors + 1] = self:hostLabel(host) .. "："
                 .. (trim(message) ~= "" and trim(message) or ("HTTP " .. text(response.code)))
             -- Credential problems look the same on every mirror, so stop after
@@ -456,10 +631,16 @@ end
 function Shushan:apiKey(source, options)
     options = options or {}
     local credentials = self:credentials(source)
-    if credentials.api_key ~= "" and not options.force then return credentials.api_key end
-    if credentials.email == "" or credentials.password == "" then return "" end
+    if credentials.api_key ~= "" and not options.force then
+        -- Guard against a stale/hand-edited token that is not base64: the
+        -- backend rejects it with 40102 on every node, so trade it for a fresh
+        -- one instead of failing every request.
+        if self:tokenLooksSigned(credentials.api_key) then return credentials.api_key end
+        logger.warn("[LekoShushan] stored token is not base64, re-login")
+    end
+    if credentials.email == "" or credentials.password == "" then return credentials.api_key end
     local ok = self:login(source, { force = options.force })
-    if not ok then return "" end
+    if not ok then return self:credentials(source).api_key end
     return self:credentials(source).api_key
 end
 
@@ -468,40 +649,42 @@ function Shushan:search(source, keyword, page)
     page = tonumber(page) or 1
     if keyword == "" then return nil, "请输入搜索关键词" end
 
-    local query = "/search?login=search&key=" .. percent_encode(keyword)
-        .. "&page=" .. tostring(page) .. "&source="
+    -- v6: GET /api/search?keyword=&page=&tab=novel -> data.list[*].
+    -- The v5 `book_url` is gone; identity now comes from `sing` + `book_id`
+    -- (see DETAIL_FIELDS).  Those ids are stable across searches.
+    local query = "/api/search?keyword=" .. percent_encode(keyword)
+        .. "&page=" .. tostring(page) .. "&tab=novel"
     local payload, host_or_err = self:requestJson(source,
         function(host) return host .. query end,
         function(value)
-            return type(value.data) == "table" and #value.data > 0
+            return type(value.data) == "table" and type(value.data.list) == "table"
+                and #value.data.list > 0
         end)
 
     if not payload then return nil, host_or_err end
 
     local results = {}
-    for _, item in ipairs(payload.data or {}) do
+    for _, item in ipairs((payload.data and payload.data.list) or {}) do
         if type(item) == "table" then
             local title = trim(item.title)
             if title ~= "" then
                 local detail = pack_fields(DETAIL_FIELDS, {
-                    source = item.source, url = item.book_url, name = title,
-                    tab = item.tab, author = item.author, cover = item.cover,
-                    intro = item.desc, kind = item.tags,
+                    source = item.source, sing = item.sing, bookid = item.book_id,
+                    name = title, tab = item.tab, author = item.author,
+                    cover = item.cover, intro = item.desc, kind = item.tags,
                 })
-                local latest = trim(item.latestChapterTitle)
+                local latest = trim(item.latest_chapter_title)
                 -- 聚合源：结果行要能看出底层站点（番茄/QQ阅读/七猫……）。
-                -- 同时只保留小说 tab，漫画/短剧等其它 tab 一律不进结果。
+                -- 只保留小说 tab；漫画/短剧/听书不进结果（Leko 只读书）。
                 local tab = trim(item.tab)
-                if tab ~= "" and tab ~= "novel" then
-                    -- 非小说 tab（漫画/短剧等）不进搜索结果
-                else
+                if tab == "" or tab == "novel" then
                     results[#results + 1] = {
                         name = title,
                         author = trim(item.author),
                         intro = trim(item.desc),
                         cover = trim(item.cover),
                         kind = trim(item.tags),
-                        wordCount = trim(item.wordCount),
+                        wordCount = trim(item.word_count),
                         lastChapter = latest ~= "" and latest or "",
                         origin = trim(item.source),
                         source = trim(item.source),
@@ -518,80 +701,184 @@ function Shushan:search(source, keyword, page)
     return { results = results }
 end
 
--- One catalog call serves both the book-info step (to hand back a tocUrl) and
--- the toc step itself, because book info and toc run in different forked
--- workers and cannot share an in-process cache.
-function Shushan:requestCatalog(source, detail)
-    if trim(detail.url) == "" then return nil, "书源没有返回书籍地址" end
-    local body = rapidjson.encode({
+-- v6 splits the old single /catalog into /api/detail (book info) and
+-- /api/catalog (chapter list).  Both take the same identity body built from
+-- the search descriptor.  Book info and toc run in different forked workers
+-- and cannot share an in-process cache, so each step issues its own call.
+local function detailBody(detail)
+    return rapidjson.encode({
         source = trim(detail.source),
-        url = trim(detail.url),
-        name = trim(detail.name),
-        bookid = trim(detail.bookid),
+        sing = trim(detail.sing),
+        book_id = trim(detail.bookid),
+        title = trim(detail.name),
         tab = trim(detail.tab) ~= "" and trim(detail.tab) or "novel",
     })
-    local payload, host_or_err = self:requestJson(source,
-        function(host)
-            return host .. "/catalog", "POST", body,
-                { ["Content-Type"] = "application/json" }
-        end,
-        function(value)
-            return type(value.data) == "table" and #value.data > 0
-        end,
-        { timeout = 30, max_hosts = 4 })
-    if not payload then return nil, host_or_err end
-    return payload
+end
+
+-- `sing` is minted by /api/search: a v5-era shelf entry stores the old base64
+-- detail URL there, and even a v6 token ages out ("sing 无效或已失效").  Both
+-- conditions are terminal on every mirror, so the only cure is a fresh search
+-- for the same title, reusing the row that matches the same origin site and
+-- book id.  Cache per book so a long session pays the extra search once.
+local FRESH_SING_TTL = 1800
+local fresh_sing_cache = {}
+-- Chapter heals re-derive identity from the catalog; keep the last catalog of
+-- each book around briefly so healing several chapters is one extra call, not
+-- one per chapter.
+local fresh_catalog_cache = {}
+local FRESH_CATALOG_TTL = 300
+
+local function needsFreshSing(message)
+    message = text(message)
+    return message:find("sing 无效", 1, true) ~= nil
+        or message:find("sing 不能为空", 1, true) ~= nil
+end
+
+local function singCacheKey(detail)
+    local bookid = trim(detail.bookid)
+    if bookid ~= "" then return bookid end
+    return trim(detail.source) .. "|" .. trim(detail.name)
+end
+
+function Shushan:resolveDetail(source, detail)
+    local key = singCacheKey(detail)
+    local cached = key ~= "" and fresh_sing_cache[key] or nil
+    if cached and cached.at and (now_seconds() - cached.at) < FRESH_SING_TTL then
+        return cached.values
+    end
+
+    local name = trim(detail.name)
+    if name == "" then return nil end
+    local result = self:search(source, name, 1)
+    local rows = type(result) == "table" and result.results or {}
+    local wanted_source = trim(detail.source)
+    local wanted_bookid = trim(detail.bookid)
+    local exact, same_title
+
+    for index = 1, #rows do
+        local row = rows[index]
+        local ok, values = pcall(function() return select(2, self:parseUrl(row.bookUrl)) end)
+        if ok and type(values) == "table" and trim(values.sing) ~= "" then
+            local same_site = wanted_source == "" or trim(values.source) == wanted_source
+            if same_site and wanted_bookid ~= "" and trim(values.bookid) == wanted_bookid then
+                exact = values
+            elseif same_site and trim(values.name) == name and not same_title then
+                same_title = values
+            end
+        end
+    end
+
+    local values = exact or same_title
+    if not values then
+        logger.warn(string.format("[LekoShushan] sing refresh miss for %s (rows=%d)",
+            name, #rows))
+        return nil
+    end
+    if key ~= "" then fresh_sing_cache[key] = { values = values, at = now_seconds() } end
+    logger.info(string.format("[LekoShushan] refreshed sing for %s (%s)",
+        trim(values.name), trim(values.bookid)))
+    return values
+end
+
+function Shushan:requestDetail(source, detail)
+    if trim(detail.sing) == "" and trim(detail.bookid) == "" then
+        return nil, "书源没有返回书籍标识（sing/book_id）"
+    end
+    local function attempt(values)
+        local body = detailBody(values)
+        return self:requestJson(source,
+            function(host)
+                return host .. "/api/detail", "POST", body,
+                    { ["Content-Type"] = "application/json" }
+            end,
+            function(value) return type(value.data) == "table" end,
+            { timeout = 30, max_hosts = 4 })
+    end
+
+    local payload, err = attempt(detail)
+    if payload then return payload, nil, detail end
+    if not needsFreshSing(err) then return nil, err end
+    local fresh = self:resolveDetail(source, detail)
+    if not fresh then return nil, err end
+    payload, err = attempt(fresh)
+    if payload then return payload, nil, fresh end
+    return nil, err
+end
+
+function Shushan:requestCatalog(source, detail)
+    if trim(detail.sing) == "" and trim(detail.bookid) == "" then
+        return nil, "书源没有返回书籍标识（sing/book_id）"
+    end
+    local function attempt(values)
+        local body = detailBody(values)
+        return self:requestJson(source,
+            function(host)
+                return host .. "/api/catalog", "POST", body,
+                    { ["Content-Type"] = "application/json" }
+            end,
+            function(value)
+                return type(value.data) == "table" and #value.data > 0
+            end,
+            { timeout = 30, max_hosts = 4 })
+    end
+
+    local payload, err = attempt(detail)
+    if payload then return payload, nil, detail end
+    if not needsFreshSing(err) then return nil, err end
+    local fresh = self:resolveDetail(source, detail)
+    if not fresh then return nil, err end
+    payload, err = attempt(fresh)
+    if payload then return payload, nil, fresh end
+    return nil, err
 end
 
 function Shushan:book(source, detail)
-    local payload, err = self:requestCatalog(source, detail)
+    local payload, err, resolved = self:requestDetail(source, detail)
     if not payload then return nil, err end
+    detail = resolved or detail
+    -- The detail response carries the authoritative title/cover/desc; fall
+    -- back to the search descriptor for any field the server left blank.
+    local info = type(payload.data) == "table" and payload.data or {}
     return {
-        name = trim(detail.name),
-        author = trim(detail.author),
-        intro = trim(detail.intro),
-        cover = trim(detail.cover),
-        kind = trim(detail.kind),
+        name = trim(info.title) ~= "" and trim(info.title) or trim(detail.name),
+        author = trim(info.author) ~= "" and trim(info.author) or trim(detail.author),
+        intro = trim(info.desc) ~= "" and trim(info.desc) or trim(detail.intro),
+        cover = trim(info.cover) ~= "" and trim(info.cover) or trim(detail.cover),
+        kind = trim(info.tags) ~= "" and trim(info.tags) or trim(detail.kind),
         tocUrl = self.PREFIX .. "/toc?d=" .. base64_encode(pack_fields(DETAIL_FIELDS, detail)),
     }
 end
 
 function Shushan:toc(source, detail)
-    local payload, err = self:requestCatalog(source, detail)
+    local payload, err, resolved = self:requestCatalog(source, detail)
     if not payload then return nil, err end
+    detail = resolved or detail
 
     local source_name = trim(detail.source)
     local book_name = trim(detail.name)
-    local book_url = trim(detail.url)
-    -- The aggregate's /catalog does NOT return per-chapter request urls for
-    -- most sources; the legado source builds them client-side
-    -- (buildChapterUrl).  Replicate that here: the fields we pack determine
-    -- what chapter() will POST to /content.
-    local fanqie = source_name:find("番茄", 1, true) ~= nil
-    local bookid = book_url:match("book_id=(%d+)") or book_url:match("bookid=(%d+)") or ""
+    local bookid = trim(detail.bookid)
+    -- v6 catalog rows carry the full content identity inline:
+    --   sing / book_id / item_id / content_md5 / chapter_index / source / tab.
+    -- No more client-side URL parsing.  Volume rows are skipped.
     local chapters = {}
     for _, item in ipairs(payload.data or {}) do
-        if type(item) == "table" and item.isVolume ~= true then
-            local chapter_url = trim(item.url)
+        if type(item) == "table" and item.is_volume ~= true then
             local fields = {
-                source = source_name,
-                cid = int_text(item.cid),
-                bookid = bookid,
-                itemid = "",
-                url = book_url,
+                source = trim(item.source) ~= "" and trim(item.source) or source_name,
+                sing = trim(item.sing) ~= "" and trim(item.sing) or trim(detail.sing),
+                bookid = trim(item.book_id) ~= "" and trim(item.book_id) or bookid,
+                itemid = trim(item.item_id),
+                md5 = trim(item.content_md5),
+                index = int_text(item.chapter_index),
+                tab = trim(item.tab) ~= "" and trim(item.tab) or trim(detail.tab),
                 name = book_name,
                 title = trim(item.title),
-                chapterid = "",
-                curl = chapter_url,
+                -- curl is retained for ParaComments parity; v6 has no per-
+                -- chapter URL, so build one carrying the same identity.
+                curl = "item_id=" .. trim(item.item_id)
+                    .. "&book_id=" .. (trim(item.book_id) ~= "" and trim(item.book_id) or bookid)
+                    .. "&content_md5=" .. trim(item.content_md5),
             }
-            if fanqie then
-                fields.itemid = chapter_url:match("item_id=(%d+)") or ""
-                fields.bookid = fields.bookid ~= "" and fields.bookid
-                    or chapter_url:match("book_id=(%d+)") or ""
-            else
-                fields.bookid = chapter_url:match("book_id=(%d+)") or chapter_url:match("bookid=(%d+)") or bookid
-                fields.chapterid = chapter_url:match("chapterid=(%d+)") or chapter_url:match("chapterId=(%d+)") or ""
-            end
             local encoded = pack_fields(CHAPTER_FIELDS, fields)
             chapters[#chapters + 1] = {
                 title = trim(item.title),
@@ -604,62 +891,140 @@ function Shushan:toc(source, detail)
     return { chapters = chapters, bookid = bookid }
 end
 
--- The chapter body is plain UTF-8 text served by the aggregate; the only
--- requirement is a registered device id in X-Device-Id plus a supported
--- protocol version.
-function Shushan:chapter(source, chapter)
+-- Rebuilds a chapter identity from a fresh catalog.  Used when /api/content
+-- rejects the descriptor we hold (v5 toc cache, or an aged-out sing): the
+-- catalog row carries the current sing / item_id / content_md5 trio.
+function Shushan:rebuildChapter(source, chapter)
+    local book_name = trim(chapter.name)
+    if book_name == "" then return nil end
+
+    local detail = self:resolveDetail(source, {
+        name = book_name,
+        source = trim(chapter.source),
+        bookid = trim(chapter.bookid),
+    })
+    if not detail then
+        logger.warn("[LekoShushan] chapter heal: book not found · " .. book_name)
+        return nil
+    end
+
+    local cache_key = trim(chapter.bookid) .. "|" .. trim(chapter.source) .. "|" .. book_name
+    local cached = fresh_catalog_cache[cache_key]
+    local rows, base
+    if cached and (now_seconds() - cached.at) < FRESH_CATALOG_TTL then
+        rows, base = cached.rows, cached.base
+    else
+        local payload, err, resolved = self:requestCatalog(source, detail)
+        rows = payload and type(payload.data) == "table" and payload.data or nil
+        if not rows then
+            logger.warn("[LekoShushan] chapter heal: catalog failed · " .. book_name
+                .. " · " .. text(err))
+            return nil
+        end
+        base = resolved or detail
+        fresh_catalog_cache[cache_key] = { rows = rows, base = base, at = now_seconds() }
+    end
+    local wanted_item = trim(chapter.itemid)
+    local wanted_title = trim(chapter.title)
+    local wanted_index = tonumber(chapter.index) or tonumber(chapter.chapterid)
+    local by_item, by_title, by_index
+    for index = 1, #rows do
+        local row = rows[index]
+        if type(row) == "table" and row.is_volume ~= true then
+            if wanted_item ~= "" and trim(row.item_id) == wanted_item then
+                by_item = row
+            elseif wanted_title ~= "" and trim(row.title) == wanted_title then
+                by_title = by_title or row
+            elseif wanted_index and tonumber(row.chapter_index) == wanted_index then
+                by_index = by_index or row
+            end
+        end
+    end
+
+    local row = by_item or by_title or by_index
+    if not row then
+        logger.warn("[LekoShushan] chapter heal: no match for " .. text(wanted_title))
+        return nil
+    end
+
+    return {
+        source = trim(row.source) ~= "" and trim(row.source) or trim(base.source),
+        sing = trim(row.sing) ~= "" and trim(row.sing) or trim(base.sing),
+        bookid = trim(row.book_id) ~= "" and trim(row.book_id) or trim(base.bookid),
+        itemid = trim(row.item_id),
+        md5 = trim(row.content_md5),
+        index = int_text(row.chapter_index),
+        tab = trim(row.tab) ~= "" and trim(row.tab) or trim(base.tab),
+        name = book_name,
+        title = trim(row.title),
+    }
+end
+
+-- The chapter body is plain UTF-8 text served by the aggregate; v6 needs the
+-- catalog-supplied identity (sing/book_id/item_id/content_md5/chapter_index),
+-- a registered device id in the signed headers, and `version` = source version
+-- in the body.  The normal reader path deliberately does NOT send review=on:
+-- that embeds comment bubbles as inline SVG <img> tags.  The 段评 counts path
+-- uses chapterWithReview below to ask for those bubbles and parse the counts.
+function Shushan:fetchContent(source, chapter, with_review, options)
+    options = options or {}
     local credentials = self:credentials(source)
     if credentials.device_id == "" then
         return nil, "缺少设备ID\n请到「书源 → 书山聚合（原生）→ 配置书源」填写一本机已登记的设备ID"
     end
 
-    local source_name = trim(chapter.source)
-    -- Mirror the legado source's content request body exactly:
-    -- {cid, source, version} + per-source fields.  Extra/missing fields are
-    -- what caused 503 "版本不受支持" and empty-catalog failures before.
-    local body = {
-        cid = math.floor(tonumber(chapter.cid) or 0),
-        source = source_name,
-        version = self.CONTENT_VERSION,
-    }
-    local fanqie = source_name:find("番茄", 1, true) ~= nil
-    if fanqie then
-        body.book_id = trim(chapter.bookid)
-        if trim(chapter.itemid) ~= "" then body.item_id = trim(chapter.itemid) end
-    else
-        -- For non-fanqie sources the aggregate expects the BOOK's catalog url,
-        -- not a per-chapter url.
-        body.url = trim(chapter.url)
-        if trim(chapter.bookid) ~= "" and trim(chapter.chapterid) ~= "" then
-            body.bookid = trim(chapter.bookid)
-            body.chapterid = trim(chapter.chapterid)
+    local function attempt(values)
+        local body = {
+            sing = trim(values.sing),
+            book_id = trim(values.bookid),
+            item_id = trim(values.itemid),
+            content_md5 = trim(values.md5),
+            chapter_index = tonumber(values.index) or 0,
+            source = trim(values.source),
+            tab = trim(values.tab) ~= "" and trim(values.tab) or "novel",
+            version = self.SOURCE_VERSION,
+            devicetype = "android",
+        }
+        if with_review then
+            -- Only these platforms render 段评 bubbles server-side (v6 source
+            -- ruleContent: paraSources).  Sending review=on for others is harmless
+            -- but pointless, so only set it when the source is one of them.
+            body.review = "on"
+            body.style = "TEXT"
         end
-        if trim(chapter.curl) ~= "" and source_name == "七猫小说" then
-            body.qm_url = trim(chapter.curl)
-        end
+
+        local encoded = rapidjson.encode(body)
+        return self:requestJson(source,
+            function(host)
+                return host .. "/api/content", "POST", encoded,
+                    { ["Content-Type"] = "application/json" }
+            end,
+            function(value)
+                local data = value.data
+                local content = type(data) == "table" and text(data.content) or ""
+                if content == "" then return false end
+                -- A mirror can answer 200 with a human-readable outage notice.
+                if contains_any(content, NODE_ERROR_NEEDLES) then return false end
+                return true
+            end,
+            { timeout = tonumber(options.timeout) or 60,
+              -- 冷章节（第一次有人读）服务端要去上游抓，实测 41s 才回；
+              -- 之后同一章 3–4s。30s 的旧上限会把这类章节直接判死，
+              -- 然后白轮换到下一个节点重新等一遍。
+              maxtime = tonumber(options.maxtime) or 120,
+              max_hosts = tonumber(options.max_hosts) or 2 })
     end
 
-    local encoded = rapidjson.encode(body)
-    local payload, host_or_err = self:requestJson(source,
-        function(host)
-            return host .. "/content", "POST", encoded, {
-                ["Content-Type"] = "application/json",
-                ["X-Device-Type"] = "android",
-                ["X-Device-Id"] = credentials.device_id,
-            }
-        end,
-        function(value)
-            local data = value.data
-            local content = type(data) == "table" and text(data.content) or ""
-            if content == "" then return false end
-            -- A mirror can answer 200 with a human-readable outage notice.
-            if contains_any(content, NODE_ERROR_NEEDLES) then return false end
-            if contains_any(content, { "设备标识缺失", "设备码无效", "版本不受支持", "版本无效" }) then
-                return true
-            end
-            return true
-        end,
-        { timeout = 30, max_hosts = 3 })
+    local payload, host_or_err = attempt(chapter)
+
+    -- A chapter descriptor cached from a v5 toc (or one whose sing aged out)
+    -- cannot be replayed: /api/content answers 40001.  Re-derive the identity
+    -- from a fresh catalog and retry once, matching on item id, chapter title
+    -- and finally chapter index.
+    if not payload and needsFreshSing(host_or_err) then
+        local fresh = self:rebuildChapter(source, chapter)
+        if fresh then payload, host_or_err = attempt(fresh) end
+    end
 
     if not payload then
         local detail = text(host_or_err)
@@ -686,6 +1051,17 @@ function Shushan:chapter(source, chapter)
         return nil, content .. "\n（书山后端已升级协议版本）"
     end
     return content
+end
+
+function Shushan:chapter(source, chapter)
+    return self:fetchContent(source, chapter, false)
+end
+
+-- Raw正文 with 段评 SVG bubbles embedded (review=on).  Used only by
+-- Leko/ParaComments to recover per-paragraph comment counts; never rendered
+-- directly to the reader.
+function Shushan:chapterWithReview(source, chapter, options)
+    return self:fetchContent(source, chapter, true, options)
 end
 
 -- ---------------------------------------------------------------------------
@@ -742,8 +1118,10 @@ function Shushan:parseUrl(url)
 
     local raw = url:match("[?&]d=([^&]+)")
     if not raw then return action, {} end
-    if action == "chapter" then return action, unpack_fields(CHAPTER_FIELDS, raw) or {} end
-    return action, unpack_fields(DETAIL_FIELDS, raw) or {}
+    if action == "chapter" then
+        return action, unpack_fields(CHAPTER_FIELDS, raw, CHAPTER_FIELDS_V5) or {}
+    end
+    return action, unpack_fields(DETAIL_FIELDS, raw, DETAIL_FIELDS_V5) or {}
 end
 
 function Shushan:handle(url, source)
@@ -785,13 +1163,20 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Both the 检测节点 button and the health probe must agree on what "this mirror
--- is alive" means, so the predicate lives in one place.  A 200 alone is not
--- enough: an unrelated server answers 200 for any path, and a mirror can be up
--- while its upstream is dead (observed on v1, whose /detection answers while
--- /search returns nothing).
+-- is alive" means, so the predicate lives in one place.  In v6 the old
+-- /detection path is 404 everywhere; /api/site/public is the public, auth-free
+-- liveness endpoint and its JSON carries "书山聚合" as site_name.  A 200 alone
+-- is not enough (an unrelated server answers 200 for any path), so check body.
+Shushan.DETECTION_PATH = "/api/site/public"
+
 function Shushan:detectionOk(response)
     if not response or tonumber(response.code) ~= 200 then return false end
-    return text(response.body):find("书山", 1, true) ~= nil
+    local body = text(response.body)
+    if body:find("书山", 1, true) then return true end
+    -- Also accept a valid v6 JSON envelope (code 0) in case the site name is
+    -- ever changed by the upstream.
+    local payload = decode_json(body)
+    return type(payload) == "table" and tonumber(payload.code) == 0
 end
 
 function Shushan:checkNodes(source)
@@ -800,7 +1185,7 @@ function Shushan:checkNodes(source)
         local host = self.HOSTS[index]
         local started = now_seconds()
         local response = self:fetch({
-            url = host .. "/detection",
+            url = host .. self.DETECTION_PATH,
             headers = { ["User-Agent"] = self.USER_AGENT },
             timeout = 8,
         })
@@ -833,7 +1218,7 @@ end
 -- Health probe (called by Leko/SourceHealth:probe inside a forked worker)
 -- ---------------------------------------------------------------------------
 
--- Reports whether any mirror answers /detection right now.
+-- Reports whether any mirror answers /api/site/public right now.
 --
 -- This is deliberately NOT checkNodes: it walks at most PROBE_HOSTS mirrors
 -- within PROBE_BUDGET wall-clock seconds, and it never writes state.  The
@@ -854,7 +1239,7 @@ function Shushan:probe(source, options)
             errors[#errors + 1] = self:hostLabel(host) .. "：探测预算已用完"
             break
         end
-        local target = host .. "/detection"
+        local target = host .. self.DETECTION_PATH
         first_target = first_target or target
         local timeout = math.max(1, math.min(self.PROBE_TIMEOUT, remaining))
         local request_started = now_seconds()

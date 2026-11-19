@@ -4,10 +4,10 @@ local UIManager = require("ui/uimanager")
 local ffiutil = require("ffi/util")
 
 local LegadoSource = require("Leko/LegadoSource")
+local ParaComments = require("Leko/ParaComments")
 local ProcessBudget = require("Leko/ProcessBudget")
 local Util = require("Leko/Util")
 local SubprocessPayload = require("Leko/SubprocessPayload")
-
 local AsyncChapterPrefetch = {
     poll_interval = 0.18,
     reap_interval = 0.25,
@@ -190,15 +190,21 @@ function AsyncChapterPrefetch:start(job, callback)
         }
         local ok, err = xpcall(function()
             local last_written = 0
+            -- 子进程每写一次活动时间，父进程的「无活动超时」就重新计时。
+            -- 计数预热不走 LegadoSource，所以要自己戳一下，否则它花的几十秒
+            -- 会被父进程当成卡死，连带把已经下好的正文一起丢掉。
+            local function touchActivity()
+                local file = io.open(worker.activity_path .. ".new", "wb")
+                if not file then return end
+                file:write(string.format("%.6f", socket.gettime())); file:close()
+                os.remove(worker.activity_path)
+                os.rename(worker.activity_path .. ".new", worker.activity_path)
+            end
             local content, fetch_err = LegadoSource:getContent(source, book, chapter, {
                 on_progress = function()
                     local now = socket.gettime()
                     if now - last_written < 0.5 then return end
-                    local file = io.open(worker.activity_path .. ".new", "wb")
-                    if not file then return end
-                    file:write(string.format("%.6f", now)); file:close()
-                    os.remove(worker.activity_path)
-                    os.rename(worker.activity_path .. ".new", worker.activity_path)
+                    touchActivity()
                     last_written = now
                 end,
             })
@@ -212,6 +218,20 @@ function AsyncChapterPrefetch:start(job, callback)
                 return
             end
             result.ok = true
+            -- 段评计数预热（只有「全书缓存」会打开这个开关）：反正这个子进程
+            -- 已经在联网，顺带把本章计数写进 <cache>/para_review/<bid>/_pc_*.lua，
+            -- 之后读到这一章就是 0 请求。计数失败不影响正文，静默跳过。
+            if job.warm_counts then
+                touchActivity()
+                local warmed = pcall(function()
+                    -- 8s × 2 个镜像封顶：预热是「顺带」，不能因为一台镜像挂住
+                    -- 就吃掉全书缓存的节奏，更不能把整章逼到父进程的超时线上。
+                    ParaComments.ensureCounts(book, chapter_index, source,
+                        { timeout = 8, max_hosts = 2 })
+                end)
+                result.counts_warmed = warmed == true
+                touchActivity()
+            end
             -- Legado rules may update per-book or per-chapter variables while
             -- resolving the content URL. Return simple state to the parent.
             result.book_variables = type(book.variables) == "table" and book.variables or nil

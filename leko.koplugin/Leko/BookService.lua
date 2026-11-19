@@ -2061,6 +2061,9 @@ function BookService:_fullCacheStep(book_id, generation)
         final_path = final_path,
         priority = 2,
         label = "full-book-cache",
+        -- 全书缓存是用户主动选的「后台把书囤好」，顺带把段评计数也囤下来：
+        -- 阅读时每一章都是 0 请求（计数走磁盘缓存）。
+        warm_counts = true,
         timeout_seconds = 32,
     }, function(ok, err, completed_worker, result)
         local current = self._full_cache_states[book_id]

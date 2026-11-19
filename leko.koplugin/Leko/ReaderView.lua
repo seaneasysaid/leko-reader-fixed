@@ -1176,10 +1176,70 @@ function ReaderView:_scheduleParaCounts(page)
     if not model or self:_paraCountsFresh(model, BookService:sourceFor(self.book)) then return end
     local chapter_index = page.chapter_index
     if not ParaComments.isSupported(self.book, chapter_index) then return end
+    -- 并行预热已经把这章取回来了（那次请求与正文下载同时进行）：直接用，
+    -- 不再多开一个子进程。
+    local stash = self._para_counts_stash
+    if stash and stash[chapter_index] then
+        local counts = stash[chapter_index]
+        stash[chapter_index] = nil
+        self:_applyParaCounts(model, counts, BookService:sourceFor(self.book))
+        return
+    end
     UI.defer(self, "para_counts_" .. tostring(chapter_index), function()
         if self._closing then return end
         if not (self.page and self.page.chapter_index == chapter_index) then return end
         self:ensureParaCounts(false)
+    end)
+end
+
+--[[--
+与正文下载并行地把本章计数取回来。
+
+进入一章时正文要等一个子进程（实测约 600ms），计数又要再等一个（约 370ms）。
+把计数那个子进程提前到「正文刚开始下载」时启动，两者就重叠了 —— 代价只是
+ProcessBudget 里一个受内存闸门限制的伴随名额（Kindle 内存吃紧时自动退回串行）。
+
+这里只负责「把结果放到手边」：页面模型可能还没建好，所以先塞进 stash，
+由 _scheduleParaCounts 在页面就绪时取用；如果那时模型已在，就直接挂上去。
+]]--
+function ReaderView:_prefetchParaCounts(chapter_index)
+    if self.para_review_enabled ~= true then return end
+    chapter_index = tonumber(chapter_index)
+    if not chapter_index then return end
+    if not ParaComments.isSupported(self.book, chapter_index) then return end
+    local source = BookService:sourceFor(self.book)
+    if not source then return end
+    if AsyncParaReview:isRunning("counts") then return end
+    local stash = self._para_counts_stash
+    if not stash then
+        stash = {}
+        self._para_counts_stash = stash
+    end
+    if stash[chapter_index] ~= nil then return end
+
+    AsyncParaReview:start("counts", {
+        book = self.book,
+        source = source,
+        chapter_index = chapter_index,
+        -- 与前台章节任务并行；没有模型可传，七猫也不再需要段落指纹
+        -- （v6 计数来自正文气泡）。
+        companion = true,
+        timeout_seconds = 45,
+    }, function(ok, payload, err)
+        if self._closing then return end
+        if not ok then
+            -- 失败不算结论：不写 stash，页面就绪后照常按原路径重试一次。
+            if err then logger.warn("Leko para review prefetch failed", tostring(err)) end
+            return
+        end
+        AsyncParaReview.rememberSourceHost(source, payload.host)
+        local counts = payload.counts_map or {}
+        local page = self.page
+        if page and page.chapter_index == chapter_index and page.chapter_model then
+            self:_applyParaCounts(page.chapter_model, counts, source)
+        else
+            stash[chapter_index] = counts
+        end
     end)
 end
 
@@ -1314,30 +1374,40 @@ function ReaderView:ensureParaCounts(interactive, on_ready)
         -- _paraCountsFresh 也会永远判成过期。
         AsyncParaReview.rememberSourceHost(source, payload.host)
 
-        local counts = payload.counts_map or {}
-        -- 段落号越界说明服务端的分段与本地不一致：越界项直接丢弃，
-        -- 免得把评论挂到不存在的段上（分页器只按 pid 查表，不越界取值）。
-        local paragraph_count = #(model.paragraphs or {})
-        local dropped = 0
-        for pid in pairs(counts) do
-            if pid >= paragraph_count then
-                counts[pid] = nil
-                dropped = dropped + 1
-            end
-        end
-        if dropped > 0 then
-            logger.warn("Leko para review: dropped out-of-range pids", tostring(dropped),
-                "of", tostring(paragraph_count), "paragraphs")
-        end
-        -- 记账用「同步之后」的镜像：下次 _paraCountsFresh 是按同一个表达式算的，
-        -- 这样才天然对得上（凭据缺失时它会回落到 "auto"）。
-        model.para_counts, model.para_counts_epoch = counts, ParaComments.hostKey(source)
-        -- 章节可能在等待期间被翻走：只有它还是当前页时才重排。
-        if self.page and self.page.chapter_model == model then
-            self:reflowForParaReview()
-        end
+        local counts = self:_applyParaCounts(model, payload.counts_map or {}, source)
         if on_ready then on_ready(counts) end
     end)
+end
+
+--[[--
+把一批计数挂到章节模型上（含越界裁剪与必要的重排）。
+
+段落号越界说明服务端的分段与本地不一致：越界项直接丢弃，免得把评论挂到
+不存在的段上（分页器只按 pid 查表，不越界取值）。
+
+记账用的是「同步之后」的镜像：下次 _paraCountsFresh 按同一个表达式算，
+这样才天然对得上（凭据缺失时它会回落到 "auto"）。章节可能在等待期间被翻走：
+只有它还是当前页时才重排。
+]]--
+function ReaderView:_applyParaCounts(model, counts, source)
+    if not model then return counts end
+    local paragraph_count = #(model.paragraphs or {})
+    local dropped = 0
+    for pid in pairs(counts) do
+        if pid >= paragraph_count then
+            counts[pid] = nil
+            dropped = dropped + 1
+        end
+    end
+    if dropped > 0 then
+        logger.warn("Leko para review: dropped out-of-range pids", tostring(dropped),
+            "of", tostring(paragraph_count), "paragraphs")
+    end
+    model.para_counts, model.para_counts_epoch = counts, ParaComments.hostKey(source)
+    if self.page and self.page.chapter_model == model then
+        self:reflowForParaReview()
+    end
+    return counts
 end
 
 -- 段评气泡的坐标探针：命中区按文字宽度复算会偏出几百像素，改为让气泡在
@@ -1520,6 +1590,19 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
     end
     if #items == 0 then
         local known = ctx.known_count
+        -- 「平台压根没有段评正文」与「这一段真的没人评论」是两件事。前者是
+        -- 书山后端 sq / qm 的 paras 通道没数据（气泡计数来自正文接口，两条路
+        -- 不同），如果沿用「目前拿不到」这种模糊说法，读者只会反复点。
+        local page_info = payload.page
+        if page_info and page_info.unsupported then
+            local label = page_info.platform_label or "该书源"
+            local head = (known and known > 0)
+                and ("这一段在" .. label .. "有 " .. tostring(known) .. " 条段评（气泡计数），")
+                or (label .. "的段评正文目前没有数据，")
+            UIManager:show(Notification:new{ text = head
+                .. "但服务端还没接入段评正文，暂时看不到内容。" })
+            return
+        end
         UIManager:show(Notification:new{ text = (known and known > 0)
             and ("这一段共有 " .. tostring(known) .. " 条评论，目前拿不到可显示的正文。")
             or "这一段还没有评论。" })
@@ -1729,6 +1812,9 @@ function ReaderView:loadPage(position, refresh_type, direction, generation)
     end
     local on_disk = BookService:isChapterDownloaded(self.book, position.chapter)
     local needs_download = not on_disk and target_chapter.url
+    -- 段评计数与正文并行：正文那趟在子进程里跑的时候，让计数也在另一个
+    -- （受内存闸门限制的）伴随子进程里跑，首次开章少等一次完整往返。
+    self:_prefetchParaCounts(position.chapter)
     if needs_download then
         if type(self.onPrepareChapter) ~= "function" then
             self:_settleSwipeRefresh()

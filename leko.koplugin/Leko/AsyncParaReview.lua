@@ -279,6 +279,8 @@ function AsyncParaReview:start(kind, job, callback)
         pid = tonumber(job.pid),
         cursor = tonumber(job.cursor),
         force = job.force == true,
+        -- 与正文下载并行（只对 counts 有意义，见 Leko/ProcessBudget 的伴随通道）。
+        companion = job.companion == true,
         -- 七猫定位段落要用（见 runJob）。任务结束时会在 deliver 里清掉，
         -- 免得几百段正文一直挂在 worker 上。
         paragraphs = job.paragraphs,
@@ -344,6 +346,7 @@ function AsyncParaReview:start(kind, job, callback)
         owner = worker,
         label = LABELS[kind],
         lane = LANES[kind],
+        companion = worker.companion,
         priority = (kind == "comments") and 85 or 2,
         on_start = spawn,
         on_preempt = function() self:cancel(kind, "preempted") end,

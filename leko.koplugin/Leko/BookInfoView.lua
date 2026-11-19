@@ -110,6 +110,16 @@ function BookInfoView:init()
     end)
     self:rebuild()
     UI.defer(self, "load_book_cover", function() self:loadCover() end)
+    -- 详情页是「点书架 → 点继续阅读」之间唯一天然的空闲窗口。
+    -- 在这里就把进度所在章丢进后台预取队列：冷章节服务端要 40s 才回，
+    -- 用户在详情页停留的这段时间正好把它跑掉，进阅读器时直接命中磁盘缓存。
+    -- 没有目录（搜索结果预览）时 requestPrefetch 自己会返回 nil。
+    UI.defer(self, "prefetch_current_chapter", function()
+        if self._closing or not self.book then return end
+        if type(self.book.chapters) ~= "table" or #self.book.chapters == 0 then return end
+        local index = (self.book.position and tonumber(self.book.position.chapter)) or 1
+        BookService:requestPrefetch(self.book, index, 1, 0)
+    end)
 end
 
 function BookInfoView:_coverCandidate()
