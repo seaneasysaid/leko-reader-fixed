@@ -24,6 +24,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Screen = Device.screen
 
+local AsyncImageFetch = require("Leko/AsyncImageFetch")
 local AsyncParaReview = require("Leko/AsyncParaReview")
 local BookService = require("Leko/BookService")
 local FontSelectionView = require("Leko/FontSelectionView")
@@ -1536,10 +1537,12 @@ function ReaderView:_paraMarkerAt(x, y)
     if self.swipe_refresh and self.swipe_refresh:isRunning() then return nil end
     local rects = self._para_hit_rects
     if type(rects) ~= "table" then return nil end
-    -- 气泡只有一行高、几十像素宽，手指落点比它大得多，两向都留余量。
-    -- 每个 rect 只对应一段的最后一行，命中邻行返回同一段落，无副作用。
-    local slack_x = math.max(Screen:scaleBySize(18), 0)
-    local slack_y = math.max(Screen:scaleBySize(24), 0)
+    -- 气泡只有一行高、几十像素宽，手指落点比它大，两向都留小余量。
+    -- 2026-11-23 Sean 要求收紧命中：真正的「点不开」根因是 ffi 守卫失效导致
+    -- PoW 超时（已修），不是命中区错位，所以不再需要「整行全宽兜底」——
+    -- 那种兜底会让点正文误开弹窗。现在横向也限制在气泡附近。
+    local slack_x = math.max(Screen:scaleBySize(12), 0)
+    local slack_y = math.max(Screen:scaleBySize(16), 0)
     for index = 1, #rects do
         local rect = rects[index]
         -- 有真实绘制坐标就用它，首帧还没绘制过时退回复算值。
@@ -1550,7 +1553,8 @@ function ReaderView:_paraMarkerAt(x, y)
             return rect.paragraph
         end
     end
-    -- 画着气泡却没命中：留证据，记录纵向最近的气泡与落点差值。
+    -- 兜底：painted 坐标可能与落点有轻微错位，纵向放宽到气泡所在行 ± 半行，
+    -- 横向仍要求在气泡附近（气泡宽 + 两倍余量），不再全宽误触翻页。
     if #rects > 0 then
         local near, near_dy
         for index = 1, #rects do
@@ -1559,18 +1563,17 @@ function ReaderView:_paraMarkerAt(x, y)
             local dy = math.abs(cy - y)
             if near_dy == nil or dy < near_dy then near, near_dy = rect, dy end
         end
-        -- 纵向落在气泡所在行就命中，横向不再设小窗口：2026-11-20 Kobo 实测，
-        -- rects 坐标可能与显示帧错位，气泡附近的小窗口照样 miss。正文区域
-        -- 即命中 —— 宁可误开弹窗，也不要让一次点气泡变成翻页。
-        if near_dy <= near.h / 2 + slack_y then
+        local near_x = near.painted_x or near.x
+        local near_cx = near_x + near.w / 2
+        if near_dy <= near.h / 2 + slack_y
+                and math.abs(x - near_cx) <= near.w / 2 + slack_x * 2 then
             return near.paragraph
         end
-        local nx = near.painted_x or near.x
-        local ny = near.painted_y or near.y
-        logger.warn("Leko para review: bubble tap missed", tostring(x), tostring(y),
+        -- 未命中降为 debug：每次点错都 warn 会刷日志（Sean 要求严格后尾随 miss 变多）。
+        logger.dbg("Leko para review: bubble tap missed", tostring(x), tostring(y),
             "rects=" .. tostring(#rects),
-            string.format("near=%d,%d,%dx%d", nx, ny, near.w, near.h),
-            string.format("dx=%d dy=%d", math.floor(x - (nx + near.w)), math.floor(near_dy)),
+            string.format("near=%d,%d,%dx%d", near_x, near.painted_y or near.y, near.w, near.h),
+            string.format("dx=%d dy=%d", math.floor(x - near_cx), math.floor(near_dy)),
             "real=" .. (near.painted_x and "y" or "n"))
     end
     return nil
@@ -1653,11 +1656,22 @@ function ReaderView:showParaComments(paragraph_index, options)
         if cursor and not ReviewPopup.isShowing() then return end
         -- 子进程选中的镜像要同步回父进程，否则下一次请求又会先试失效的那台。
         AsyncParaReview.rememberSourceHost(source, payload.host)
+        -- 段评配图目录：<cache>/review_pics/<book_id>/。按书分目录，移出书架时
+        -- 可整目录清理（见 ReviewPics）。目录准备失败时 pic_dir 为 nil，弹窗
+        -- 自动退回纯文字模式，不影响段评正文阅读。
+        local pic_dir
+        local ok_rp, ReviewPics = pcall(require, "Leko/ReviewPics")
+        if ok_rp and self.book and self.book.id then
+            local ok_dir, dir = pcall(ReviewPics.ensure, tostring(self.book.id))
+            if ok_dir then pic_dir = dir end
+        end
         self:_presentParaComments(paragraph_index, payload, {
             ReviewPopup = ReviewPopup,
             model = model,
             chapter_index = chapter_index,
             known_count = known_count,
+            pic_dir = pic_dir,
+            source = source,
         })
     end)
     return true
@@ -1692,12 +1706,21 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
     local items = {}
     for _, item in ipairs(list) do
         local text = Util.trim(tostring(item.text or ""))
-        if text ~= "" then
+        local pics = type(item.pics) == "table" and item.pics or {}
+        -- 纯图评论（无文字但有图）也要收进来，否则段评配图整条丢失。
+        if text ~= "" or #pics > 0 then
             items[#items + 1] = {
                 abstract = quote,
                 author = tostring(item.name or "匿名"),
                 content = text,
                 likes_count = tonumber(item.likes) or 0,
+                comment_id = item.id,
+                pics = pics,
+                reply_count = tonumber(item.reply_count) or #(item.replies or {}),
+                replies = type(item.replies) == "table" and item.replies or {},
+                replies_has_more = item.replies_has_more == true,
+                -- 书山 v6 的回复已内联在条目里：展开时零请求，直接本地返回。
+                replies_inline = true,
             }
         end
     end
@@ -1726,8 +1749,74 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
         end
     end
 
+    -- 配图下载回调：widget 串行调度，这里只负责「下一张」。
+    -- done(ok) 必到达一次（AsyncImageFetch 保证），widget 据此刷新页面位图。
+    local fetch_pic = nil
+    if ctx.pic_dir then
+        fetch_pic = function(url, path, done)
+            local function finish(ok) if done then pcall(done, ok == true) end end
+            AsyncImageFetch:fetch(url, path, function(ok, _payload, err)
+                if not ok then
+                    logger.warn("Leko para review: image fetch failed", tostring(err))
+                end
+                finish(ok)
+            end)
+        end
+    end
+
+    -- 二级回复回调：书山 v6 回复已内联，展开时直接本地返回，零网络请求。
+    -- 必须走 nextTick —— 这个回调在 widget 的触摸事件栈里执行，同步重建弹窗
+    -- 会和 UIManager 的事件分发互相踩。
+    local on_replies = function(item, cursor, done)
+        local result = {
+            replies = item.replies_inline and item.replies or {},
+            total = tonumber(item.reply_count) or #(item.replies or {}),
+            has_more = item.replies_has_more == true,
+            cursor = nil,
+        }
+        local function emit()
+            if done then pcall(done, true, result) end
+        end
+        if type(UIManager.nextTick) == "function" then UIManager:nextTick(emit)
+        else UIManager:scheduleIn(0, emit) end
+    end
+
+    -- 左右滑切段评（1:1 fanqie main.lua:879 navigate_para）：在本章「有段评的
+    -- 段落列表」里切上/下一段。leko 的等价数据是 model.para_counts（key = 0 基
+    -- pid，value = 该段评论数），按段号升序排好，找到当前段的位置即可导航。
+    -- 切段时先关旧弹窗、延迟一帧再开新的（和原版一样，等旧窗从 UIManager 出栈）。
+    local para_nav = nil
+    if model and type(model.para_counts) == "table" then
+        local with_reviews = {}
+        for pid, count in pairs(model.para_counts) do
+            if (tonumber(count) or 0) > 0 then
+                with_reviews[#with_reviews + 1] = tonumber(pid) + 1 -- para_counts 用 0 基 pid
+            end
+        end
+        table.sort(with_reviews)
+        local current = 0
+        for i, p in ipairs(with_reviews) do
+            if p == paragraph_index then current = i break end
+        end
+        if current > 0 then
+            para_nav = function(dir)
+                local target = current + (dir == "next" and 1 or -1)
+                if target < 1 or target > #with_reviews then return end
+                local target_para = with_reviews[target]
+                ctx.ReviewPopup.closeVisible()
+                UIManager:nextTick(function()
+                    self:showParaComments(target_para)
+                end)
+            end
+        end
+    end
+
     ctx.ReviewPopup.show{
         pages = items,
+        pic_dir = ctx.pic_dir,
+        fetch_pic = fetch_pic,
+        on_replies = on_replies,
+        para_nav = para_nav,
         -- 段标识：区分「同一段继续加载」与「换了新一段」，决定弹窗是否保留滚动位置。
         paragraph_key = tostring(ctx.chapter_index) .. ":" .. tostring(paragraph_index),
         doc_font_name = self.style.body_font,
@@ -1747,7 +1836,8 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
         contrast = 0,
         -- 弹窗字重跟随正文（0-3），face_factory 按 FontWeight 四档仿粗。
         doc_font_weight = self.style.body_weight or 0,
-        tap_to_page = true,
+        -- fanqie 原版没有「点左右半屏翻页」，弹窗内只靠上下滑/滚动翻评论。
+        -- 保持 1:1：不传 tap_to_page，点击评论正文不再翻页（action 行/图片仍响应）。
         more_text = more_text,
         on_more = on_more,
     }

@@ -30,12 +30,16 @@ local FaceFactory = {
     fallback_cache = {}, -- path|size -> FontFaceObj (fallback faces shared across variants)
 }
 
--- Size variants (relative to the base size). Sean 定版：评论正文/引文 0.93，
--- 作者·点赞行（评论 id）再小一档 0.88。
+-- Size variants (relative to the base size)，逐项对齐 fanqie 原版 face_factory.lua。
+-- 评论正文/引文 0.93；一级作者行（评论 id）0.86；二级作者行 0.84；
+-- 二级正文 0.90；展开开关 0.93（可点控件，跟一级正文同号）。
 FaceFactory.VARIANTS = {
-    content = 0.93,  -- thought body
-    quote   = 0.93,  -- quoted abstract
-    meta    = 0.88,  -- author line（评论 id）：比正文再小一档
+    content = 0.93,       -- 一级正文
+    quote   = 0.93,       -- 引文
+    meta    = 0.86,       -- 一级作者行（评论 id）：fanqie 原版 0.86
+    reply   = 0.90,       -- 二级回复正文
+    reply_meta = 0.84,    -- 二级回复作者行：比一级 meta 0.86 再小半档
+    reply_toggle = 0.93,  -- 「展开/收起 N 条回复」是可点控件，不能太小
 }
 
 -- 正文字重 -> 仿粗强度，与 Leko/FontWeight.lua 的四档一致

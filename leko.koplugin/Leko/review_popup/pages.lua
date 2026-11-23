@@ -24,13 +24,22 @@ local CacheItem = require("cacheitem")
 local ContentBuilder = require("Leko/review_popup/content_builder")
 local Device = require("device")
 local FaceFactory = require("Leko/review_popup/face_factory")
+local ImgSize = require("Leko/review_popup/img_size")
 local Paginator = require("Leko/review_popup/paginator")
 local Screen = Device.screen
 local logger = require("logger")
 
+local ok_ReviewPics, ReviewPics = pcall(require, "Leko/ReviewPics")
+if not ok_ReviewPics then ReviewPics = nil end
+local ok_ImageWidget, ImageWidget = pcall(require, "ui/widget/imagewidget")
+if not ok_ImageWidget then ImageWidget = nil end
+local ok_RenderImage, RenderImage = pcall(require, "ui/renderimage")
+if not ok_RenderImage then RenderImage = nil end
+
 local PAGE_BB_CACHE_MAX = 8
 local PIECE_CACHE_MAX = 200
 local LAYOUT_CACHE_MAX = 6
+local IMG_CACHE_MAX = 12
 
 local PieceItem = CacheItem:extend{}
 function PieceItem:onFree()
@@ -47,6 +56,11 @@ function LayoutItem:onFree()
     Paginator.freeTextPieces(self.pieces)
 end
 
+local ImgItem = CacheItem:extend{}
+function ImgItem:onFree()
+    if self.bb and self.bb.free then self.bb:free() end
+end
+
 local function newPieceCache()
     return Cache:new{ slots = PIECE_CACHE_MAX, enable_eviction_cb = true }
 end
@@ -59,16 +73,124 @@ local function newLayoutCache()
     return Cache:new{ slots = LAYOUT_CACHE_MAX, enable_eviction_cb = true }
 end
 
+local function newImgCache()
+    return Cache:new{ slots = IMG_CACHE_MAX, enable_eviction_cb = true }
+end
+
 local function itemsKey(items)
     local parts = {}
     for _, item in ipairs(items or {}) do
-        parts[#parts + 1] = string.format("%s|%s|%s|%d",
+        -- 缓存键必须纳入图片与回复状态：否则图下完了 / 回复展开了，items 的
+        -- 文字字段没变，布局缓存命中旧的 → 图片和回复永远不显示。
+        local pic_sig = {}
+        for _, p in ipairs(type(item.pics) == "table" and item.pics or {}) do
+            pic_sig[#pic_sig + 1] = tostring(p.url or "") .. "x" .. tostring(p.w or 0) .. "x" .. tostring(p.h or 0)
+        end
+        local reply_sig = {}
+        for _, r in ipairs(type(item.replies) == "table" and item.replies or {}) do
+            reply_sig[#reply_sig + 1] = tostring(r.text or "") .. ":" .. tostring(r.user_name or "")
+        end
+        parts[#parts + 1] = string.format("%s|%s|%s|%d|%s|%s|%s|%s|%d",
             tostring(item.abstract or ""),
             tostring(item.author or ""),
             tostring(item.content or ""),
-            tonumber(item.likes_count) or 0)
+            tonumber(item.likes_count) or 0,
+            tostring(item.comment_id or ""),
+            table.concat(pic_sig, ","),
+            table.concat(reply_sig, ","),
+            tostring(item.replies_expanded or false) .. "/" .. tostring(item.replies_loading or false),
+            tonumber(item.reply_count) or 0)
     end
     return table.concat(parts, "\n")
+end
+
+-- ── 段评配图排版（纯函数，移植自 fanqie.review_popup.pages）─────────────
+-- 硬约束：分页阶段绝不读图，只用接口 width/height 定占位比例；真实比例在
+-- 绘制时用文件头修正（contain），所以「图下完了」不需要重排，只刷新位图。
+-- Sean 定版：竖图高 ≤ 半个内容视口；横图宽 ≤ 半个内容区宽。
+local IMG_HALF_H_RATIO = 0.5
+local IMG_HALF_W_RATIO = 0.5
+local IMG_WIDTH_RATIO = 0.92
+local IMG_GRID_COLS = 3
+
+local function singleImageBox(pic, text_w, viewport_h)
+    local avail_w = math.floor(text_w * IMG_WIDTH_RATIO)
+    if avail_w < 1 then avail_w = 1 end
+    local half_h = math.max(1, math.floor((viewport_h or 0) * IMG_HALF_H_RATIO))
+    local half_w = math.max(1, math.floor(text_w * IMG_HALF_W_RATIO))
+    local pw = tonumber(pic and pic.w) or 0
+    local ph = tonumber(pic and pic.h) or 0
+    if pw > 0 and ph > 0 then
+        if ph >= pw then
+            local h = math.min(half_h, math.floor(avail_w * ph / pw + 0.5))
+            h = math.max(1, h)
+            local w = math.max(1, math.floor(h * pw / ph + 0.5))
+            if w > avail_w then w = avail_w end
+            return w, h
+        end
+        local w = math.min(avail_w, half_w)
+        local h = math.max(1, math.floor(w * ph / pw + 0.5))
+        if h > half_h then
+            h = half_h
+            w = math.max(1, math.floor(h * pw / ph + 0.5))
+        end
+        return w, h
+    end
+    return math.max(1, math.min(avail_w, half_w)), math.max(1, math.floor(half_h * 0.75))
+end
+
+local function gridMetrics(text_w)
+    local gap = Screen:scaleBySize(4)
+    local avail = math.floor(text_w)
+    local cell = math.floor((avail - (IMG_GRID_COLS - 1) * gap) / IMG_GRID_COLS)
+    if cell < 1 then cell = 1 end
+    return cell, gap
+end
+
+--- 一个 image block 的几何：{ cells={{x,y,w,h}}, box_h }。
+local function imageLayout(pics, text_w, viewport_h)
+    local n = #pics
+    if n == 1 then
+        local w, h = singleImageBox(pics[1], text_w, viewport_h)
+        return { cells = { { x = 0, y = 0, w = w, h = h } }, box_h = h }
+    end
+    local cell, gap = gridMetrics(text_w)
+    local half_h = math.max(1, math.floor((viewport_h or 0) * IMG_HALF_H_RATIO))
+    local half_w = math.max(1, math.floor(text_w * IMG_HALF_W_RATIO))
+    if cell > half_h then cell = half_h end
+    if cell > half_w then cell = half_w end
+    local rows = math.ceil(n / IMG_GRID_COLS)
+    local cells = {}
+    for i = 1, n do
+        local r = math.floor((i - 1) / IMG_GRID_COLS)
+        local c = (i - 1) % IMG_GRID_COLS
+        cells[i] = { x = c * (cell + gap), y = r * (cell + gap), w = cell, h = cell }
+    end
+    return { cells = cells, box_h = rows * cell + (rows - 1) * gap }
+end
+
+--- 图片块的分页边界：单图整块原子边界；网格按行切，行间不留缝。
+local function imageBoundaries(lay)
+    local cells = lay.cells or {}
+    if #cells == 0 then return {} end
+    local rows, order = {}, {}
+    for i = 1, #cells do
+        local c = cells[i]
+        local row = rows[c.y]
+        if not row then
+            rows[c.y] = { top = c.y, bottom = c.y + c.h }
+            order[#order + 1] = c.y
+        elseif c.y + c.h > row.bottom then
+            row.bottom = c.y + c.h
+        end
+    end
+    table.sort(order)
+    local out = {}
+    for k = 1, #order do
+        local next_top = (k < #order) and rows[order[k + 1]].top or lay.box_h
+        out[k] = { top = rows[order[k]].top, bottom = next_top }
+    end
+    return out
 end
 
 local function geomKey(doc_font_name, doc_font_size, margins, height_ratio, content_width, contrast, doc_weight, doc_font_index)
@@ -108,9 +230,14 @@ function PageRenderer:new(opts)
     self_obj.contrast = tonumber(opts.contrast) or 0
     self_obj.doc_weight = tonumber(opts.doc_weight) or 0
     self_obj.skip_quote = opts.skip_quote == true
+    self_obj.pic_dir = opts.pic_dir
+    self_obj.estimate_viewport_h = opts.estimate_viewport_h
     self_obj._layout_cache = newLayoutCache()
     self_obj._page_bbs = newPageCache()
     self_obj._piece_cache = newPieceCache()
+    self_obj._img_bbs = newImgCache()
+    self_obj._img_missing = {}
+    self_obj._drawn_images = 0
     self_obj._items_key = itemsKey(self_obj.items)
     self_obj._geom_key = geomKey(self_obj.doc_font_name, self_obj.doc_font_size,
         self_obj.doc_margins, self_obj.height_ratio, self_obj.content_width,
@@ -221,9 +348,62 @@ function PageRenderer:paginate()
             y = y + thickness + math.floor(base_size * (block.spacing_after or 0) + 0.5)
         elseif block.kind == "paragraph" then
             y = y + math.floor(base_size * (block.spacing_before or 0) + 0.5)
-            addTextPiece(block.variant, block.text, block.fg, text_w, 0,
-                block.variant == "meta")
+            -- 回复块缩进：层级 * 约 1.15 个字宽，正文宽度同步收窄。
+            -- 逐项对齐 fanqie 原版 pages.lua：1.15×level、封顶 text_w/2、块宽下限 10。
+            local level = tonumber(block.indent_level) or 0
+            local indent = 0
+            if level > 0 then
+                indent = math.floor(base_size * 1.15 * level)
+                if indent > text_w / 2 then indent = math.floor(text_w / 2) end
+            end
+            local block_w = text_w - indent
+            if block_w < 10 then block_w = 10 end
+            local before = #pieces
+            addTextPiece(block.variant, block.text, block.fg, block_w, indent,
+                block.variant == "meta" or block.variant == "reply_meta")
+            -- 展开/收起/继续加载行的点击命中靠这两个字段；原版同款赋值。
+            if #pieces > before then
+                local piece = pieces[#pieces]
+                piece.action = block.action
+                piece.item_index = block.item_index
+            end
             y = y + math.floor(base_size * (block.spacing_after or 0) + 0.5)
+        elseif block.kind == "image" and type(block.pics) == "table" and #block.pics > 0 then
+            y = y + math.floor(base_size * (block.spacing_before or 0) + 0.5)
+            -- 二级回复里的图跟着回复一起缩进：1.15×level + 封顶 + 块宽下限，
+            -- 与文字块同一套几何（对齐 fanqie 原版 pages.lua）。
+            local img_level = tonumber(block.indent_level) or 0
+            local indent = 0
+            if img_level > 0 then
+                indent = math.floor(base_size * 1.15 * img_level)
+                if indent > text_w / 2 then indent = math.floor(text_w / 2) end
+            end
+            local img_w = text_w - indent
+            if img_w < 10 then img_w = 10 end
+            local lay = imageLayout(block.pics, img_w, self.estimate_viewport_h)
+            local piece_y = y
+            pieces[#pieces + 1] = {
+                kind = "image",
+                pics = block.pics,
+                layout = lay,
+                item_index = block.item_index,
+                x = indent,
+                y = piece_y,
+                piece_h = lay.box_h,
+            }
+            -- 图片块必须进 boundary：不进的话末页高度漏算图那一截，图下沿
+            -- 永远露不出来（翻页停在图顶）。行与行之间不留缝。
+            -- 首行空隙合并（fanqie 原版同款）：图前 spacing_before 留下的空档
+            -- 并进上一条 boundary，避免切出只有几像素高的空白占位页。
+            for ri, b in ipairs(imageBoundaries(lay)) do
+                local top_abs = piece_y + b.top
+                if ri == 1 and #boundaries > 0
+                    and boundaries[#boundaries].bottom < top_abs then
+                    boundaries[#boundaries].bottom = top_abs
+                end
+                boundaries[#boundaries + 1] = { top = top_abs, bottom = piece_y + b.bottom }
+            end
+            y = y + lay.box_h + math.floor(base_size * (block.spacing_after or 0) + 0.5)
         end
     end
 
@@ -279,6 +459,91 @@ function PageRenderer:_getPieceTextBB(piece)
     return bb
 end
 
+--- 某张配图的本地缓存路径。没有 pic_dir 说明本次弹窗不带图。
+function PageRenderer:_imagePath(pic)
+    if not self.pic_dir or not ReviewPics then return nil end
+    local name = ReviewPics.filename(pic and pic.url)
+    if not name then return nil end
+    return self.pic_dir .. "/" .. name
+end
+
+--- 解码一张图、等比缩进 box_w × box_h（contain，白底居中），返回整块位图。
+--- 返回 nil 表示「还没下 / 解不出来」→ 调用方画占位框。
+function PageRenderer:_renderImageBB(pic, box_w, box_h)
+    if box_w < 1 or box_h < 1 then return nil end
+    local path = self:_imagePath(pic)
+    if not path or self._img_missing[path] then return nil end
+    if not (ReviewPics and ReviewPics.file_exists(path)) then
+        self._img_missing[path] = true
+        return nil
+    end
+    local dw, dh = ImgSize.probe(path)
+    if not (dw and dw > 0 and dh and dh > 0) then
+        dw, dh = tonumber(pic.w) or 0, tonumber(pic.h) or 0
+    end
+    if not (dw > 0 and dh > 0) then dw, dh = box_w, box_h end
+    local scale = math.min(box_w / dw, box_h / dh)
+    local rw = math.max(1, math.floor(dw * scale + 0.5))
+    local rh = math.max(1, math.floor(dh * scale + 0.5))
+    local ox = math.max(0, math.floor((box_w - rw) / 2))
+    local oy = math.max(0, math.floor((box_h - rh) / 2))
+
+    local bbtype = Screen:isColorEnabled() and Blitbuffer.TYPE_BBRGB32 or Blitbuffer.TYPE_BB8
+    local bb = Blitbuffer.new(box_w, box_h, bbtype)
+    bb:fill(Blitbuffer.COLOR_WHITE)
+
+    local drawn = false
+    if ImageWidget then
+        drawn = pcall(function()
+            local iw = ImageWidget:new{
+                file = path, width = rw, height = rh, alpha = true,
+                file_do_cache = false,
+            }
+            iw:paintTo(bb, ox, oy)
+            if iw.free then iw:free() end
+        end)
+    end
+    if not drawn and RenderImage then
+        local ok_img, img = pcall(RenderImage.renderImageFile, RenderImage, path, false, rw, rh)
+        if ok_img and img then
+            pcall(function()
+                bb:blitFrom(img, ox, oy, 0, 0,
+                    math.min(rw, img:getWidth()), math.min(rh, img:getHeight()))
+            end)
+            if img.free then pcall(img.free, img) end
+            drawn = true
+        end
+    end
+    if not drawn then
+        bb:free()
+        return nil
+    end
+    self._drawn_images = (self._drawn_images or 0) + 1
+    return bb
+end
+
+function PageRenderer:_getImageBB(pic, box_w, box_h)
+    if not self.pic_dir then return nil end
+    local path = self:_imagePath(pic)
+    if not path then return nil end
+    local key = path .. "|" .. box_w .. "x" .. box_h
+    local hit = self._img_bbs:get(key)
+    if hit then return hit.bb end
+    local bb = self:_renderImageBB(pic, box_w, box_h)
+    if not bb then return nil end
+    self._img_bbs:insert(key, ImgItem:new{ bb = bb })
+    return bb
+end
+
+--- 图片落盘后调用：让下一帧重新判断文件在不在。
+function PageRenderer:invalidateImage(url)
+    if not ReviewPics then return end
+    local name = ReviewPics.filename(url)
+    if not name or not self.pic_dir then return end
+    self._img_missing[self.pic_dir .. "/" .. name] = nil
+    ImgSize.forget(self.pic_dir .. "/" .. name)
+end
+
 function PageRenderer:_freePieceCache()
     if self._piece_cache and self._piece_cache.clear then
         self._piece_cache:clear()
@@ -316,6 +581,37 @@ function PageRenderer:renderPage(page_idx, page_starts)
             if bottom > top then
                 bb:paintRect(piece.x, top - p0, piece.width, bottom - top, piece.fg)
             end
+        elseif piece.kind == "image" then
+            -- 图块跨页：相邻页各绘自己那一段（src_y 对得上），滚动拼起来连续。
+            local lay = piece.layout
+            local ox = piece.x or 0
+            if lay and lay.cells then
+                for i = 1, #lay.cells do
+                    local cell = lay.cells[i]
+                    local pic = piece.pics[i]
+                    if pic then
+                        local cell_top = piece.y + cell.y
+                        local top = math.max(cell_top, p0)
+                        local bottom = math.min(cell_top + cell.h, p1)
+                        if bottom > top then
+                            local img_bb = self:_getImageBB(pic, cell.w, cell.h)
+                            if img_bb then
+                                bb:blitFrom(img_bb, ox + cell.x, top - p0, 0, top - cell_top,
+                                    math.min(cell.w, img_bb:getWidth()), bottom - top)
+                            else
+                                -- 占位框：浅灰底 + 上下细线，让「这里有张图」可感知。
+                                bb:paintRect(ox + cell.x, top - p0, cell.w, bottom - top,
+                                    Blitbuffer.COLOR_GRAY_E)
+                                bb:paintRect(ox + cell.x, top - p0, cell.w, 1, Blitbuffer.COLOR_GRAY_9)
+                                if cell.h >= 2 then
+                                    bb:paintRect(ox + cell.x, top - p0 + (bottom - top) - 1,
+                                        cell.w, 1, Blitbuffer.COLOR_GRAY_9)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
         else
             local r = Paginator.pieceVisibleRange(piece, p0, p1)
             if r and piece.kind == "text" then
@@ -350,6 +646,8 @@ end
 function PageRenderer:freeContentCaches()
     self:_freePageBBs()
     self:_freePieceCache()
+    if self._img_bbs and self._img_bbs.clear then self._img_bbs:clear() end
+    self._img_missing = {}
     if self._layout_cache and self._layout_cache.clear then
         self._layout_cache:clear()
     else
@@ -358,5 +656,13 @@ function PageRenderer:freeContentCaches()
     self.layout = nil
     self.boundaries = nil
 end
+
+-- 单测钩子：图片几何是纯函数，暴露给 _smoke_review_pics.js 验证。
+PageRenderer._test = {
+    singleImageBox = singleImageBox,
+    imageLayout = imageLayout,
+    imageBoundaries = imageBoundaries,
+    itemsKey = itemsKey,
+}
 
 return PageRenderer

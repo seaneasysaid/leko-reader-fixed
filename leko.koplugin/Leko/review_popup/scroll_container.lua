@@ -17,7 +17,6 @@ Event semantics: north/south are consumed here; west/east return false and
 propagate upward (the outer SwipeClose closes the popup).
 --]]
 
-local BD = require("ui/bidi")
 local Device = require("device")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -38,9 +37,6 @@ local ScrollContainer = InputContainer:extend{
     margin_left = 0,        -- content left margin (doc_margins.left)
     text_w = 0,             -- content draw width
     dialog = nil,
-    -- When false, taps on the left/right half of the viewport do not turn
-    -- pages (gestures fall through to the outer widget instead).
-    tap_to_page = false,
     -- Page-break boundary table: { {top, bottom, keep_next?} } in y order.
     -- Page steps land only on boundaries so a line is never split across pages.
     boundaries = nil,
@@ -92,15 +88,6 @@ function ScrollContainer:init()
                 },
             },
         }
-        if self.tap_to_page ~= false then
-            -- Tap left/right half to page up/down (optional, see tap_to_page).
-            self.ges_events.TapScrollText = {
-                GestureRange:new{
-                    ges = "tap",
-                    range = function() return self.dimen end,
-                },
-            }
-        end
     end
 
     if Device:hasKeys() then
@@ -158,7 +145,7 @@ function ScrollContainer:scrollBy(delta)
         self:_updateScrollBar()
         if self.dialog then
             UIManager:setDirty(self.dialog, function()
-                return "partial", self.dimen
+                return "ui", self.dimen
             end)
         end
     end
@@ -175,7 +162,7 @@ function ScrollContainer:_setOffset(new_offset)
         self:_updateScrollBar()
         if self.dialog then
             UIManager:setDirty(self.dialog, function()
-                return "partial", self.dimen
+                return "ui", self.dimen
             end)
         end
     end
@@ -200,16 +187,6 @@ function ScrollContainer:onScrollText(arg, ges)
     end
     -- west/east: propagate outward (closes the popup)
     return false
-end
-
---- Tap left half to page up, right half to page down (mirrored UI flips).
-function ScrollContainer:onTapScrollText(arg, ges)
-    if BD.flipIfMirroredUILayout(ges.pos.x < Screen:getWidth() / 2) then
-        self:scrollToPage(-1)
-    else
-        self:scrollToPage(1)
-    end
-    return true
 end
 
 function ScrollContainer:onScrollUp()
@@ -244,19 +221,35 @@ function ScrollContainer:onPanReleaseText(arg, ges)
     return false
 end
 
+--- 贴图：滚动位置可能落在页中间（pan 的 scrollBy 会产生这种偏移），按页内
+--- 位移把当前页上移，露出的下半屏用下一页补满。只贴当前页并永远从页顶
+--- (src_y=0) 开始会让 pan「拖不动」——页内位移被吞掉，直到跨过整页才跳一下；
+--- 末页不足一个视口时下方也会留白。1:1 移植自 fanqie scroll_container.lua。
+function ScrollContainer:_paintPages(bb, x, y)
+    local pages = self.pages
+    if not pages or #pages == 0 then return end
+    local cur = self:_currentPageIndex()
+    local start = math.min(pages[cur] or 0, self.scroll_offset)
+    local dy = y - (self.scroll_offset - start)
+    for idx = cur, #pages do
+        local page_bb = self.page_bb_getter(idx)
+        if not page_bb then return end
+        local dest_y = math.max(y, dy)
+        local skip = dest_y - dy                        -- 顶部被裁掉的高度
+        local room = self.viewport_h - (dest_y - y)
+        local h = math.min(page_bb:getHeight() - skip, room)
+        if h <= 0 then return end
+        bb:blitFrom(page_bb, x + self.margin_left, dest_y, 0, skip, self.text_w, h)
+        dy = dy + page_bb:getHeight()
+        if dest_y + h >= y + self.viewport_h then return end
+    end
+end
+
 function ScrollContainer:paintTo(bb, x, y)
     self.dimen.x, self.dimen.y = x, y
 
     if self.viewport_h > 0 and self.page_bb_getter then
-        local cur = self:_currentPageIndex()
-        local page_bb = self.page_bb_getter(cur)
-        if page_bb then
-            local visible_h = math.min(self.viewport_h, page_bb:getHeight())
-            if visible_h > 0 then
-                bb:blitFrom(page_bb, x + self.margin_left, y,
-                    0, 0, self.text_w, visible_h)
-            end
-        end
+        self:_paintPages(bb, x, y)
     end
 
     if self.v_scroll_bar then

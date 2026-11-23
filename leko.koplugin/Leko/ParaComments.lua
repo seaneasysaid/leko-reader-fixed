@@ -100,7 +100,14 @@ ParaComments.FIRST_OPEN_PAGES = 2
 --    是上一段的评论），必须整条作废重拉。
 -- 6：引文改从条目取（item.quote / item.para_text），并解包对象型字段。旧缓存里
 --    para_text 存的是 `table: 0x…` 这种内存地址串，必须重拉。
-local COMMENTS_CACHE_VERSION = 6
+-- 7：评论条目新增 id / images / replies 字段（段评配图 + 二级回复）。旧缓存的
+--    条目只有文字，继续用会看不到任何图和回复，必须重拉一次。
+-- 8：二级回复字段口径修正。服务端 replies 是**总数数字**、reply_list 才是回复
+--    数组；旧解析 `item.replies or item.reply_list` 被数字短路，缓存里的条目
+--    全是 replies={} 空数组（点开只显示「还有 N 条」没内容）。必须重拉。
+-- 9：正文清掉服务端自带的 `[图片]` 字面占位符（与真图重复）；二级回复图片
+--    改从 segments(type=image) 取（旧缓存里二级 pics 为空只有 [图片] 文字）。
+local COMMENTS_CACHE_VERSION = 9
 -- 段评是阅读路径上的附加请求，宁可失败也不要长时间卡住翻页。
 ParaComments.TIMEOUT = 15
 ParaComments.CACHE_KIND = "para_review"
@@ -195,6 +202,18 @@ end
 
 local function trim(value)
     return Util.trim(text(value))
+end
+
+-- 服务端正文 content 里会把图片写成 `[图片]` 字面占位符，真正的图片 URL
+-- 单独放在 images/segments 里由弹窗渲染。若不清理，正文会多出「[图片]」
+-- 文字、和下方真图重复（二级回复尤其明显：只看到「[图片]」文字却没图）。
+-- fanqie 原版用 crengine 把 content 塞进 HTML，这个标记会被浏览器吞掉；
+-- leko 是自绘文本，必须在这里主动去掉。多种括号形态一并兼容。
+local function stripImagePlaceholders(value)
+    local s = text(value)
+    s = s:gsub("%[%s*图片%s*%]", "")
+    s = s:gsub("%[%s*img%s*%]", "")
+    return Util.trim(s)
 end
 
 -- URL query 编码（source 是中文名、book_id 可能含大写，必须编码）。
@@ -401,8 +420,12 @@ end
 -- 计数缓存的格式版本。
 -- 2：段号改为「气泡所在段落」（旧版按第几个气泡编号，服务端只给有评论的段
 --    插气泡时整体错位 —— 书旗 228 段只有 5 个气泡，旧缓存里是 0..4）。
--- 旧缓存直接丢弃重算，不然错位的气泡会一直留到 TTL 过期。
-local COUNTS_FORMAT = 2
+-- 3：气泡计数兼容 `99+`。旧解析只认纯数字，服务端改版后热门章节全是 `99+`
+--    ⇒ 缓存里存的是「本章 0 气泡」（空缓存 TTL 12h，会一直藏到过期）。
+--    升版本让这些错误空缓存立即重算。
+-- 4：`99+` 从「取数字 99」改成「记下界 100」。旧缓存里存的是 99，`count > 99`
+--    不成立 ⇒ 气泡显示 `[99]` 而非原版的 `[99+]`。升版本让错误值重算。
+local COUNTS_FORMAT = 4
 
 local function readCountsFile(path)
     if lfs.attributes(path, "mode") ~= "file" then return nil end
@@ -525,8 +548,20 @@ function ParaComments.countsFromContent(content)
                 return CryptoCompat.base64Decode(encoded .. string.rep("=", (4 - #encoded % 4) % 4))
             end)
             if ok and decoded then
-                local number = text(decoded):match(">(%d+)</text>")
+                -- 2026-11-23 服务端改动：热门章节的气泡计数不再写具体数字，
+                -- 一律写成 `99+`（《十日终焉》ch1 实测 66 个气泡全是 `99+`）。
+                -- 旧正则 `>(%d+)</text>` 对 `99+` 返回 nil ⇒ 每一段都被当成
+                -- 0 条 ⇒ 整章一个气泡都不显示。这里兼容两种：纯数字取原值，
+                -- 带 `+` 的说明真实总数已被服务端截断成「≥100」，精确值拿不到。
+                -- fanqie 原版（content.lua）是拿真实 n 判断 `n > 99 → "99+"`；
+                -- leko 这边只拿到截断串，所以用 100 作下界哨兵，让 Paginator
+                -- 的 `count > 99` 同样成立 ⇒ 气泡显示 `[99+]`（1:1 原版视觉）。
+                -- 注意这只是「展示上限」，不是加载上限：弹窗首屏 40 条 +
+                -- 「继续加载」按 cursor 续拉，没有 99 条硬上限。
+                local plus_number = text(decoded):match(">(%d+)%+</text>")
+                local number = plus_number or text(decoded):match(">(%d+)</text>")
                 local count = tonumber(number)
+                if plus_number and count then count = math.max(count, 100) end
                 if count and count > 0 then counts[index - 1] = count end
             end
         end
@@ -672,6 +707,142 @@ local function sanitizeParaText(value)
 end
 
 --[[--
+段评配图归一化（2026-11-23 移植自 fanqie.review_pics）。
+
+书山 v6 段评条目的 images 实测有两种形态：
+  * 数组   [{ web_uri=…, width=…, height=… }, …]
+  * map 包装 { image_data = { {…}, … } } —— # 为 0，必须包一层再拆
+图片字段各版本不一：url / web_url / dynamic_url / web_uri（web_uri 只收绝对地址）。
+统一输出 { url, fetch, w, h, displayable }：url 是缓存键/去重键，fetch 是下载地址。
+
+HEIC/HEIF 设备端无解码器：能换公共 webp 模板就换（下节 to_webp_url），
+换不了就标记 displayable=false 由 UI 提示，绝不让下载层白下。
+]]--
+local IMAGE_EXT_UNSUPPORTED = {
+    heic = true, heif = true, avif = true, tif = true, tiff = true,
+}
+local CONVERT_WIDTH = 800
+local NOSIGN_HOST = "https://p3-novel.byteimg.com"
+local PUBLIC_STYLE = "1yzifmftcy-expand"
+
+local function imageExt(url)
+    if type(url) ~= "string" then return nil end
+    local path = url:match("^[^?]*") or url
+    local ext = path:match("%.([%a%d]+)$")
+    return ext and ext:lower() or nil
+end
+
+--- HEIC → 无签名公共模板 WebP（服务端实时转码）。只认番茄自家域与白名单路径，
+--- 识别不出返回 nil（保留「不可显示」判定，不猜）。
+local function toWebpUrl(url, width)
+    if type(url) ~= "string" or url == "" then return nil end
+    local nq = url:match("^[^?]*")
+    local host, path = nq:match("^https?://([^/]+)(/.*)$")
+    if not host or not path then return nil end
+    if not (host:find("fqnovelpic.com", 1, true) or host:find("byteimg.com", 1, true)) then
+        return nil
+    end
+    local head = path:match("^(.*)~tplv")
+    if not head or head == "" then return nil end
+    if not (head:match("^/tos%-cn%-i%-[%w]+/[^/]+$")
+        or head:match("^/img/novel%-static/[^/]+$")) then
+        return nil
+    end
+    local w = math.floor(tonumber(width) or CONVERT_WIDTH)
+    if w < 16 then w = 16 end
+    if w > 2048 then w = 2048 end
+    return string.format("%s%s~tplv-%s:%d:0:0.webp", NOSIGN_HOST, head, PUBLIC_STYLE, w)
+end
+
+--- 一条段评的 images → 扁平图片数组。
+local function normalizeImages(raw)
+    local out = {}
+    if type(raw) ~= "table" then return out end
+    -- 判据用 next(raw) 而不是 #raw：{ image_data={…} } 长度恒为 0。
+    if next(raw) == nil then return out end
+    local wrapped = (#raw > 0) and raw or { raw }
+    local function take(im)
+        if type(im) ~= "table" then return end
+        local url = im.url or im.web_url or im.dynamic_url or im.thumb_url
+        if (not url or url == "") and type(im.thumb_nails) == "table"
+            and type(im.thumb_nails[1]) == "table" then
+            url = im.thumb_nails[1].dynamic_url or im.thumb_nails[1].url
+        end
+        if (not url or url == "") and type(im.web_uri) == "string"
+            and im.web_uri:match("^https?://") then
+            url = im.web_uri
+        end
+        if type(url) == "string" and url ~= "" then
+            local ext = imageExt(url)
+            local unsupported = (ext and IMAGE_EXT_UNSUPPORTED[ext] == true) or false
+            local fetch, display = url, true
+            if unsupported then
+                local conv = toWebpUrl(url)
+                if conv then fetch, display = conv, true
+                else display = false end
+            end
+            out[#out + 1] = {
+                url = url,
+                fetch = fetch,
+                w = tonumber(im.width or im.w) or 0,
+                h = tonumber(im.height or im.h) or 0,
+                displayable = display,
+            }
+        end
+    end
+    for _, wrap in ipairs(wrapped) do
+        if type(wrap) == "table" and type(wrap.image_data) == "table" then
+            local entries = wrap.image_data
+            if entries.web_url or entries.url or entries.web_uri then entries = { entries } end
+            for _, im in ipairs(entries) do take(im) end
+        else
+            take(wrap)
+        end
+    end
+    return out
+end
+
+--- 二级回复归一化：{ user_name, reply_to_user_name, text, digg_count, pics }。
+local function normalizeReplies(raw)
+    local out = {}
+    if type(raw) ~= "table" then return out end
+    -- 兼容 replies / reply_list 两种外层字段由调用方选好传进来。
+    for _, r in ipairs(raw) do
+        if type(r) == "table" then
+            local body = stripImagePlaceholders(r.content or r.text)
+            local name = trim(text(r.user_name or r.name))
+            -- 二级回复的图片在 segments（type=image）里，不在 images 字段。
+            -- fanqie 原版 shushan.lua:1120 优先从 segments 取图，这里同口径：
+            -- segments 里的 image 段先转成 {url=...} 再交给 normalizeImages。
+            local pics = normalizeImages(r.images or r.picInfos or r.pic_infos or r.pics)
+            if #pics == 0 and type(r.segments) == "table" then
+                local from_segments = {}
+                for _, seg in ipairs(r.segments) do
+                    if type(seg) == "table" and seg.type == "image"
+                        and type(seg.url) == "string" and seg.url ~= "" then
+                        from_segments[#from_segments + 1] = {
+                            url = seg.url, width = seg.width, height = seg.height,
+                        }
+                    end
+                end
+                pics = normalizeImages(from_segments)
+            end
+            if body ~= "" or #pics > 0 then
+                out[#out + 1] = {
+                    user_name = name ~= "" and name or "匿名",
+                    reply_to_user_name = trim(text(r.reply_to_user_name or r.reply_to_name
+                        or r.reply_to_user or r.reply_to)),
+                    text = body,
+                    digg_count = tonumber(r.digg_count or r.likes) or 0,
+                    pics = pics,
+                }
+            end
+        end
+    end
+    return out
+end
+
+--[[--
 v6 /api/comment 的统一评论解析。
 
 响应 data.items[*] 字段（实测 2026-11-19）：
@@ -688,15 +859,51 @@ local function parseV6Comments(payload)
     if not data then return list, "" end
     for _, item in ipairs(type(data.items) == "table" and data.items or {}) do
         if type(item) == "table" then
-            local body = trim(text(item.content))
-            if body ~= "" then
+            local body = stripImagePlaceholders(item.content)
+            local pics = normalizeImages(item.images or item.image_list)
+            -- 一级评论也兼容 segments（type=image）里的图：images 缺失时兜底。
+            -- fanqie 原版 shushan.lua:1120 优先 segments，这里同口径。
+            if #pics == 0 and type(item.segments) == "table" then
+                local from_segments = {}
+                for _, seg in ipairs(item.segments) do
+                    if type(seg) == "table" and seg.type == "image"
+                        and type(seg.url) == "string" and seg.url ~= "" then
+                        from_segments[#from_segments + 1] = {
+                            url = seg.url, width = seg.width, height = seg.height,
+                        }
+                    end
+                end
+                pics = normalizeImages(from_segments)
+            end
+            -- 纯图评论：正文为空但有图，也必须收进列表（否则段评配图整条丢失）。
+            if body ~= "" or #pics > 0 then
                 local name = trim(text(item.user_name))
+                -- 二级回复字段口径（2026-11-23 抓 v5.vossc.com /api/comment 实测修正）：
+                --   item.replies      = **数字**（该评论的回复总数，如 127 / 10 / 1）
+                --   item.reply_list   = **数组**（本批内联回复，最多 10 条）
+                -- 旧代码 `item.replies or item.reply_list` 是 bug：数字在 Lua 里
+                -- truthy，`or` 短路后永远取到那个总数，真正的 reply_list 被丢弃 ⇒
+                -- normalizeReplies(127) 返回空表 ⇒ 展开只显示「还有 N 条」却无内容。
+                -- fanqie 原版口径一致（shushan.lua:1158 取 replies 当 reply_count、
+                -- 1133 取 reply_list 当回复数组）。
+                local replies = normalizeReplies(item.reply_list)
+                local reply_count = tonumber(item.replies)
+                    or tonumber(item.reply_count) or tonumber(item.replies_count)
+                    or #replies
                 list[#list + 1] = {
+                    id = item.id,
                     name = name ~= "" and name or "匿名",
                     text = body,
                     likes = tonumber(item.likes) or 0,
                     author = item.is_author == true,
                     timestamp = tonumber(item.time) or 0,
+                    pics = pics,
+                    replies = replies,
+                    reply_count = reply_count,
+                    -- fanqie 书山源只显示内联首屏、不做二级续拉（main.lua:1045
+                    -- 写死 has_more=false），这里同口径，避免「还有 N 条」空壳。
+                    replies_has_more = false,
+                    replies_next = nil,
                 }
             end
             -- 原文挂在**条目**上（实测 v6：item.quote / item.para_text），
@@ -1028,5 +1235,15 @@ function ParaComments.fetchComments(book, chapter_index, source, pid, options)
     end
     return cached.list, cached.para_text, nil, pageInfo(cached)
 end
+
+-- 单测钩子：图片/回复归一化与 v6 解析是纯函数，暴露给 _smoke 脚本直接验证。
+-- 业务代码请勿调用。
+ParaComments._test = {
+    normalizeImages = normalizeImages,
+    normalizeReplies = normalizeReplies,
+    stripImagePlaceholders = stripImagePlaceholders,
+    toWebpUrl = toWebpUrl,
+    parseV6Comments = parseV6Comments,
+}
 
 return ParaComments

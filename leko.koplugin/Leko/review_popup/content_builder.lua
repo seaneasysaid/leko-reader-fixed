@@ -196,7 +196,10 @@ function ContentBuilder.build(items, opts)
                 spacing_after = 0.54,
             }
         end
-        local meta = "▸ " .. tostring(item.author or "匿名")
+        -- 一级作者行用中点（与点赞数前的分隔点同一个字符）：`· 张三 · ♥ 2`。
+        -- fanqie 原版 content_builder.lua 同款：`▸` 三角只留给「展开 N 条回复」，
+        -- 两者同符号会让读者分不清哪行是作者、哪行是可点开关。
+        local meta = "· " .. tostring(item.author or "匿名")
         local likes = tonumber(item.likes_count) or 0
         if likes > 0 then
             meta = meta .. " · ♥ " .. tostring(likes)
@@ -218,6 +221,111 @@ function ContentBuilder.build(items, opts)
                 text = content,
                 fg = Blitbuffer.COLOR_BLACK,
             }
+        end
+
+        -- 段评配图：纯图评论（无文字）也会走到这里 —— 归一层已放开「必须有文字」
+        -- 的判据，否则这类图整个被丢弃。
+        if type(item.pics) == "table" and #item.pics > 0 then
+            blocks[#blocks + 1] = {
+                kind = "image",
+                pics = item.pics,
+                item_index = item_index,
+                spacing_before = 0.2,
+                spacing_after = 0.2,
+            }
+        end
+
+        -- ── 二级回复 ──────────────────────────────────────────────────
+        -- 入口单独占一行且可点；展开后回复按接口顺序平铺，用「回复 @某人」表达
+        -- 层级（接口 sub_reply 恒空，层级只靠 reply_to_user_name，平铺不丢条）。
+        if (tonumber(item.reply_count) or 0) > 0 then
+            local reply_count = tonumber(item.reply_count) or 0
+            local toggle_text
+            if item.replies_loading then
+                toggle_text = "↳ 正在加载回复…"
+            elseif item.replies_expanded then
+                toggle_text = "▾ 收起 " .. tostring(reply_count) .. " 条回复"
+            else
+                toggle_text = "▸ 展开 " .. tostring(reply_count) .. " 条回复"
+            end
+            -- 加载中不挂 action：piece.action 为空即不可点，避免重复发请求。
+            blocks[#blocks + 1] = {
+                kind = "paragraph",
+                variant = "reply_toggle",
+                text = toggle_text,
+                fg = grayForLevel(4),
+                spacing_before = 0.18,
+                action = (not item.replies_loading) and "toggle_replies" or nil,
+                item_index = item_index,
+            }
+
+            if item.replies_expanded and type(item.replies) == "table" then
+                for _, reply in ipairs(item.replies) do
+                    local name = tostring(reply.user_name or "匿名")
+                    local rmeta = "↳ " .. name
+                    local to_name = tostring(reply.reply_to_user_name or "")
+                    if to_name ~= "" and to_name ~= name then
+                        rmeta = rmeta .. " 回复 @" .. to_name
+                    end
+                    local digg = tonumber(reply.digg_count) or 0
+                    if digg > 0 then rmeta = rmeta .. " · ♥ " .. tostring(digg) end
+                    blocks[#blocks + 1] = {
+                        kind = "paragraph",
+                        variant = "reply_meta",
+                        text = rmeta,
+                        fg = grayForLevel(6),
+                        indent_level = 1,
+                        spacing_before = 0.12,
+                        item_index = item_index,
+                    }
+                    local rtext = decode(trimText(reply.text or ""))
+                    if rtext ~= "" then
+                        blocks[#blocks + 1] = {
+                            kind = "paragraph",
+                            variant = "reply",
+                            text = rtext,
+                            fg = Blitbuffer.COLOR_BLACK,
+                            indent_level = 1,
+                            item_index = item_index,
+                        }
+                    end
+                    -- 二级回复也可能带图：纯图回复靠这段显示，缩进 1 级对齐正文。
+                    if type(reply.pics) == "table" and #reply.pics > 0 then
+                        blocks[#blocks + 1] = {
+                            kind = "image",
+                            pics = reply.pics,
+                            item_index = item_index,
+                            indent_level = 1,
+                            spacing_before = 0.12,
+                            spacing_after = 0.06,
+                        }
+                    end
+                end
+
+                if item.replies_more then
+                    local loaded = #item.replies
+                    local total = tonumber(item.replies_total) or (tonumber(item.reply_count) or loaded)
+                    local left = total - loaded
+                    local more_text
+                    if item.replies_loading then
+                        more_text = "… 正在加载更多回复…"
+                    elseif left > 0 then
+                        more_text = string.format("… 还有 %d 条回复", left)
+                    else
+                        more_text = "… 继续加载更多回复"
+                    end
+                    blocks[#blocks + 1] = {
+                        kind = "paragraph",
+                        variant = "reply_toggle",
+                        text = more_text,
+                        fg = grayForLevel(5),
+                        indent_level = 1,
+                        spacing_before = 0.12,
+                        action = (not item.replies_loading) and "more_replies" or nil,
+                        item_index = item_index,
+                    }
+                end
+            end
         end
     end
 
