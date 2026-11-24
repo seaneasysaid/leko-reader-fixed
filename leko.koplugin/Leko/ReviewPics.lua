@@ -1,25 +1,21 @@
 --[[--
-段评图片缓存：目录、命名、路径、统计、清理（Leko 版，移植自 fanqie.review_pics）。
+段评图片缓存：目录、命名、路径与内容校验（Leko 版，移植自 fanqie.review_pics）。
 
 目录结构：<KOReader 数据目录>/leko/cache/review_pics/<book_id>/<稳定哈希>.<ext>
 
-按 book_id 分子目录：书移出书架时整目录删除最干净；判据是**集合成员**
-（书架还在的书整目录保留），不是 mtime —— mtime 只在写入时更新，常读的书
-同样「很旧」，用它清理正是封面缓存踩过的坑。
+按 book_id 分子目录：清理「全部缓存」时整目录删除，不会误删封面缓存。
 
-与 images/（封面）完全独立：混目录会让两边的孤儿清理互相误删。
+与 images/（封面）完全独立：混目录会让两边的清理互相误删。
 ]]--
 
 local lfs = require("libs/libkoreader-lfs")
 local Storage = require("Leko/Storage")
-local logger = require("logger")
 
 local ok_md5, md5 = pcall(require, "md5")
 
 local M = {}
 
 M.DIR_NAME = "review_pics"
-M.AUTO_PRUNE_BYTES = 100 * 1024 * 1024   -- 段评图比封面小而多，阈值取 100MB
 
 local function is_dir(path)
     if type(path) ~= "string" then return false end
@@ -101,122 +97,27 @@ function M.file_exists(path)
     return ok and type(size) == "number" and size > 0
 end
 
-function M.path(book_id, url)
-    local name = M.filename(url)
-    if not name then return nil end
-    local dir = M.dir(book_id)
-    if not dir then return nil end
-    ensure_path(dir)
-    return dir .. "/" .. name
+--- 字节流是否是真实图片（JPEG / PNG / GIF / WebP / BMP）。
+--- 下载层用它在写盘前拦掉错误页；渲染层用它识别历史坏缓存。
+function M.is_image_bytes(body)
+    if type(body) ~= "string" or #body < 12 then return false end
+    local b1, b2, b3, b4 = body:byte(1, 4)
+    if b1 == 0xFF and b2 == 0xD8 and b3 == 0xFF then return true end          -- JPEG
+    if b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then return true end -- PNG
+    if body:sub(1, 3) == "GIF" then return true end                            -- GIF
+    if body:sub(1, 4) == "RIFF" and body:sub(9, 12) == "WEBP" then return true end -- WebP
+    if b1 == 0x42 and b2 == 0x4D then return true end                          -- BMP
+    return false
 end
 
-function M.find(book_id, url)
-    local p = M.path(book_id, url)
-    if p and M.file_exists(p) then return p end
-    return nil
-end
-
-function M.stats(dir)
-    local out = { count = 0, bytes = 0 }
-    if type(dir) ~= "string" then return out end
-    local ok, iter, dir_obj = pcall(lfs.dir, dir)
-    if not ok or type(iter) ~= "function" then return out end
-    for name in iter, dir_obj do
-        if type(name) == "string" and not name:match("^%.") then
-            local path = dir .. "/" .. name
-            local ok_a, size = pcall(lfs.attributes, path, "size")
-            if ok_a and type(size) == "number" and size > 0 then
-                out.count = out.count + 1
-                out.bytes = out.bytes + size
-            end
-        end
-    end
-    return out
-end
-
-function M.total_stats()
-    local out = { count = 0, bytes = 0 }
-    local base = M.base()
-    local ok, iter, dir_obj = pcall(lfs.dir, base)
-    if not ok or type(iter) ~= "function" then return out end
-    for name in iter, dir_obj do
-        if type(name) == "string" and not name:match("^%.") then
-            local st = M.stats(base .. "/" .. name)
-            out.count = out.count + st.count
-            out.bytes = out.bytes + st.bytes
-        end
-    end
-    return out
-end
-
-local function rmdir_tree(path)
-    local ok, iter, dir_obj = pcall(lfs.dir, path)
-    if not ok or type(iter) ~= "function" then return 0 end
-    local removed = 0
-    for name in iter, dir_obj do
-        if type(name) == "string" and name ~= "." and name ~= ".." then
-            local child = path .. "/" .. name
-            if is_dir(child) then
-                removed = removed + rmdir_tree(child)
-            elseif os.remove(child) then
-                removed = removed + 1
-            end
-        end
-    end
-    pcall(lfs.rmdir, path)
-    return removed
-end
-
---- 按书架集合清理：删除不在集合内的 <book_id>/ 整个子目录。
--- @param book_ids table 书架 book_id 数组 / set / book 表数组
--- @return deleted_files, freed_bytes
-function M.prune_orphans(book_ids)
-    local deleted, freed = 0, 0
-    if type(book_ids) ~= "table" then return deleted, freed end
-    local keep = {}
-    local function id_of(v)
-        if type(v) == "table" then return v.book_id or v.bookId or v.id end
-        return v
-    end
-    for k, v in pairs(book_ids) do
-        local id
-        if type(k) == "number" then id = id_of(v) else id = k end
-        if id ~= nil and tostring(id) ~= "" then keep[sanitize(id)] = true end
-    end
-    if next(keep) == nil then return deleted, freed end   -- 空集合不动手
-
-    local base = M.base()
-    local ok, iter, dir_obj = pcall(lfs.dir, base)
-    if not ok or type(iter) ~= "function" then return deleted, freed end
-    local dead = {}
-    for name in iter, dir_obj do
-        if type(name) == "string" and not name:match("^%.") and not keep[name] then
-            local path = base .. "/" .. name
-            if is_dir(path) then
-                dead[#dead + 1] = { path = path, bytes = M.stats(path).bytes }
-            end
-        end
-    end
-    for i = 1, #dead do
-        local n = rmdir_tree(dead[i].path)
-        if n > 0 then
-            deleted = deleted + n
-            freed = freed + dead[i].bytes
-        end
-    end
-    if deleted > 0 then
-        logger.info("Leko review pics: pruned", deleted, "files, freed", freed, "bytes")
-    end
-    return deleted, freed
-end
-
---- 阈值触发的自动清理：超过 AUTO_PRUNE_BYTES 才按书架集合删整目录。
-function M.maybe_auto_prune(book_ids)
-    if type(book_ids) ~= "table" then return 0, 0 end
-    local st = M.total_stats()
-    if st.bytes < M.AUTO_PRUNE_BYTES then return 0, 0 end
-    logger.info("Leko review pics: total", st.bytes, "bytes /", st.count, "images, pruning")
-    return M.prune_orphans(book_ids)
+--- 只读文件头判断缓存是否像图片；读不到按「不是」处理。
+function M.looks_like_image(path)
+    if type(path) ~= "string" or path == "" then return false end
+    local file = io.open(path, "rb")
+    if not file then return false end
+    local head = file:read(16) or ""
+    file:close()
+    return M.is_image_bytes(head)
 end
 
 return M

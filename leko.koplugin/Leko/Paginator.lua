@@ -6,7 +6,6 @@ local BookService = require("Leko/BookService")
 local Util = require("Leko/Util")
 local ReaderMargins = require("Leko/ReaderMargins")
 local FontWeight = require("Leko/FontWeight")
-local logger = require("logger")
 
 local Paginator = {}
 

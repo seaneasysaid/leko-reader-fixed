@@ -1075,7 +1075,13 @@ local function fetchCommentPage(platform, book_id, chapter_id, pid, start, sourc
     local list, para_text = parseV6Comments(payload)
     local data = payload.data or {}
     local next_cursor = tonumber(data.next)
-    if not next_cursor or next_cursor < 0 then next_cursor = start + #list end
+    if not next_cursor or next_cursor < 0 then
+        -- 服务端没给 next 时按**它本页返回的条目数**推进，不能用解析后的
+        -- #list：空正文/纯删帖会被过滤掉，按 #list 推进会少走几条，
+        -- 下一页把同一批评论再返回一遍。
+        local server_count = type(data.items) == "table" and #data.items or #list
+        next_cursor = start + server_count
+    end
     next_cursor = math.floor(next_cursor)
     local has_more = data.has_more == true
     -- 服务端没给 has_more 时按「满一页就还可能有余量」推断；空页到此为止。

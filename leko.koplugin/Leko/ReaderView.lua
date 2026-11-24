@@ -4,7 +4,6 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Event = require("ui/event")
 local FrameContainer = require("ui/widget/container/framecontainer")
-local Font = require("ui/font")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
@@ -1609,8 +1608,13 @@ function ReaderView:showParaComments(paragraph_index, options)
     if model and type(model.para_counts) == "table" then
         known_count = tonumber(model.para_counts[pid])
     end
+    local cursor = tonumber(options.cursor)
     local source = BookService:sourceFor(self.book)
     if not source then
+        -- 续拉失败也不能把「继续加载」按钮锁死：复位之后再让读者重试。
+        if cursor then
+            pcall(function() require("Leko/ReviewPopup").releaseMorePending() end)
+        end
         UIManager:show(Notification:new{ text = "没有找到可用的书源，无法读取段评" })
         return
     end
@@ -1624,13 +1628,19 @@ function ReaderView:showParaComments(paragraph_index, options)
         return
     end
 
-    local cursor = tonumber(options.cursor)
+    local function releaseMore()
+        if cursor and type(ReviewPopup.releaseMorePending) == "function" then
+            pcall(ReviewPopup.releaseMorePending)
+        end
+    end
+
     local token = {}
     self._para_request_token = token
     self:_beginParaWait("正在获取段评…（点按取消）", token, function()
         self._para_request_token = nil
         self:_endParaWait()
         AsyncParaReview:cancel("comments", "user")
+        releaseMore()
     end)
 
     AsyncParaReview:start("comments", {
@@ -1648,6 +1658,7 @@ function ReaderView:showParaComments(paragraph_index, options)
         self:_endParaWait()
         if self._closing then return end
         if not ok then
+            releaseMore()
             UIManager:show(Notification:new{ text = "段评获取失败：" .. tostring(err or "未知错误") })
             return
         end
@@ -1672,6 +1683,7 @@ function ReaderView:showParaComments(paragraph_index, options)
             known_count = known_count,
             pic_dir = pic_dir,
             source = source,
+            continuation = cursor ~= nil,
         })
     end)
     return true
@@ -1725,6 +1737,10 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
         end
     end
     if #items == 0 then
+        if ctx.continuation and ctx.ReviewPopup
+            and type(ctx.ReviewPopup.releaseMorePending) == "function" then
+            pcall(ctx.ReviewPopup.releaseMorePending)
+        end
         local known = ctx.known_count
         UIManager:show(Notification:new{ text = (known and known > 0)
             and ("这一段共有 " .. tostring(known) .. " 条评论，目前拿不到可显示的正文。")
@@ -1884,8 +1900,11 @@ function ReaderView:showPageParaCommentList()
         local label = Util.trim(tostring((model.paragraphs and model.paragraphs[paragraph]) or ""))
         if Util.utf8Length(label) > 12 then label = Util.utf8Sub(label, 1, 12) .. "…" end
         local count = tonumber(model.para_counts[pid]) or 0
+        -- 100 是「99+」的下界哨兵（服务端把热门段截断成 99+），列表里
+        -- 不能再显示成「100 条」，与正文气泡保持一致。
+        local count_text = count > 99 and "99+" or tostring(count)
         buttons[#buttons + 1] = { {
-            text = "第" .. tostring(pid + 1) .. "段 · " .. tostring(count) .. " 条 · " .. label,
+            text = "第" .. tostring(pid + 1) .. "段 · " .. count_text .. " 条 · " .. label,
             callback = function()
                 UIManager:close(dialog)
                 self:showParaComments(paragraph)

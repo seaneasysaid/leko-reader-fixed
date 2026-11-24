@@ -1,4 +1,3 @@
-local rapidjson = require("rapidjson")
 local socket = require("socket")
 local UIManager = require("ui/uimanager")
 local ffiutil = require("ffi/util")

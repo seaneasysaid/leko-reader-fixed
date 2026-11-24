@@ -516,6 +516,14 @@ function PageRenderer:_renderImageBB(pic, box_w, box_h)
     end
     if not drawn then
         bb:free()
+        -- 解不出来且文件头也不是图片：这是历史坏缓存（错误页/半截图），
+        -- 删掉并清掉 missing 标记，下次布局会重新入队下载。
+        if ReviewPics and ReviewPics.file_exists(path)
+            and not ReviewPics.looks_like_image(path) then
+            pcall(os.remove, path)
+            ImgSize.forget(path)
+            self._img_missing[path] = nil
+        end
         return nil
     end
     self._drawn_images = (self._drawn_images or 0) + 1

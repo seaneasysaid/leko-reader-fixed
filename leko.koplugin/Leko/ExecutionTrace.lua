@@ -7,7 +7,6 @@
 
 local Http = require("Leko/Http")
 local Digest = require("Leko/Digest")
-local rapidjson = require("rapidjson")
 
 local ExecutionTrace = {}
 

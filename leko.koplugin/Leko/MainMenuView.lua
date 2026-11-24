@@ -7,7 +7,6 @@ local NetworkMgr = require("ui/network/manager")
 local Notification = require("ui/widget/notification")
 local UIManager = require("ui/uimanager")
 
-local ErrorGuard = require("Leko/ErrorGuard")
 local AsyncStorageStats = require("Leko/AsyncStorageStats")
 local SearchSettings = require("Leko/SearchSettings")
 local Storage = require("Leko/Storage")

@@ -20,7 +20,6 @@ local MemoryGuard = require("Leko/MemoryGuard")
 local ProcessBudget = require("Leko/ProcessBudget")
 local Storage = require("Leko/Storage")
 local SubprocessPayload = require("Leko/SubprocessPayload")
-local logger = require("logger")
 
 local AsyncImageFetch = {
     poll_interval = 0.15,
@@ -69,6 +68,14 @@ local function downloadJob(job)
     local body = response.body
     if type(body) ~= "string" or #body == 0 then
         return { ok = false, error = "图片返回为空" }
+    end
+    -- 错误页 / 半截图一旦写进缓存就再也不会重下（file_exists 只看大小）。
+    -- 落盘前用文件头确认是图片，不合格就当本次失败，并清掉可能存在的旧坏文件。
+    local ok_pics, ReviewPics = pcall(require, "Leko/ReviewPics")
+    if ok_pics and type(ReviewPics) == "table"
+        and not ReviewPics.is_image_bytes(body) then
+        pcall(os.remove, job.path)
+        return { ok = false, error = "图片内容无效" }
     end
     local f = io.open(job.path, "wb")
     if not f then return { ok = false, error = "无法写入图片缓存" } end

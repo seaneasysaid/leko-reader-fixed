@@ -140,6 +140,15 @@ function M.closeVisible()
     end
 end
 
+--- 续拉失败 / 被取消时复位「继续加载」的防连点标记。
+--- 按钮只在弹窗被 _reopen 复用时才会自动复位；请求失败不会重建弹窗，
+--- 不在这里松开，本次弹窗内按钮会一直点不动。
+function M.releaseMorePending()
+    for _, pooled in pairs(_pool) do
+        if pooled then pooled._more_pending = false end
+    end
+end
+
 --- 释放池与位图缓存（换书 / 关闭阅读器时调用）。
 function M.cleanup()
     if not next(_pool) then

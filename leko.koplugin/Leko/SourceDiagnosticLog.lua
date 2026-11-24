@@ -1,5 +1,3 @@
-local socket = require("socket")
-
 local Storage = require("Leko/Storage")
 local Util = require("Leko/Util")
 

@@ -394,22 +394,27 @@ function ThoughtPopupWidget:_handleImageAction(piece, content_x, content_y)
     local path = (self.pic_dir and name) and (self.pic_dir .. "/" .. name) or nil
     local function refetch()
         if not (path and type(self.fetch_pic) == "function") then return end
-        if self._img_inflight and self._img_inflight[pic.url] then return end
-        pcall(self.fetch_pic, pic.fetch or pic.url, path, function(ok)
+        self._img_inflight = self._img_inflight or {}
+        -- 与批量队列共用 inflight 去重：连点不会同时起两个子进程写同一个文件。
+        if self._img_inflight[pic.url] then return end
+        self._img_inflight[pic.url] = true
+        local ok_call = pcall(self.fetch_pic, pic.fetch or pic.url, path, function(ok)
+            self._img_inflight[pic.url] = nil
             if ok then
                 self._pages:invalidateImage(pic.url)
                 self:_refreshImageArea()
             end
         end)
+        if not ok_call then self._img_inflight[pic.url] = nil end
     end
-    -- 0 字节残骸：删掉重下
-    if path and ReviewPics.file_exists(path) then
-        local f = io.open(path, "rb")
-        local size = 0
-        if f then size = f:seek("end") or 0 f:close() end
-        if size <= 0 then pcall(os.remove, path) refetch() return end
-    end
+    -- 无缓存，或缓存文件头根本不是图片（错误页/半截图）：删掉重下。
     if not (path and ReviewPics.file_exists(path)) then refetch() return end
+    if not ReviewPics.looks_like_image(path) then
+        pcall(os.remove, path)
+        if self._pages then self._pages:invalidateImage(pic.url) end
+        refetch()
+        return
+    end
     -- ImageViewer 的 image 形参要 BlitBuffer，文件路径必须给 file（给 image=path 会崩）。
     local ok, viewer = pcall(function()
         return require("ui/widget/imageviewer"):new{ file = path, fullscreen = true }
