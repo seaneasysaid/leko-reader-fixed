@@ -118,8 +118,9 @@ local function singleImageBox(pic, text_w, viewport_h)
     if avail_w < 1 then avail_w = 1 end
     local half_h = math.max(1, math.floor((viewport_h or 0) * IMG_HALF_H_RATIO))
     local half_w = math.max(1, math.floor(text_w * IMG_HALF_W_RATIO))
-    local pw = tonumber(pic and pic.w) or 0
-    local ph = tonumber(pic and pic.h) or 0
+    -- 优先用裁后有效尺寸，否则 800×166 会排成 380×79 矮框，裁完又被压回。
+    local pw = tonumber(pic and (pic._cw or pic.w)) or 0
+    local ph = tonumber(pic and (pic._ch or pic.h)) or 0
     if pw > 0 and ph > 0 then
         if ph >= pw then
             local h = math.min(half_h, math.floor(avail_w * ph / pw + 0.5))
@@ -286,6 +287,10 @@ end
 function PageRenderer:paginate()
     local t0 = os.clock()
     local blocks = ContentBuilder.build(self.items, { contrast = self.contrast, skip_quote = self.skip_quote })
+    -- 分页前先量图：有 expand 黑边的按裁后比例排版，避免排进矮框后被压回。
+    for _, block in ipairs(blocks) do
+        if block.kind == "image" then self:measurePics(block.pics) end
+    end
     local t1 = os.clock()
 
     local item_width = math.min(math.ceil(self.doc_margins.right * 2 / 5), Screen:scaleBySize(10))
@@ -467,6 +472,118 @@ function PageRenderer:_imagePath(pic)
     return self.pic_dir .. "/" .. name
 end
 
+--- 颜色是否接近纯黑（兼容 8bpp 灰度与 RGB32 两种位图）。
+local function is_black_color(c)
+    if not c then return false end
+    if c.r ~= nil then
+        return c.r < 16 and c.g < 16 and c.b < 16
+    end
+    return (c.a or 0) < 16
+end
+
+--- 检测左右两侧整列纯黑的边条（expand 转码模板补的画布）。
+-- 安全阀：对称、各 ≥4px、差 ≤2px、内容 ≥20% 宽，且内容区有非黑像素。
+-- ⚠️ 上限必须 >0.35w：800×166 左右各补 280px，0.35w 正好卡在边界上。
+local function detect_side_bars_impl(w, h, get_pixel)
+    if w < 16 or h < 8 then return 0, 0 end
+    local max_cols = math.floor(w * 0.45)
+    local step_y = math.max(1, math.floor(h / 32))
+    local function run(from_left)
+        local n = 0
+        for k = 0, max_cols - 1 do
+            local x = from_left and k or (w - 1 - k)
+            local black = true
+            for y = 0, h - 1, step_y do
+                if not is_black_color(get_pixel(x, y)) then
+                    black = false
+                    break
+                end
+            end
+            if not black then break end
+            n = n + 1
+        end
+        return n
+    end
+    local l = run(true)
+    local r = run(false)
+    if l < 4 or r < 4 or math.abs(l - r) > 2 then return 0, 0 end
+    -- 内容至少保留 20% 宽
+    local cw = w - l - r
+    if cw < w * 0.2 then return 0, 0 end
+    -- 内容区采样列必须有非黑像素：避免把「整张图本身就是黑底」裁空
+    local has_content = false
+    for k = 0, 7 do
+        local x = l + math.floor((cw - 1) * k / 7)
+        for y = 0, h - 1, step_y do
+            if not is_black_color(get_pixel(x, y)) then
+                has_content = true
+                break
+            end
+        end
+        if has_content then break end
+    end
+    if not has_content then return 0, 0 end
+    return l, r
+end
+
+local function detect_bars_from_bb(bb, w, h)
+    return detect_side_bars_impl(w, h, function(x, y)
+        return bb:getPixel(x, y)
+    end)
+end
+
+--- 解码一张本地图，返回裁后有效宽高；解码失败返回 nil。
+function PageRenderer:_measureOne(path)
+    local ok_src, src = pcall(RenderImage.renderImageFile, RenderImage, path, false)
+    if not ok_src or not src then return nil end
+    local sw, sh = src:getWidth(), src:getHeight()
+    local l, r = detect_bars_from_bb(src, sw, sh)
+    if src.free then pcall(src.free, src) end
+    if l == 0 and r == 0 then return sw, sh end
+    return sw - l - r, sh
+end
+
+--- 分页前量图：扣掉 expand 黑边写回 _cw/_ch；没下载的等落盘后再测。
+--- @return boolean 有效比例是否变化（调用方需要重排）
+function PageRenderer:measurePics(pics)
+    if type(pics) ~= "table" or not (ok_RenderImage and RenderImage) then
+        return false
+    end
+    local changed = false
+    for _, pic in ipairs(pics) do
+        if type(pic) == "table" and pic._cw == nil then
+            local path = self:_imagePath(pic)
+            if path and ReviewPics and ReviewPics.file_exists(path) then
+                local cw, ch = self:_measureOne(path)
+                if cw and cw > 0 and ch and ch > 0 then
+                    pic._cw, pic._ch = cw, ch
+                    local pw = tonumber(pic.w) or 0
+                    local ph = tonumber(pic.h) or 0
+                    if pw <= 0 or ph <= 0 then
+                        changed = true
+                    else
+                        local old_r, new_r = pw / ph, cw / ch
+                        if math.abs(new_r - old_r) > old_r * 0.02 then
+                            changed = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return changed
+end
+
+--- 清掉布局缓存并按当前 _cw/_ch 重新分页（图片有效尺寸变化后调用）。
+function PageRenderer:invalidateLayout()
+    if self._layout_cache and self._layout_cache.clear then
+        self._layout_cache:clear()
+    else
+        self._layout_cache = newLayoutCache()
+    end
+    self:ensureLayout()
+end
+
 --- 解码一张图、等比缩进 box_w × box_h（contain，白底居中），返回整块位图。
 --- 返回 nil 表示「还没下 / 解不出来」→ 调用方画占位框。
 function PageRenderer:_renderImageBB(pic, box_w, box_h)
@@ -477,6 +594,17 @@ function PageRenderer:_renderImageBB(pic, box_w, box_h)
         self._img_missing[path] = true
         return nil
     end
+    local bbtype = Screen:isColorEnabled() and Blitbuffer.TYPE_BBRGB32 or Blitbuffer.TYPE_BB8
+
+    -- expand 会在左右补纯黑画布：有黑边就直接裁，不必再算 contain 几何。
+    if ok_RenderImage and RenderImage then
+        local ok_trim, trimmed = pcall(self._renderTrimmed, self, path, box_w, box_h, bbtype)
+        if ok_trim and trimmed then
+            self._drawn_images = (self._drawn_images or 0) + 1
+            return trimmed
+        end
+    end
+
     local dw, dh = ImgSize.probe(path)
     if not (dw and dw > 0 and dh and dh > 0) then
         dw, dh = tonumber(pic.w) or 0, tonumber(pic.h) or 0
@@ -488,7 +616,6 @@ function PageRenderer:_renderImageBB(pic, box_w, box_h)
     local ox = math.max(0, math.floor((box_w - rw) / 2))
     local oy = math.max(0, math.floor((box_h - rh) / 2))
 
-    local bbtype = Screen:isColorEnabled() and Blitbuffer.TYPE_BBRGB32 or Blitbuffer.TYPE_BB8
     local bb = Blitbuffer.new(box_w, box_h, bbtype)
     bb:fill(Blitbuffer.COLOR_WHITE)
 
@@ -527,6 +654,39 @@ function PageRenderer:_renderImageBB(pic, box_w, box_h)
         return nil
     end
     self._drawn_images = (self._drawn_images or 0) + 1
+    return bb
+end
+
+--- 裁掉 expand 左右黑边后再 contain；无黑边返回 nil。
+function PageRenderer:_renderTrimmed(path, box_w, box_h, bbtype)
+    local src = RenderImage:renderImageFile(path, false)
+    if not src then return nil end
+    local sw, sh = src:getWidth(), src:getHeight()
+    local l, r = detect_bars_from_bb(src, sw, sh)
+    if l == 0 and r == 0 then
+        src:free()
+        return nil
+    end
+
+    local cw = sw - l - r
+    local scale = math.min(box_w / cw, box_h / sh)
+    local tw = math.max(1, math.floor(cw * scale + 0.5))
+    local th = math.max(1, math.floor(sh * scale + 0.5))
+
+    -- blitFrom 带源偏移：只把 [l, 0, cw, sh] 这段拷进新缓冲，再整体缩放。
+    local crop = Blitbuffer.new(cw, sh, src:getType())
+    crop:blitFrom(src, 0, 0, l, 0, cw, sh)
+    src:free()
+    local scaled = RenderImage:scaleBlitBuffer(crop, tw, th)   -- 默认会 free crop
+    if not scaled then return nil end
+
+    local bb = Blitbuffer.new(box_w, box_h, bbtype)
+    bb:fill(Blitbuffer.COLOR_WHITE)
+    local ox = math.max(0, math.floor((box_w - tw) / 2))
+    local oy = math.max(0, math.floor((box_h - th) / 2))
+    bb:blitFrom(scaled, ox, oy, 0, 0,
+        math.min(tw, scaled:getWidth()), math.min(th, scaled:getHeight()))
+    if scaled.free then scaled:free() end
     return bb
 end
 
@@ -671,6 +831,7 @@ PageRenderer._test = {
     imageLayout = imageLayout,
     imageBoundaries = imageBoundaries,
     itemsKey = itemsKey,
+    detect_side_bars = detect_side_bars_impl,
 }
 
 return PageRenderer

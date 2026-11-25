@@ -317,7 +317,31 @@ end
 --- 用 "ui" 而非 "partial"：partial 计入 flashing promotion，REAGL 设备上会被
 --- 提升成全屏闪白（上方正文像蒙了层白纱）。
 function ThoughtPopupWidget:_refreshImageArea()
-    if not self._scroll_container then return end
+    if not (self._scroll_container and self._pages) then return end
+    -- 新落盘的图可能带黑边：比例变了就重排，否则仍会被压进裁前的矮框。
+    local pics = {}
+    for _, item in ipairs(self.items or {}) do
+        if type(item.pics) == "table" then
+            for _, pic in ipairs(item.pics) do pics[#pics + 1] = pic end
+        end
+        if type(item.replies) == "table" then
+            for _, reply in ipairs(item.replies) do
+                if type(reply.pics) == "table" then
+                    for _, pic in ipairs(reply.pics) do pics[#pics + 1] = pic end
+                end
+            end
+        end
+    end
+    local offset = self._scroll_container.scroll_offset or 0
+    if self._pages:measurePics(pics) then
+        self._pages:invalidateLayout()
+        self:_buildLayout()
+        if offset > 0 then self._scroll_container:_setOffset(offset) end
+        UIManager:setDirty(self, function()
+            return "ui", self.container.dimen
+        end)
+        return
+    end
     self._pages:_freePageBBs()
     UIManager:setDirty(self, function()
         return "ui", self._scroll_container.dimen
