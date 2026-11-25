@@ -482,24 +482,25 @@ local function is_black_color(c)
 end
 
 --- 检测左右两侧整列纯黑的边条（expand 转码模板补的画布）。
--- 安全阀：对称、各 ≥4px、差 ≤2px、内容 ≥20% 宽，且内容区有非黑像素。
--- ⚠️ 上限必须 >0.35w：800×166 左右各补 280px，0.35w 正好卡在边界上。
+-- 判据：左右对称（差 ≤2px）、各 ≥4px、裁完内容 ≥16px，且内容区采样列有非黑像素。
+-- 不设「内容占原宽比例」下限：补边宽度只取决于原图多窄，80×80 表情补到 800 宽时
+-- 内容仅占 10%，按比例判会永远裁不掉——防纯黑底图交给采样判据。
+-- 扫描上限 (w-16)/2 永不越过内容中线；0.45w 在 800 宽图各补 360px 时会漏判。
 local function detect_side_bars_impl(w, h, get_pixel)
     if w < 16 or h < 8 then return 0, 0 end
-    local max_cols = math.floor(w * 0.45)
+    local max_cols = math.floor((w - 16) / 2)
     local step_y = math.max(1, math.floor(h / 32))
+    local function column_is_black(x)
+        for y = 0, h - 1, step_y do
+            if not is_black_color(get_pixel(x, y)) then return false end
+        end
+        return true
+    end
     local function run(from_left)
         local n = 0
         for k = 0, max_cols - 1 do
             local x = from_left and k or (w - 1 - k)
-            local black = true
-            for y = 0, h - 1, step_y do
-                if not is_black_color(get_pixel(x, y)) then
-                    black = false
-                    break
-                end
-            end
-            if not black then break end
+            if not column_is_black(x) then break end
             n = n + 1
         end
         return n
@@ -507,23 +508,16 @@ local function detect_side_bars_impl(w, h, get_pixel)
     local l = run(true)
     local r = run(false)
     if l < 4 or r < 4 or math.abs(l - r) > 2 then return 0, 0 end
-    -- 内容至少保留 20% 宽
     local cw = w - l - r
-    if cw < w * 0.2 then return 0, 0 end
-    -- 内容区采样列必须有非黑像素：避免把「整张图本身就是黑底」裁空
-    local has_content = false
-    for k = 0, 7 do
-        local x = l + math.floor((cw - 1) * k / 7)
-        for y = 0, h - 1, step_y do
-            if not is_black_color(get_pixel(x, y)) then
-                has_content = true
-                break
-            end
+    -- 绝对下限：裁完不足 16px 就没有显示价值了
+    if cw < 16 then return 0, 0 end
+    -- 内容区不能整块是黑的：均匀采样 5 列（避开两端），全黑说明不是画布补边，放弃
+    for i = 1, 5 do
+        if not column_is_black(l + math.floor(cw * i / 6)) then
+            return l, r
         end
-        if has_content then break end
     end
-    if not has_content then return 0, 0 end
-    return l, r
+    return 0, 0
 end
 
 local function detect_bars_from_bb(bb, w, h)

@@ -65,15 +65,15 @@ Shushan.HOSTS = {
     "https://v2.vossc.com",
     "https://v3.vossc.com",
     "http://113.44.163.166:7001",
+    -- 2026-11-25 应 Sean 要求加回。曾因恒 502 于 11-20 摘除，现恢复参与轮换；
+    -- 慢节点由 HOST_STATS 动态排序自动沉底，静态位置只是同档时的兜底次序。
+    "http://1.94.248.5:7001",
 }
 
--- 已摘除的节点：`http://1.94.248.5:7001` 实测恒 502 / 10s 超时，2026-11-20
--- 从池子里拿掉。留这份名单只为一件事：它历史上被 _rememberHost 记成过首选并
--- 落进用户的 login_info，hostOrder 必须继续忽略这个旧值，否则每次请求又会先
--- 白等一个超时。
-Shushan.RETIRED_HOSTS = {
-    ["http://1.94.248.5:7001"] = true,
-}
+-- 退役节点名单：被 _rememberHost 记成首选并落进用户 login_info 的旧 host，
+-- hostOrder 会对它们禁用插队（避免每次请求先白等一个超时）。
+-- 字段保留为空表——hostOrder 直接索引该表，删除字段会导致 nil 索引报错。
+Shushan.RETIRED_HOSTS = {}
 
 Shushan.REQUEST_TIMEOUT = 20
 Shushan.MAX_BYTES = 4 * 1024 * 1024
