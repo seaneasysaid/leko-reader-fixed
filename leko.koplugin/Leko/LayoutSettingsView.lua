@@ -31,6 +31,7 @@ local Screen = Device.screen
 local FontSelectionView = require("Leko/FontSelectionView")
 local FontWeight = require("Leko/FontWeight")
 local Storage = require("Leko/Storage")
+local Util = require("Leko/Util")
 local W = require("Leko/InkStyle")
 
 local LayoutSettingsView = {}
@@ -185,29 +186,37 @@ function LayoutSettingsView:new(opts)
     local function fontPillText()
         local name = FontSelectionView:getDisplayName(style)
         if name == FontSelectionView.SYSTEM_DISPLAY_NAME then name = "系统字体" end
-        -- pill 只有半行宽：按字节截断后去掉尾部不完整的 UTF-8 字节。
-        if #name > 21 then name = name:sub(1, 21):gsub("[\128-\191]+$", "") .. "…" end
-        return "字体：" .. name
+        -- pill 只有半行宽：按字符截断（按字节切会把汉字切成残缺 UTF-8，
+        -- 渲染成◇问号）。前缀「字体：」占 3 个字符，名字留 7 个。
+        return "字体：" .. Util.truncateUtf8(name, 7, "…")
     end
     body[#body + 1] = pillPair(
         fontPillText(), function() close(function() if opts.onFont then opts.onFont() end end) end,
         "阅读状态栏", function() close(function() if opts.onStatus then opts.onStatus() end end) end)
     body[#body + 1] = VerticalSpan:new{ width = W.px(6) }
+    -- 默认排版快照只含排版页能改的项（六滑块 + 首行缩进 + 字体），
+    -- 不碰夜间模式/段评/状态栏这些设备控制项。
+    local layout_keys = {
+        "body_font_size", "body_weight", "line_spacing", "paragraph_spacing",
+        "paragraph_spacing_em", "indent", "text_align", "margin_left",
+        "margin_right", "margin_top", "margin_bottom", "body_font",
+        "body_font_index", "body_font_display_name",
+    }
     body[#body + 1] = pillPair(
         "保存为默认排版", function()
-            Storage:saveReaderStyle(style)
+            local snapshot = {}
+            for _, key in ipairs(layout_keys) do snapshot[key] = style[key] end
+            Storage:saveDefaultReaderStyle(snapshot)
             UIManager:show(require("ui/widget/notification"):new{ text = "已保存为默认排版" })
         end,
         "恢复默认排版", function()
             apply(function(s)
-                local default = Storage:getDefaultReaderStyle()
-                for _, key in ipairs({
-                    "body_font_size", "body_weight", "line_spacing", "paragraph_spacing",
-                    "paragraph_spacing_em",
-                    "indent", "text_align", "margin_left", "margin_right",
-                    "margin_top", "margin_bottom",
-                }) do s[key] = default[key] end
+                -- 优先读用户保存过的快照；从没保存过才回退出厂默认。
+                local saved = Storage:getSavedDefaultReaderStyle()
+                local default = saved or Storage:getDefaultReaderStyle()
+                for _, key in ipairs(layout_keys) do s[key] = default[key] end
             end)
+            UIManager:show(require("ui/widget/notification"):new{ text = "已恢复默认排版" })
         end)
     body[#body + 1] = VerticalSpan:new{ width = W.px(6) }
     body[#body + 1] = W.pill("关闭", inner_w, function() close() end, W.px(40))

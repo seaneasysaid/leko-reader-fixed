@@ -78,13 +78,6 @@ function FontWeight.label(value)
     return "特粗"
 end
 
--- 旧版全屏排版菜单仍按整数档循环；新版滑块走 clamp，不依赖这里。
-function FontWeight.next(value)
-    local weight = FontWeight.clamp(value)
-    if weight < 0 or weight >= 3 then return 0 end
-    return math.floor(weight + 0.5) + 1
-end
-
 local function emboldenStrength(ftsize, factor)
     if not ftsize or not factor or factor <= 0 then return nil end
     local ok, strength = pcall(ftsize.getEmboldenHalfStrength, ftsize, factor)

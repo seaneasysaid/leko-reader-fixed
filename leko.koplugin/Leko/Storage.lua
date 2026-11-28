@@ -1401,9 +1401,14 @@ function Storage:getReaderStyle()
     for key, value in pairs(saved) do style[key] = value end
     -- 旧字段一律清掉，避免旧粗体存档残留。
     style.body_bold = false
-    -- 字重 0-3，旧配置缺省为「正常」。
-    local weight = math.floor((tonumber(style.body_weight) or 0) + 0.5)
-    style.body_weight = math.max(0, math.min(3, weight))
+    -- 字重沿用 -3~5.5 / 0.25 连续刻度：吸附到刻度但不取整到旧四档，
+    -- 否则用户设的 1.75 会在每次打开时被读成 2。
+    local ok_weight, FontWeight = pcall(require, "Leko/FontWeight")
+    if ok_weight then
+        style.body_weight = FontWeight.clamp(style.body_weight or 0)
+    else
+        style.body_weight = tonumber(style.body_weight) or 0
+    end
     -- 0.15.19 persisted the old fixed 44/54 chapter-opening gaps. Migrate
     -- only those title fields; never touch the user's font, horizontal
     -- reading margins, line spacing or indentation preference.
@@ -1420,6 +1425,18 @@ end
 function Storage:saveReaderStyle(style)
     self:getSettings():saveSetting("reader_style", style)
     self:getSettings():flush()
+end
+
+-- 「保存为默认排版」用的独立快照。reader_style 是正在用的排版，每次调滑块
+-- 都会被 applyStyleChange 覆盖，不能当默认；这里单独存一份，恢复时读它。
+function Storage:saveDefaultReaderStyle(style)
+    self:getSettings():saveSetting("default_reader_style", style)
+    self:getSettings():flush()
+end
+
+-- 返回用户保存过的默认排版；没保存过返回 nil，调用方回退出厂默认。
+function Storage:getSavedDefaultReaderStyle()
+    return self:getSettings():readSetting("default_reader_style")
 end
 
 function Storage:saveBookProgress(book)
