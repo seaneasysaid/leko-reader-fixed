@@ -43,7 +43,7 @@ end
 function MobileSourceImportView:_build()
     local width, height = self.dimen.w, self.dimen.h
     local header_h = math.max(54, math.floor(height * 0.075))
-    local footer_h = math.max(62, math.floor(height * 0.085))
+    local footer_h = header_h
     local text_width = math.max(1, width - 28)
     local qr_limit = math.min(width - 36, math.floor(height * 0.49))
     local module_size = math.max(1, math.floor(qr_limit / (self.qr.size + 8)))
@@ -54,7 +54,7 @@ function MobileSourceImportView:_build()
         quiet_zone = 4,
     }
 
-    local header = UI.header(width, header_h, {
+    local header = UI.topBar(width, header_h, {
         left_text = "‹ 返回",
         title = "用手机导入书源",
         on_left = function() self:onClose() end,
@@ -88,7 +88,7 @@ function MobileSourceImportView:_build()
         UI.vspace(4),
         self.status_widget,
     }
-    local footer = UI.footer(width, footer_h, {
+    local footer = UI.bottomBar(width, footer_h, {
         { text = "取消", bold = true, callback = function() self:onClose() end },
     })
     self[1] = UI.screen(width, height, header, body, footer, header_h, footer_h)

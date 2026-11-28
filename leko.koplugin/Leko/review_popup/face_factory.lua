@@ -42,10 +42,10 @@ FaceFactory.VARIANTS = {
     reply_toggle = 0.93,  -- 「展开/收起 N 条回复」是可点控件，不能太小
 }
 
--- 正文字重 -> 仿粗强度，与 Leko/FontWeight.lua 的四档一致
--- （0 正常 / 1 微粗 / 2 中粗 / 3 加粗 = KOReader 标准粗体 3/8）。
--- 弹窗只跟「字重」，不拿对比度当粗细用（那是栅格 gamma，拿去加粗会糊）。
-FaceFactory.WEIGHT_FACTORS = { [0] = 0, 1 / 8, 1 / 4, 3 / 8 }
+-- 弹窗只跟正文「字重」，不拿对比度当粗细用（那是栅格 gamma，拿去加粗会糊）。
+-- 档位与换算统一走 Leko/FontWeight.lua：范围 -3~5.5 / 步长 0.25，
+-- 旧四档 0/1/2/3 的视觉效果保持不变。
+local FontWeight = require("Leko/FontWeight")
 
 function FaceFactory:init()
     if self.initialized then return end
@@ -291,16 +291,17 @@ end
 --- @param face_index number|nil 字体文件内字面序号（TTC，style.body_font_index）
 function FaceFactory:getFace(font_name, size, variant, doc_weight, face_index)
     variant = variant or "content"
-    doc_weight = math.max(0, math.min(3, math.floor((tonumber(doc_weight) or 0) + 0.5)))
+    doc_weight = FontWeight.clamp(doc_weight)
     face_index = tonumber(face_index)
-    local key = string.format("%s|%d|%s|w%d|i%s",
-        font_name or "", size or 0, variant, doc_weight, tostring(face_index))
+    local key = string.format("%s|%s|%s|w%s|i%s",
+        font_name or "", tostring(size or 0), variant,
+        FontWeight.key(doc_weight), tostring(face_index))
     local cached = self.face_cache[key]
     if cached then return cached end
 
     local ratio = self.VARIANTS[variant] or 1.0
     local v_size = math.max(8, math.floor(size * ratio + 0.5))
-    local embolden = self.WEIGHT_FACTORS[doc_weight]
+    local embolden = FontWeight.factor(doc_weight)
     if not embolden or embolden <= 0 then embolden = nil end
     local face
 

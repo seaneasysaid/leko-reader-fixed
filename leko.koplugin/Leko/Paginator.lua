@@ -154,11 +154,9 @@ function Paginator:getGeometry(style)
     if cell_width and cell_width > 0 and cell_width <= content_width then
         local fitted_width = math.floor(content_width / cell_width) * cell_width
         if (style.margin_left or 28) == (style.margin_right or 28) then
-            local preset = ReaderMargins:index(style.margin_left or 28)
-            if preset then
-                fitted_width = ReaderMargins:columns(preset, screen_width, cell_width,
-                    function(value) return Screen:scaleBySize(value) end) * cell_width
-            end
+            -- 传真实边距值：旧五档仍走兼容算法，新 2px 细刻度按实际列宽取整。
+            fitted_width = ReaderMargins:columns(style.margin_left or 28, screen_width,
+                cell_width, function(value) return Screen:scaleBySize(value) end) * cell_width
         end
         local remainder = content_width - fitted_width
         local left_extra = math.floor(remainder / 2)

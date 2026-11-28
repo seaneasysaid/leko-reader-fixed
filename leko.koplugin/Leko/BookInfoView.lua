@@ -290,7 +290,8 @@ function BookInfoView:rebuild()
     self.book.in_library = in_library
     self.book.not_shelf = not in_library
     local header_h = math.max(54, math.floor(height * 0.075))
-    local footer_h = math.max(62, math.floor(height * 0.085))
+    -- 顶/底菜单等高，上下留白对称（Sean 2026-11-28）。
+    local footer_h = header_h
     local body_h = height - header_h - footer_h
     local margin = math.max(14, math.floor(width * 0.03))
     local cover_w = math.floor(width * 0.28)
@@ -314,7 +315,7 @@ function BookInfoView:rebuild()
         end
     end
 
-    local header = UI.header(width, header_h, {
+    local header = UI.topBar(width, header_h, {
         left_text = "‹ 返回",
         title = "书籍详情",
         right_text = "更多 ›",
@@ -369,17 +370,20 @@ function BookInfoView:rebuild()
         },
     }
 
-    local footer = UI.footer(width, footer_h, {
+    -- 五项菜单字号统一 20pt，只给主操作加粗（Sean 2026-11-28）。
+    local footer = UI.bottomBar(width, footer_h, {
         {
             text = in_library and "继续阅读" or "开始试读",
             bold = true,
+            font_size = 20,
             callback = function() self:startReading() end,
         },
-        { text = "目录", callback = function() self:showToc() end },
-        { text = "书籍换源", font_size = 16, enabled = self.book.source_id ~= nil, callback = function() self:showBookSourceSwitcher() end },
-        { text = "封面换源", font_size = 16, enabled = self.book.source_id ~= nil, callback = function() self:showCoverSourceSwitcher() end },
+        { text = "目录", font_size = 20, callback = function() self:showToc() end },
+        { text = "书籍换源", font_size = 20, enabled = self.book.source_id ~= nil, callback = function() self:showBookSourceSwitcher() end },
+        { text = "封面换源", font_size = 20, enabled = self.book.source_id ~= nil, callback = function() self:showCoverSourceSwitcher() end },
         {
             text = in_library and "移出书架" or "加入书架",
+            font_size = 20,
             callback = function() self:toggleBookshelf() end,
         },
     })

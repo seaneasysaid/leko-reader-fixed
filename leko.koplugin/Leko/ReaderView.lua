@@ -2,6 +2,8 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
+local DeviceControlView = require("Leko/DeviceControlView")
+local LayoutSettingsView = require("Leko/LayoutSettingsView")
 local Event = require("ui/event")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
@@ -9,7 +11,6 @@ local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local InputDialog = require("ui/widget/inputdialog")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local Notification = require("ui/widget/notification")
 local OverlapGroup = require("ui/widget/overlapgroup")
@@ -27,11 +28,9 @@ local AsyncImageFetch = require("Leko/AsyncImageFetch")
 local AsyncParaReview = require("Leko/AsyncParaReview")
 local BookService = require("Leko/BookService")
 local FontSelectionView = require("Leko/FontSelectionView")
-local FontWeight = require("Leko/FontWeight")
 local KOReaderStatisticsBridge = require("Leko/KOReaderStatisticsBridge")
 local Paginator = require("Leko/Paginator")
 local ParaComments = require("Leko/ParaComments")
-local ReaderMargins = require("Leko/ReaderMargins")
 local ReaderFooter = require("Leko/ReaderFooter")
 local ShushanAuth = require("Leko/ShushanAuth")
 local Storage = require("Leko/Storage")
@@ -39,63 +38,19 @@ local TocView = require("Leko/TocView")
 local UI = require("Leko/UI")
 local Util = require("Leko/Util")
 
--- Keep the semantic direction constants available even when an older or
--- mixed plugin directory cannot load the optional transition coordinator.
--- The real module is loaded only when a ReaderView is created.
-local SwipeRefresh = { FORWARD = "forward", BACKWARD = "backward" }
-local swipe_refresh_module
-local swipe_refresh_load_error
-
-local function loadSwipeRefresh()
-    if swipe_refresh_module ~= nil then
-        return swipe_refresh_module ~= false and swipe_refresh_module or nil,
-            swipe_refresh_load_error
-    end
-    local ok, module = pcall(require, "Leko/SwipeRefresh")
-    if not ok or type(module) ~= "table" or type(module.new) ~= "function" then
-        swipe_refresh_load_error = tostring(ok and "transition coordinator API is invalid" or module)
-        swipe_refresh_module = false
-        return nil, swipe_refresh_load_error
-    end
-    swipe_refresh_module = module
-    SwipeRefresh = module
-    return module
-end
-
--- 翻页动画四档：关 / 快 / 正常 / 慢。
---
--- 关键：电子墨水每画一条带就要提交一次局部刷新，一次刷新本身就要几十毫秒
--- 并且等波形完成，所以只调「两条带之间等多久」（8~30 ms）几乎看不出来。
--- 真正决定总时长的是**刷新的次数**，所以档位主要改条带数：快 4 条、慢 12 条，
--- 间隔只作微调。正常档不写条带数，沿用 SwipeRefresh 的默认值（竖屏 8 /
--- 横屏 6）—— 横竖屏的最优条带数本来就不一样，写死一个反而两边都不合适。
-local SWIPE_MODES = {
-    off = { label = "关", delay = 0 },
-    fast = { label = "快", delay = 0.006, strips = 4 },
-    normal = { label = "正常", delay = 0.012 },
-    slow = { label = "慢", delay = 0.028, strips = 12 },
-}
-local SWIPE_MODE_ORDER = { "off", "fast", "normal", "slow" }
-
-local function normalizeSwipeMode(value)
-    if SWIPE_MODES[value] then return value end
-    return "normal"
-end
-
-local function nextSwipeMode(value)
-    local current = normalizeSwipeMode(value)
-    for index, key in ipairs(SWIPE_MODE_ORDER) do
-        if key == current then
-            return SWIPE_MODE_ORDER[index % #SWIPE_MODE_ORDER + 1]
-        end
-    end
-    return "normal"
-end
+-- 翻页方向常量。leko 不再自带动画实现，翻页动画统一交给 KOReader 原生
+-- swipe animation：翻页时设 Screen:setSwipeAnimations(true) + 方向标志，
+-- UIManager:_repaint 里的动画补丁会在画新页前保存旧页、逐条带擦除。
+-- 开关复用 KOReader 全局 G_reader_settings 的 swipe_animations（与 KOReader 原生一致）。
+-- 全刷同理：翻页只发 "partial"（不带 region），由 KOReader 的
+-- full_refresh_count（设置里的「全刷页数」）按全局计数自动升级为 full，
+-- leko 不再自己强制整屏刷新，全刷节奏完全由 KOReader 决定。
+local PageDirection = { FORWARD = "forward", BACKWARD = "backward" }
 
 local ReaderView = InputContainer:extend{
     covers_fullscreen = true,
     -- Full-screen application pages must remain non-modal.
-    -- KOReader keeps modal windows above ordinary dialogs, which would hide InputDialog/ButtonDialog.
+    -- KOReader keeps modal windows above ordinary dialogs, which would hide ButtonDialog.
     modal = false,
 }
 
@@ -104,18 +59,11 @@ function ReaderView:init()
     self.history = {}
     self.menu_visible = false
     self._exit_dialog = nil
-    self._layout_dialog = nil
     self._closing = false
     self.prefetch_state = nil
     self._progress_dirty = false
     self._footer_dirty = true
     self.page_generation = 0
-    self._pending_rebuild = nil
-    -- 同章翻页动画档位（off / fast / normal / slow），见文件顶部的 SWIPE_MODES。
-    -- 老配置只有 page_transition_enabled，按它决定开/关，档位缺省为正常。
-    self.swipe_mode = (self.style.page_transition_enabled == false)
-        and "off" or normalizeSwipeMode(self.style.page_animation_speed)
-    self.chapter_clean_wave_enabled = self.style.chapter_clean_wave_enabled ~= false
     -- 段评默认关闭。开启后为番茄 / 七猫 / QQ阅读章节拉取评论计数，并在段末显示 [N] 气泡。
     self.para_review_enabled = self.style.para_review_enabled == true
     -- 段末气泡的屏幕矩形（每次重画正文时重建），routeTap 用它做命中判定。
@@ -132,20 +80,6 @@ function ReaderView:init()
     self._para_request_token = nil
     self._para_counts_token = nil
     self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
-    local swipe_module, swipe_error = loadSwipeRefresh()
-    if swipe_module then
-        local constructed, coordinator = pcall(swipe_module.new, swipe_module, {
-            screen = Screen,
-            ui_manager = UIManager,
-        })
-        if constructed and type(coordinator) == "table" then
-            self.swipe_refresh = coordinator
-        else
-            self.swipe_refresh = nil
-            swipe_error = tostring(coordinator or "transition coordinator initialization failed")
-        end
-    end
-    self._swipe_refresh_load_error = swipe_error
     self.ges_events = self.ges_events or {}
     self.key_events = self.key_events or {}
 
@@ -195,19 +129,6 @@ function ReaderView:init()
     self:setPage(page, "full")
     self.statistics_bridge = KOReaderStatisticsBridge:new{}
     self.statistics_bridge:start(self.book, self:_statisticsVirtualPage())
-    if self._swipe_refresh_load_error then
-        local message = "动画效果模块加载失败，已回退普通刷新。请完全退出并重新打开 KOReader 后，重新复制完整的 leko.koplugin 文件夹。"
-        logger.warn("Leko transition coordinator disabled:", self._swipe_refresh_load_error)
-        if type(UIManager.nextTick) == "function" then
-            UIManager:nextTick(function()
-                if not self._closing then
-                    UIManager:show(Notification:new{ text = message })
-                end
-            end)
-        else
-            UIManager:show(Notification:new{ text = message })
-        end
-    end
 end
 
 local function clamp01(value)
@@ -310,8 +231,9 @@ end
 
 function ReaderView:getMenuMetrics()
     local top_h = math.max(56, math.floor(self.dimen.h * 0.075))
-    -- One compact action row. Font controls live inside the layout dialog.
-    local bottom_h = math.max(64, math.floor(self.dimen.h * 0.09))
+    -- One compact action row. Font/layout controls live in the bottom sheet.
+    -- 底部四项菜单条与顶部同高（原来 64 / 0.09 偏高），上下留白收紧、更对称。
+    local bottom_h = math.max(56, math.floor(self.dimen.h * 0.075))
     return top_h, bottom_h
 end
 
@@ -499,13 +421,18 @@ end
 function ReaderView:_ensureClockTimer()
     if self._clock_timer or self._closing then return end
     -- 时间已经挪到页脚左下角（Sean 2026-11-02），所以生命线跟着页脚走。
-    if not self.page or not self.style.show_footer then return end
+    -- 状态栏细分开关：关了页脚或时间、或关了「每分钟自动刷新」就不起表，
+    -- 免得为一条看不见的时钟每分钟重绘一次页脚。
+    if not self.page or not self.style.show_footer or self.style.show_time == false
+            or self.style.status_minute_refresh == false then return end
     local ok, seconds = pcall(os.date, "%S")
     local delay = 60 - (tonumber(seconds) or 0)
     if delay < 1 then delay = 1 end
     self._clock_timer = function()
         self._clock_timer = nil
-        if self._closing or not self.page or not self.style.show_footer then return end
+        if self._closing or not self.page or not self.style.show_footer
+                or self.style.show_time == false
+                or self.style.status_minute_refresh == false then return end
         if UIManager.isWidgetShown and not UIManager:isWidgetShown(self) then return end
         -- 时间在页脚左下角：只重绘页脚那条，正文和页眉都不动。
         self:rebuild("ui", self:_footerRegion() or self.dimen)
@@ -549,7 +476,9 @@ function ReaderView:buildFooterStatus(page, geometry)
     local chapter_count = #(self.book.chapters or {})
     local book_progress = chapter_count > 0
         and clamp01(((chapter_index - 1) + chapter_percentage) / chapter_count) or 0
-    local left_text = self:_clockText()
+    -- 状态栏细分开关：时间 / 页码各自独立，关掉的那一项留空但仍占位，
+    -- 这样页脚高度不变、Paginator 分页不受影响（和状态栏开关语义一致）。
+    local left_text = self.style.show_time == false and "" or self:_clockText()
     -- 全书进度精确到小数点后两位。
     local book_text = string.format("%.2f%%", book_progress * 100)
     -- 四舍五入会把「最后一章读到 99.996%」显示成 100.00%，看着像读完了。
@@ -559,7 +488,12 @@ function ReaderView:buildFooterStatus(page, geometry)
     local page_text = page_number and page_total and string.format("%d/%d", page_number, page_total)
         or "--/--"
     -- 「12/37」和「32.15%」之间留两个空格：一个空格太挤，两个才分得开（Sean 要求）。
-    local right_text = page_text .. "  " .. book_text
+    local right_text
+    if self.style.show_page == false then
+        right_text = ""
+    else
+        right_text = page_text .. "  " .. book_text
+    end
     -- The footer no longer renders any cache/prefetch indicator. A progress bar
     -- here meant one footer-only repaint per prefetch tick, and those regional
     -- refreshes could race the chapter-turn full refresh on E Ink.
@@ -692,22 +626,30 @@ end
 -- 时间已经挪到页脚左下角（Sean 2026-11-02 调整），页眉只留状态图标。
 function ReaderView:_headerStatusText()
     local parts = {}
-    local wifi = self:_wifiSymbol()
-    if wifi then parts[#parts + 1] = wifi end
-    local battery, battery_percent = self:_batterySymbol()
-    -- 百分比紧贴图标（「🔋85%」），不额外加空格：页眉左边还要留位置给章节名。
-    if battery then
-        if battery_percent then
-            battery = battery .. string.format("%d%%", battery_percent)
+    -- 状态栏细分开关：Wi-Fi / 电量各自独立，关掉就不取图标也不显示。
+    if self.style.show_wifi ~= false then
+        local wifi = self:_wifiSymbol()
+        if wifi then parts[#parts + 1] = wifi end
+    end
+    if self.style.show_battery ~= false then
+        local battery, battery_percent = self:_batterySymbol()
+        -- 百分比紧贴图标（「🔋85%」），不额外加空格：页眉左边还要留位置给章节名。
+        if battery then
+            if battery_percent then
+                battery = battery .. string.format("%d%%", battery_percent)
+            end
+            parts[#parts + 1] = battery
         end
-        parts[#parts + 1] = battery
     end
     return table.concat(parts, " ")
 end
 
--- 夜间模式: dark background with light text (黑底白字).
+-- ⭐ 夜间模式与 KOReader 全局一致：走 KOReader 全局 Screen.night_mode，
+-- 由 framebuffer 级反转（硬件灰度反转 / bb:invert）把整屏日间配色翻成夜间。
+-- leko 自己**不再另画黑底白字**，否则会被 framebuffer 再反一次=没效果。
+-- 保留这个函数只为兼容既有调用点，恒返回 false（即页面始终按日间色绘制）。
 function ReaderView:isNightMode()
-    return self.style and self.style.night_mode == true
+    return false
 end
 
 -- 前向声明：段评气泡坐标探针的类定义在文件后半段（见下方 `_ParaMarkerAnchor`
@@ -752,7 +694,9 @@ function ReaderView:buildReadingPage(page)
             LeftContainer:new{
                 dimen = Geom:new{ w = title_width, h = geometry.header_height },
                 TextWidget:new{
-                    text = page.chapter_title or self.book.title,
+                    -- 状态栏细分开关：关掉标题就留空，页眉高度不变。
+                    text = self.style.show_title == false and ""
+                        or (page.chapter_title or self.book.title),
                     face = geometry.chrome_face, padding = 0,
                     max_width = title_width,
                     fgcolor = chrome_color,
@@ -939,7 +883,9 @@ end
 function ReaderView:buildMenuOverlay()
     local width, height = self.dimen.w, self.dimen.h
     local top_h, bottom_h = self:getMenuMetrics()
-    local top = UI.header(width, top_h, {
+    -- 简洁风格：菜单项无方框、项间竖细线，上/下各一条 2px 中灰横线与正文分隔。
+    -- topBar/bottomBar 内部已给线留 1px，整体高度保持 top_h/bottom_h 不变。
+    local top = UI.topBar(width, top_h, {
         left_text = "‹ 书架",
         title = self.book.title or "阅读",
         right_text = "书籍详情",
@@ -949,13 +895,6 @@ function ReaderView:buildMenuOverlay()
     })
     top.overlap_offset = { 0, 0 }
 
-    local actions = UI.footer(width, bottom_h, {
-        { text = "目录", bold = true, callback = function() self:showToc() end },
-        { text = "上一章", callback = function() self:jumpChapter(-1) end },
-        { text = "下一章", callback = function() self:jumpChapter(1) end },
-        { text = "阅读设置", font_size = 16, callback = function() self:showLayoutMenu() end },
-        { text = "刷新本章", font_size = 16, callback = function() self:reloadCurrentChapter() end },
-    })
     local bottom = FrameContainer:new{
         width = width,
         height = bottom_h,
@@ -963,7 +902,14 @@ function ReaderView:buildMenuOverlay()
         padding = 0,
         background = Blitbuffer.COLOR_WHITE,
         overlap_offset = { 0, height - bottom_h },
-        actions,
+        UI.bottomBar(width, bottom_h, {
+            -- 四项与顶部「书架 / 书籍详情」按钮完全同款：20pt 常规体、不加粗，
+            -- 避免「目录」粗体、其余常规造成的字号/字重不一致（Sean 2026-11-28）。
+            { text = "目录", font_size = 20, callback = function() self:showToc() end },
+            { text = "排版设置", font_size = 20, callback = function() self:showLayoutMenu() end },
+            { text = "设备控制", font_size = 20, callback = function() self:showDeviceMenu() end },
+            { text = "刷新本章", font_size = 20, callback = function() self:reloadCurrentChapter() end },
+        }),
     }
     return top, bottom
 end
@@ -995,18 +941,6 @@ function ReaderView:rebuild(refresh_type, refresh_region)
     -- The cache window is established by setPage before the target page is
     -- built. Here we only recover the service-owned state for a redraw.
     self:_syncPrefetchState()
-    -- The ordinary path must remain independent of transition state. This is
-    -- especially important immediately after the user turns animation off:
-    -- a stale visual coordinator flag must not turn a direct rebuild into a
-    -- pending repaint.
-    if self:isSwipeAnimationEnabled() and self.swipe_refresh
-            and self.swipe_refresh:isRunning() then
-        self._pending_rebuild = {
-            refresh_type = refresh_type or "ui",
-            refresh_region = refresh_region,
-        }
-        return false
-    end
     local page_widget = self:buildReadingPage(self.page)
     if self.menu_visible then
         local top, bottom = self:buildMenuOverlay()
@@ -1025,100 +959,65 @@ function ReaderView:rebuild(refresh_type, refresh_region)
     return true
 end
 
--- The transition callback means that Screen.bb now owns the submitted pixels;
--- it is not a physical E Ink waveform-complete notification.
-function ReaderView:_finishSwipeSubmission()
-    if self._closing or not self.page then return end
-    self:_syncPrefetchState()
-    local page_widget = self:buildReadingPage(self.page)
-    if self.menu_visible then
-        local top, bottom = self:buildMenuOverlay()
-        self[1] = OverlapGroup:new{
-            dimen = self.dimen:copy(),
-            allow_mirroring = false,
-            page_widget,
-            top,
-            bottom,
-        }
-    else
-        self[1] = page_widget
+-- 屏幕方向：KOReader 原生 rotation 菜单走 UIManager:broadcastEvent，
+-- 设备控制页的竖屏/逆时针/顺时针三个按钮也发同一个 SetRotationMode 事件。
+-- leko 的 ReaderView 尺寸与分页签名都绑在 Screen 宽高上，转屏后必须就地
+-- 更新 dimen 并整页重排，否则正文会按旧尺寸排版、只画半屏。
+function ReaderView:onSetRotationMode(mode)
+    if self._closing then return false end
+    local old_mode = Screen:getRotationMode()
+    if mode == nil or mode == old_mode then return false end
+    Screen:setRotationMode(mode)
+    self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
+    -- ⭐ 关键：rebuild 只会用旧的 self.page 重画，页面是按转屏前的宽度折行的。
+    -- 横竖切换后必须按当前锚点重新 makePage，正文才会重新折行铺满新屏幕；
+    -- 否则只画左侧一部分，右侧露出被旋转 90° 的弹窗残影 —— 翻页时才重排，
+    -- 这正是「切换方向后卡屏，翻页才消失」的根因。
+    if self.page and self.book then
+        local anchor = self.page.start_position
+        local page, err = Paginator:makePage(self.book, anchor, self.style)
+        if page then
+            self.page = page
+            self._progress_dirty = true
+            self._footer_dirty = true
+            self:_syncPrefetchState()
+        else
+            logger.warn("Leko rotation reflow failed", tostring(err))
+        end
     end
-    local pending = self._pending_rebuild
-    self._pending_rebuild = nil
-    if pending then
-        local mode, region = pageRefresh(pending.refresh_type, pending.refresh_region, self.dimen)
-        UIManager:setDirty(self, mode, region)
-    end
+    -- full 整屏刷：清掉弹窗旋转后留在 framebuffer 上的旧像素。
+    UIManager:setDirty(nil, "full")
+    self:rebuild("full")
+    return true
 end
 
+-- 翻页动画统一交给 KOReader 原生 swipe animation：这里只读写它的全局开关
+-- （与 KOReader 原生一致），不再自带刷新后端、档位或动画调度器。
+-- 原生动画是一次性标志，由 UIManager:_repaint 消费；下列收尾函数保留原名，
+-- 是因为翻页、弹窗、关阅读器等诸多路径都在调用，现在只负责清掉可能残留的
+-- 标志，避免把它带给紧接着的菜单/弹窗刷新。
 function ReaderView:_settleSwipeRefresh()
-    return self.swipe_refresh and self.swipe_refresh:settle() or false
+    if Device:canDoSwipeAnimation() then Screen:setSwipeAnimations(false) end
+    return false
 end
 
 function ReaderView:_cancelSwipeRefresh()
-    return self.swipe_refresh and self.swipe_refresh:cancel() or false
+    if Device:canDoSwipeAnimation() then Screen:setSwipeAnimations(false) end
+    return true
 end
 
--- 翻页动画只有一个真源：self.swipe_mode（off / fast / normal / slow）。
--- 旧代码另存一个 bool 镜像并让两者互相推导，改档位时很容易不同步。
 function ReaderView:isSwipeAnimationEnabled()
-    return self:getPageAnimationMode() ~= "off"
+    return G_reader_settings ~= nil and G_reader_settings:isTrue("swipe_animations")
 end
 
-function ReaderView:getPageAnimationMode()
-    return normalizeSwipeMode(self.swipe_mode)
-end
-
-function ReaderView:swipeFrameDelay()
-    return SWIPE_MODES[self:getPageAnimationMode()].delay
-end
-
--- 条带数上限；nil = 用 SwipeRefresh 的默认值（竖屏 8 / 横屏 6）。
-function ReaderView:swipeStrips()
-    return SWIPE_MODES[self:getPageAnimationMode()].strips
-end
-
-function ReaderView:setPageAnimationMode(mode)
-    mode = normalizeSwipeMode(mode)
-    local enabled = mode ~= "off"
-    self.swipe_mode = mode
-    self.style.page_transition_enabled = enabled
-    self.style.page_animation_speed = mode
-    Storage:saveReaderStyle(self.style)
-    if not enabled and self.swipe_refresh and self.swipe_refresh:isRunning() then
-        -- Disabling animation must not wait for the physical waveform.  Drop
-        -- the visual transition and repaint the current logical page through
-        -- the ordinary ReaderView path.
-        self:_cancelSwipeRefresh()
-        self._pending_rebuild = nil
-        if self.page then self:rebuild("partial") end
-    end
-    local label = "翻页动画：" .. SWIPE_MODES[self:getPageAnimationMode()].label
-    if not self:_refreshLayoutToggle("page_animation_mode", label) then
-        self:refreshLayoutMenu()
-    end
-    return mode
-end
-
--- 「跨章净屏」现在直接调用 KOReader 的全局刷新（整屏 full 刷新，即
--- Screen.refreshFull），不再由本模块播放条带波。样式键沿用历史名字，
--- 老配置无需迁移。
-function ReaderView:isChapterCleanEnabled()
-    return self.chapter_clean_wave_enabled ~= false
-end
-
-function ReaderView:setChapterCleanEnabled(enabled)
+function ReaderView:setSwipeAnimationEnabled(enabled)
     enabled = enabled == true
-    self.chapter_clean_wave_enabled = enabled
-    self.style.chapter_clean_wave_enabled = enabled
-    Storage:saveReaderStyle(self.style)
-    if not enabled and self.swipe_refresh and self.swipe_refresh:isRunning() then
-        self:_cancelSwipeRefresh()
-        if self.page then self:rebuild("partial") end
+    if G_reader_settings then
+        G_reader_settings:saveSetting("swipe_animations", enabled)
+        G_reader_settings:flush()
     end
-    if not self:_refreshLayoutToggle("chapter_clean_toggle",
-            enabled and "跨章净屏：开" or "跨章净屏：关") then
-        self:refreshLayoutMenu()
+    if not enabled and Device:canDoSwipeAnimation() then
+        Screen:setSwipeAnimations(false)
     end
     return enabled
 end
@@ -1138,10 +1037,6 @@ function ReaderView:setParaReviewEnabled(enabled)
     self.para_review_enabled = enabled
     self.style.para_review_enabled = enabled
     Storage:saveReaderStyle(self.style)
-    if not self:_refreshLayoutToggle("para_review_toggle",
-            enabled and "段评：开" or "段评：关") then
-        self:refreshLayoutMenu()
-    end
     -- 开关只改「要不要给段末行让出气泡宽度」，必须重排才能生效。
     -- 刚打开时如果本章还没有计数，就先不重排 —— 等计数到了 ensureParaCounts
     -- 会重排一次，省掉一次无意义的二次分页。
@@ -1199,7 +1094,7 @@ function ReaderView:reflowForParaReview()
         return true
     end
     -- 气泡挤进段末行，那一行的可用宽度变窄，后面每一行都重新折行 —— 屏幕上现有的
-    -- 每一个字都已经作废。这种规模的变更只能用整屏闪刷（和「跨章净屏」同一条路径）：
+    -- 每一个字都已经作废。这种规模的变更只能用整屏闪刷：
     -- 局部 / 快速波形盖不住已经落下的旧字，读者看到的就是「新字叠着旧字、行首缺字」。
     -- 页脚由这次 rebuild 一并重画，不需要再补一次局部刷新。
     self:rebuild("full")
@@ -1533,7 +1428,6 @@ end
 -- 段末气泡的命中判定。返回 1 基段落号，未命中返回 nil。
 function ReaderView:_paraMarkerAt(x, y)
     if self.para_review_enabled ~= true then return nil end
-    if self.swipe_refresh and self.swipe_refresh:isRunning() then return nil end
     local rects = self._para_hit_rects
     if type(rects) ~= "table" then return nil end
     -- 气泡只有一行高、几十像素宽，手指落点比它大，两向都留小余量。
@@ -1850,7 +1744,7 @@ function ReaderView:_presentParaComments(paragraph_index, payload, ctx)
         -- 番茄 2.2.0-fixed.6：弹窗字色与正文对齐。旧值 7 会把作者行的浅灰
         -- 全部压成纯黑，层级全毁；0 = 内容纯黑、辅助信息保持浅灰。
         contrast = 0,
-        -- 弹窗字重跟随正文（0-3），face_factory 按 FontWeight 四档仿粗。
+        -- 弹窗字重跟随正文（字重刻度 -3~5.5），face_factory 统一换算仿粗。
         doc_font_weight = self.style.body_weight or 0,
         -- fanqie 原版没有「点左右半屏翻页」，弹窗内只靠上下滑/滚动翻评论。
         -- 保持 1:1：不传 tap_to_page，点击评论正文不再翻页（action 行/图片仍响应）。
@@ -1936,8 +1830,6 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
         end
         self._pending_history = nil
     end
-    local previous_chapter = self.page and self.page.chapter_index
-    local chapter_changed = previous_chapter ~= nil and previous_chapter ~= page.chapter_index
     if not direction then self:_cancelSwipeRefresh() end
     self.page = page
     self._progress_dirty = true
@@ -1953,54 +1845,17 @@ function ReaderView:setPage(page, refresh_type, direction, generation)
     self:_syncPrefetchState()
     -- 段评：进入新的一章后，等本页画完再后台补一次本章评论计数。
     self:_scheduleParaCounts(page)
-    -- 「跨章净屏」走 KOReader 自己的全局刷新，不再是一次本地动画：新章第一页
-    -- 照常经由 widget 重绘，刷新用整屏 "full"（Screen.refreshFull）。它刻意与
-    -- 「动画效果」解耦 —— 「动画效果」只负责同章内的擦除渐显。
-    if direction and chapter_changed and self:isChapterCleanEnabled() then
-        self:_cancelSwipeRefresh()
-        self.menu_visible = false
-        self:rebuild("full")
-        -- 传 nil widget 的 "full" 入队就是 KOReader 对角线滑动全刷用的那个调用：
-        -- 它会把 UIManager.refresh_count 归零，避免周期性提升紧挨着再来一次
-        -- 黑闪（成对连闪）。两条入队会合并成同一次整屏刷新。
-        if type(UIManager.setDirty) == "function" then
-            UIManager:setDirty(nil, "full")
-        end
-        return true
+    -- 翻页一律走 KOReader 原生链路（同章 / 跨章都一样）：
+    -- 翻页前设好一次性动画标志，随后照常 rebuild（内部 UIManager:setDirty
+    -- 触发 _repaint）。刷新类型恒为 "partial" 且不带 region —— KOReader 按
+    -- full_refresh_count（设置里的「全刷页数」）自动决定哪一次升级成整屏全刷；
+    -- leko 既不自己刷新 framebuffer，也不为跨章另外插一次 full。
+    if direction and self:isSwipeAnimationEnabled() and Device:canDoSwipeAnimation() then
+        Screen:setSwipeAnimations(true)
+        Screen:setSwipeDirection(direction == PageDirection.FORWARD)
     end
-
-    if direction and self:isSwipeAnimationEnabled() and self.swipe_refresh then
-        self.menu_visible = false
-        local target_widget = self:buildReadingPage(page)
-        local begin_ok, started, begin_err = pcall(self.swipe_refresh.begin,
-            self.swipe_refresh,
-            target_widget,
-            direction,
-            function() self:_finishSwipeSubmission() end,
-            {
-                page_animation_enabled = self:isSwipeAnimationEnabled(),
-                frame_delay = self:swipeFrameDelay(),
-                strips = self:swipeStrips(),
-            })
-        if not begin_ok then
-            begin_err = tostring(started)
-            started = nil
-            logger.warn("Leko transition backend failed; disabling it for this reader:", begin_err)
-            pcall(self.swipe_refresh.cancel, self.swipe_refresh)
-            self.swipe_refresh = nil
-        end
-        if not started then
-            self:rebuild(refresh_type or "partial")
-        end
-    else
-        if direction and self:isSwipeAnimationEnabled()
-                and self.swipe_refresh and self.swipe_refresh:isRunning() then
-            self:_cancelSwipeRefresh()
-        end
-        -- This is the 0.15.44/0.15.39 direct path.  No-animation turns do
-        -- not consult, schedule or settle the transition coordinator.
-        self:rebuild(refresh_type or "partial")
-    end
+    self.menu_visible = false
+    self:rebuild(refresh_type or "partial")
     return true
 end
 
@@ -2118,7 +1973,7 @@ function ReaderView:nextPage()
     local generation = self:_nextPageGeneration()
     self._pending_history = { generation = generation, forward = true,
         position = Util.positionCopy(self.page.start_position) }
-    self:loadPage(self.page.next_position, "partial", SwipeRefresh.FORWARD, generation)
+    self:loadPage(self.page.next_position, "partial", PageDirection.FORWARD, generation)
     return true
 end
 
@@ -2127,7 +1982,7 @@ function ReaderView:_showPreviousPage(target_position, refresh_type, generation)
     local page, err = Paginator:findPreviousPage(self.book, target_position, self.style)
     if not page then return nil, tostring(err or "已经是第一页") end
     self.menu_visible = false
-    return self:setPage(page, refresh_type or "partial", SwipeRefresh.BACKWARD, generation)
+    return self:setPage(page, refresh_type or "partial", PageDirection.BACKWARD, generation)
 end
 
 function ReaderView:previousPage()
@@ -2135,7 +1990,7 @@ function ReaderView:previousPage()
     if target then
         local generation = self:_nextPageGeneration()
         self._pending_history = { generation = generation, position = target }
-        self:loadPage(target, "partial", SwipeRefresh.BACKWARD, generation)
+        self:loadPage(target, "partial", PageDirection.BACKWARD, generation)
         return true
     end
 
@@ -2152,7 +2007,7 @@ function ReaderView:previousPage()
         local task, err = self.onPrepareChapter(self, {
             chapter = previous_chapter, paragraph = 1, char = 1,
         }, "partial", {
-            direction = SwipeRefresh.BACKWARD,
+            direction = PageDirection.BACKWARD,
             generation = generation,
             present = function(reader)
                 return reader:_showPreviousPage(current, "partial", generation)
@@ -2248,6 +2103,12 @@ end
 function ReaderView:applyStyleChange(callback)
     self:_settleSwipeRefresh()
     callback(self.style)
+    -- 段间距按 em 语义：移动过段间距滑块后按字号实时换算，
+    -- 这样调字号时段落留白跟着一起缩放。老存档没有 em 字段，行为不变。
+    if type(self.style.paragraph_spacing_em) == "number" then
+        self.style.paragraph_spacing = self.style.paragraph_spacing_em
+            * (tonumber(self.style.body_font_size) or 27)
+    end
     self.history = {}
     -- 排版变了：页表必然重排，顺手清掉「这版排不出来」的记忆，避免旧签名卡住。
     self._chapter_pages_failed_sig = nil
@@ -2263,7 +2124,6 @@ function ReaderView:applyStyleChange(callback)
     -- Reflow changes only the in-memory cursor; the close path persists it.
     BookService:savePosition(self.book, page.start_position, false)
     self:rebuild("full")
-    self:refreshLayoutMenu()
     self:_scheduleFooterRefresh(true)
 end
 
@@ -2282,286 +2142,73 @@ function ReaderView:applyFontSelection(selection)
     end)
 end
 
-function ReaderView:_refreshLayoutToggle(id, text)
-    local dialog = self._layout_dialog
+-- 「阅读状态栏」二级页：时间 / 电量 / Wi-Fi / 页码 / 章节标题 / 每分钟刷新。
+-- 语义对齐阅读状态栏设置，但 leko 是自己的页眉页脚渲染，
+-- 开关只改 style 字段，不改变 geometry（页眉页脚高度由总开关决定）。
+function ReaderView:refreshStatusMenu()
+    local dialog = self._status_dialog
     if not dialog then return false end
-
-    -- ButtonDialog exposes the lookup itself on current KOReader releases;
-    -- older hosts only expose the child ButtonTable.  Resolve either form so
-    -- the callback can repaint the existing row immediately.
-    local button
-    if type(dialog.getButtonById) == "function" then
-        local ok, found = pcall(dialog.getButtonById, dialog, id)
-        if ok then button = found end
-    end
-    if not button then
-        local button_table = dialog.buttontable or dialog.button_table
-        if button_table and type(button_table.getButtonById) == "function" then
-            local ok, found = pcall(button_table.getButtonById, button_table, id)
-            if ok then button = found end
+    return UI.defer(self, "status_menu_refresh", function()
+        local d = self._status_dialog
+        if self._closing or not d then return end
+        if type(d.reinit) == "function" then
+            d.buttons = self:makeStatusMenuButtons()
+            d:reinit()
+            local region = d.movable and d.movable.dimen or d.dimen
+            if region then UIManager:setDirty(d, "ui", region) end
         end
-    end
-    if not button or type(button.setText) ~= "function" then return false end
-
-    local ok = pcall(button.setText, button, text, button.width)
-    if not ok then return false end
-
-    -- Button:refresh() invalidates exactly the button's own label region.  It
-    -- is important here: rebuilding the whole dialog from inside its click
-    -- callback can leave the old button tree painted until a later UI event.
-    if type(button.refresh) == "function" then
-        local refreshed = pcall(button.refresh, button)
-        if refreshed then return true end
-    end
-
-    local child = button[1]
-    local region = child and child.dimen or button.dimen
-    if child and child.dimen and type(UIManager.widgetRepaint) == "function" then
-        pcall(UIManager.widgetRepaint, UIManager, child, child.dimen.x, button.dimen.y)
-    end
-    if region then UIManager:setDirty(nil, "ui", region) end
-    return true
-end
-
--- ButtonDialog materializes non-dynamic labels when it is constructed. For
--- layout changes, rebuild the open dialog on the next UI tick so a callback is
--- not rebuilding the dialog tree while that same button is still dispatching.
-function ReaderView:refreshLayoutMenu()
-    if not self._layout_dialog then return false end
-    return UI.defer(self, "layout_menu_refresh", function()
-        local dialog = self._layout_dialog
-        if self._closing or not dialog then return end
-        if type(dialog.reinit) == "function" then
-            dialog.buttons = self:makeLayoutMenuButtons()
-            dialog:reinit()
-            -- ButtonDialog's geometry is recomputed by reinit().  Pass the
-            -- concrete region; the callback-form setDirty used by newer
-            -- widgets is not understood by every 0.15.x host.
-            local region = dialog.movable and dialog.movable.dimen or dialog.dimen
-            if region then UIManager:setDirty(dialog, "ui", region) end
-            return
-        end
-        -- Compatibility fallback for an older host without ButtonDialog:reinit.
-        self._layout_dialog = nil
-        UIManager:close(dialog)
-        self:showLayoutMenu()
-        self:_scheduleFooterRefresh(true)
     end)
 end
 
-function ReaderView:makeLayoutMenuButtons()
-    local line_values = { 0.12, 0.20, 0.28, 0.38, 0.50 }
-    local line_labels = { "最窄", "窄", "中", "宽", "最宽" }
-    local margin_values = ReaderMargins.values
-    local margin_labels = ReaderMargins.labels
-    local vertical_margin_values = { 6, 12, 18, 24, 30 }
-    local vertical_margin_labels = { "最窄", "窄", "中", "宽", "最宽" }
-    local paragraph_values = { 0, 6, 10, 16, 24 }
-    local paragraph_labels = { "无", "0.25 行", "0.5 行", "0.75 行", "一行" }
+function ReaderView:_statusToggle(key, label)
+    self:applyStyleChange(function(style)
+        style[key] = style[key] == false
+    end)
+    self:refreshStatusMenu()
+end
 
-    local function cycle(values, current)
-        local closest = 1
-        current = tonumber(current) or values[1]
-        for index, value in ipairs(values) do
-            if math.abs(value - current) < math.abs(values[closest] - current) then closest = index end
-        end
-        return values[(closest % #values) + 1]
+function ReaderView:makeStatusMenuButtons()
+    local style = self.style
+    local function row(key, label)
+        return { text = label .. "：" .. (style[key] == false and "关" or "开"),
+            callback = function() self:_statusToggle(key, label) end }
     end
-
-    local function choiceLabel(values, labels, current)
-        local closest = 1
-        current = tonumber(current) or values[1]
-        for index, value in ipairs(values) do
-            if math.abs(value - current) < math.abs(values[closest] - current) then closest = index end
-        end
-        return labels[closest]
-    end
-
-    -- First-line indent cycles through 关 / 2 字符 / 4 字符. The legacy
-    -- boolean true is treated as the 2-character default.
-    local function indentLabel(current)
-        if current == false then return "关" end
-        local count = tonumber(current)
-        if count ~= nil and count >= 4 then return "4 字符" end
-        return "2 字符"
-    end
-
-    local function cycleIndent(current)
-        if current == false then return 2 end
-        local count = tonumber(current)
-        if count ~= nil and count >= 4 then return false end
-        return 4
-    end
-
-    local function apply(fn)
-        self:applyStyleChange(fn)
-    end
-
-    local function close()
-        local dialog = self._layout_dialog
-        if dialog then UIManager:close(dialog) end
-        self._layout_dialog = nil
-        self:_scheduleFooterRefresh(true)
-    end
-
-    local function chooseFont()
-        self:showFontSelection()
-    end
-
-    -- Prompt for a custom body font size as a number.
-    local function promptFontSize()
-        self:_settleSwipeRefresh()
-        local current = tonumber(self.style.body_font_size) or 27
-        local dialog
-        dialog = InputDialog:new{
-            modal = true,
-            title = "设置字号",
-            input_hint = "请输入字号（例如 27）",
-            input_type = "number",
-            text = tostring(current),
-            buttons = {
-                {
-                    { text = "取消", id = "close", callback = function() UIManager:close(dialog) end },
-                    { text = "确定", callback = function()
-                        local raw = dialog:getInputText()
-                        UIManager:close(dialog)
-                        local size = tonumber(raw)
-                        if not size then
-                            UIManager:show(Notification:new{ text = "请输入有效数字" })
-                            return
-                        end
-                        size = math.max(14, math.min(72, math.floor(size)))
-                        apply(function(s) s.body_font_size = size end)
-                    end },
-                },
-            },
-        }
-        UIManager:show(dialog)
-        pcall(function() dialog:onShowKeyboard() end)
-    end
-
-    -- Row 2 pairs the brightness entry (when the device has a frontlight)
-    -- with the night-mode toggle; both affect light/colors together.
-    local night_button = {
-        text = "夜间模式：" .. (self:isNightMode() and "开" or "关"),
-        callback = function() apply(function(s)
-            s.night_mode = not (s.night_mode == true)
-        end) end,
-    }
-    local brightness_button
-    if self:hasFrontlightControl() then
-        brightness_button = {
-            text = "屏幕亮度",
-            callback = function()
-                close()
-                UIManager:broadcastEvent(Event:new("ShowFlDialog"))
-            end,
-        }
-    end
-    local light_row = brightness_button
-        and { brightness_button, night_button }
-        or { night_button }
-
-    local buttons = {
-        -- 文字：字体 / 字号 / 字重 / 行距。
+    return {
+        { row("show_title", "章节标题"), row("show_time", "时间") },
+        { row("show_battery", "电量"), row("show_wifi", "Wi-Fi") },
+        { row("show_page", "页码与进度"), row("status_minute_refresh", "每分钟刷新") },
         {
-            { text = "字体", callback = chooseFont },
-            -- 点按 +1，长按输入。
-            { text = "字号：" .. tostring(self.style.body_font_size or 27),
-              callback = function() apply(function(s)
-                  s.body_font_size = math.min(72, (tonumber(s.body_font_size) or 27) + 1)
-              end) end,
-              hold_callback = promptFontSize },
-        },
-        {
-            -- 字重 0-3（400/500/600/700），长按回「正常」。
-            { id = "body_weight_toggle",
-              text = "字重：" .. FontWeight.label(self.style.body_weight),
-              callback = function() apply(function(s)
-                  s.body_weight = FontWeight.next(s.body_weight)
-              end) end,
-              hold_callback = function() apply(function(s)
-                  s.body_weight = 0
-              end) end },
-            { text = "行距：" .. choiceLabel(line_values, line_labels, self.style.line_spacing), callback = function() apply(function(s)
-                s.line_spacing = cycle(line_values, s.line_spacing or 0.28)
-            end) end },
-        },
-        {
-            { text = "首行缩进：" .. indentLabel(self.style.indent), callback = function() apply(function(s)
-                s.indent = cycleIndent(s.indent)
-            end) end },
-            { text = "段间距：" .. choiceLabel(paragraph_values, paragraph_labels, self.style.paragraph_spacing), callback = function() apply(function(s)
-                s.paragraph_spacing = cycle(paragraph_values, s.paragraph_spacing or 10)
-            end) end },
-        },
-        -- 三种边距并排，省一行。
-        {
-            { text = "左右边距：" .. choiceLabel(margin_values, margin_labels, self.style.margin_left), callback = function() apply(function(s)
-                local margin = cycle(margin_values, s.margin_left or 28)
-                s.margin_left, s.margin_right = margin, margin
-            end) end },
-            { text = "上边距：" .. choiceLabel(vertical_margin_values, vertical_margin_labels, self.style.margin_top), callback = function() apply(function(s)
-                s.margin_top = cycle(vertical_margin_values, s.margin_top or 12)
-            end) end },
-            { text = "下边距：" .. choiceLabel(vertical_margin_values, vertical_margin_labels, self.style.margin_bottom), callback = function() apply(function(s)
-                s.margin_bottom = cycle(vertical_margin_values, s.margin_bottom or 12)
-            end) end },
-        },
-        {
-            { text = self.style.show_header and "页眉：显示" or "页眉：隐藏", callback = function() apply(function(s)
-                s.show_header = not s.show_header
-            end) end },
-            { text = self.style.show_footer and "页脚：显示" or "页脚：隐藏", callback = function() apply(function(s)
-                s.show_footer = not s.show_footer
-            end) end },
-        },
-        light_row,
-        {
-            { id = "page_animation_mode", text = "翻页动画：" .. SWIPE_MODES[self:getPageAnimationMode()].label, callback = function()
-                self:setPageAnimationMode(nextSwipeMode(self:getPageAnimationMode()))
+            { text = self.style.show_header and "页眉：显示" or "页眉：隐藏", callback = function()
+                self:applyStyleChange(function(s) s.show_header = not s.show_header end)
             end },
-            { id = "chapter_clean_toggle", text = self:isChapterCleanEnabled() and "跨章净屏：开" or "跨章净屏：关", callback = function()
-                self:setChapterCleanEnabled(not self:isChapterCleanEnabled())
+            { text = self.style.show_footer and "页脚：显示" or "页脚：隐藏", callback = function()
+                self:applyStyleChange(function(s) s.show_footer = not s.show_footer end)
             end },
         },
+        { { text = "返回排版", callback = function()
+            local dialog = self._status_dialog
+            if dialog then UIManager:close(dialog) end
+            self._status_dialog = nil
+            self:showLayoutMenu()
+        end } },
     }
-    -- 段评仅番茄 / 七猫 / QQ阅读的章节有，其他书不显示这一行。
-    local para_chapter_index = self.page and self.page.chapter_index
-    if para_chapter_index and ParaComments.isSupported(self.book, para_chapter_index) then
-        local para_on = self:isParaReviewEnabled()
-        buttons[#buttons + 1] = {
-            { id = "para_review_toggle", text = para_on and "段评：开" or "段评：关", callback = function()
-                self:setParaReviewEnabled(not self:isParaReviewEnabled())
-            end },
-            -- 段评关闭时置灰。
-            { id = "page_para_button",
-              text = para_on and "本页段评" or "本页段评（段评已关）",
-              enabled = para_on,
-              callback = function()
-                  close()
-                  self:showPageParaCommentList()
-              end },
-        }
-    end
-    -- 恢复默认：只重置排版，保留已选字体。
-    buttons[#buttons + 1] = {
-        { id = "reset_layout_button", text = "恢复默认", callback = function()
-            apply(function(s)
-                local default = Storage:getDefaultReaderStyle()
-                for _, key in ipairs({
-                    "body_font_size", "body_weight", "line_spacing", "paragraph_spacing",
-                    "indent", "text_align", "margin_left", "margin_right",
-                    "margin_top", "margin_bottom", "show_header", "show_footer",
-                }) do
-                    s[key] = default[key]
-                end
-            end)
-            UIManager:show(Notification:new{ text = "排版已恢复默认" })
-        end },
-        { text = "关闭", callback = close },
+end
+
+function ReaderView:showStatusMenu()
+    self:_settleSwipeRefresh()
+    local dialog = self._status_dialog
+    if dialog and UIManager.isWidgetShown and UIManager:isWidgetShown(dialog) then return true end
+    local new_dialog = ButtonDialog:new{
+        title = "阅读状态栏",
+        modal = true,
+        buttons = self:makeStatusMenuButtons(),
+        tap_close_callback = function()
+            self._status_dialog = nil
+            self:showLayoutMenu()
+        end,
     }
-    return buttons
+    self._status_dialog = new_dialog
+    return UI.showModalLater(self, "status_menu", function() return new_dialog end)
 end
 
 function ReaderView:hasFrontlightControl()
@@ -2572,9 +2219,6 @@ end
 
 function ReaderView:showFontSelection()
     self:_settleSwipeRefresh()
-    local dialog = self._layout_dialog
-    if dialog then UIManager:close(dialog) end
-    self._layout_dialog = nil
     self:_scheduleFooterRefresh(true)
     return UI.showLater(self, "font_selection", function()
         return FontSelectionView:new{
@@ -2588,29 +2232,51 @@ function ReaderView:showFontSelection()
     end, "full")
 end
 
+-- 排版 / 设备控制都是简洁风格底部弹窗（正文仍可见），不再是 ButtonDialog。
+-- 从页面返回后重新显示阅读页的菜单浮层，读者不必再点一次屏幕。
 function ReaderView:showLayoutMenu()
     self:_settleSwipeRefresh()
-    if self._layout_dialog then
-        if UIManager.isWidgetShown and UIManager:isWidgetShown(self._layout_dialog) then return true end
-        self._layout_dialog = nil
-        self:_scheduleFooterRefresh(true)
-    end
-    return UI.showModalLater(self, "layout_menu", function()
-        local dialog = ButtonDialog:new{
-            title = "阅读设置",
-            modal = true,
-            -- 固定 10 行（含段评那两行），一页放得下，不再需要翻页
-            -- 才能点「关闭」。屏幕更矮的机型仍由 ButtonDialog 自动分页。
-            rows_per_page = 10,
-            buttons = self:makeLayoutMenuButtons(),
-            tap_close_callback = function()
-                self._layout_dialog = nil
-                self:_scheduleFooterRefresh(true)
+    if self._layout_page and UIManager.isWidgetShown
+            and UIManager:isWidgetShown(self._layout_page) then return true end
+    return UI.showLater(self, "layout_page", function()
+        local page = LayoutSettingsView:new{
+            style = self.style,
+            onApply = function(fn) self:applyStyleChange(fn) end,
+            onFont = function() self:showFontSelection() end,
+            onStatus = function() self:showStatusMenu() end,
+            onClosed = function()
+                self._layout_page = nil
+                if not self._closing then
+                    self.menu_visible = true
+                    self:rebuild("ui")
+                end
             end,
         }
-        self._layout_dialog = dialog
-        return dialog
-    end)
+        self._layout_page = page
+        return page
+    end, "ui")
+end
+
+function ReaderView:showDeviceMenu()
+    self:_settleSwipeRefresh()
+    if self._device_page and UIManager.isWidgetShown
+            and UIManager:isWidgetShown(self._device_page) then return true end
+    return UI.showLater(self, "device_page", function()
+        local page = DeviceControlView:new{
+            style = self.style,
+            onApply = function(fn) self:applyStyleChange(fn) end,
+            onParaReviewChanged = function(v) self:setParaReviewEnabled(v) end,
+            onClosed = function()
+                self._device_page = nil
+                if not self._closing then
+                    self.menu_visible = true
+                    self:rebuild("ui")
+                end
+            end,
+        }
+        self._device_page = page
+        return page
+    end, "ui")
 end
 
 function ReaderView:routeTap(ges)
@@ -2714,21 +2380,18 @@ end
 function ReaderView:onFullRefresh()
     if self._closing then return false end
     self:_settleSwipeRefresh()
-    -- 与「跨章净屏」同一条路：传 nil widget 的 "full" 就是 KOReader 自己的
-    -- 整屏刷新，顺带把 refresh_count 归零，不会紧接着再黑闪一次。
+    -- 遥控器主动全刷：传 nil widget 的 "full" 就是 KOReader 自己的整屏刷新，
+    -- 顺带把 refresh_count 归零，不会紧接着再黑闪一次。
     if type(UIManager.setDirty) == "function" then UIManager:setDirty(nil, "full") end
     return true
 end
 
 function ReaderView:onToggleNightMode()
     if self._closing then return false end
-    local menu_was_visible = self.menu_visible
-    self:applyStyleChange(function(style)
-        style.night_mode = not (style.night_mode == true)
+    -- 与设备控制页一致：走 KOReader 全局反转，不再改 leko 自己的 style.night_mode。
+    pcall(function()
+        require("device/devicelistener"):new{}:onToggleNightMode()
     end)
-    -- applyStyleChange 是给设置弹窗准备的，会顺手把底部菜单打开；
-    -- 遥控器触发时不应该弹出菜单。
-    if not menu_was_visible and self.menu_visible then self:toggleMenu(false) end
     return true
 end
 
@@ -2870,13 +2533,20 @@ function ReaderView:closeReaderNow()
     AsyncParaReview:release()
     self:_cancelSwipeRefresh()
     if self._exit_dialog then UIManager:close(self._exit_dialog); self._exit_dialog = nil end
-    if self._layout_dialog then UIManager:close(self._layout_dialog); self._layout_dialog = nil end
+    for _, key in ipairs({ "_layout_page", "_device_page", "_status_dialog" }) do
+        local page = self[key]
+        if page then UIManager:close(page) end
+        self[key] = nil
+    end
 
     BookService:cancelPrefetch(self.book.id)
     BookService:unobservePrefetch(self.book.id, self)
     if self.statistics_bridge then self.statistics_bridge:close() end
     self:onFlushSettings()
 
+    -- 横屏只用于阅读：退出前先回竖屏，让下面的书架重建直接按竖屏尺寸排，
+    -- 避免横屏书架/KOReader 布局错乱与残影（Sean 2026-11-28）。
+    UI.resetPortrait()
     -- Rebuild the covered bookshelf before removing the reader. UIManager will
     -- then reveal it with a single full refresh instead of repainting it twice.
     if self.onBeforeReaderClose then self.onBeforeReaderClose(self.book) end

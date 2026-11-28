@@ -1370,23 +1370,28 @@ function Storage:getDefaultReaderStyle()
         text_align = "left",
         -- 旧字段，仅保留兼容。
         body_bold = false,
-        -- 字重 0-3：正常 / 微粗 / 中粗 / 加粗（见 Leko/FontWeight.lua）。
+        -- 字重沿用 -3~5.5 刻度 / 0.25；旧 0-3 四档视觉不变
+        -- （正常 / 微粗 / 中粗 / 加粗，见 Leko/FontWeight.lua）。
         body_weight = 0,
         -- 夜间模式: dark background with light text.
         night_mode = false,
         show_header = true,
         show_footer = true,
+        -- 状态栏细分开关：对应「阅读状态栏」设置里的各项。
+        -- 总开关 show_header / show_footer 之上，逐项控制页眉页脚里的元素；
+        -- 默认全开，保持既有用户的画面不变。
+        show_title = true,      -- 页眉左上章节名
+        show_time = true,       -- 页脚左下时钟
+        show_battery = true,    -- 页眉右上电量
+        show_wifi = true,       -- 页眉右上 Wi-Fi
+        show_page = true,       -- 页脚右侧页码与全书进度
+        status_minute_refresh = true, -- 时钟每分钟自动刷新
         chapter_new_page = true,
-        -- The visual page transition is optional. ReaderView does not add a
-        -- separate full-surface clearing pass after a page transition.
-        page_transition_enabled = true,
-        -- 同章翻页动画档位（off / fast / normal / slow），同时决定条带数与
-        -- 帧间隔，见 Leko/ReaderView.lua 顶部的 SWIPE_MODES；缺省为正常。
-        page_animation_speed = "normal",
-        -- Cross-chapter cleanup is deliberately opt-in: it uses several
-        -- scoped UI submissions and is slower than the ordinary page swipe.
-        -- Keep the key name for compatibility with existing .44 settings.
-        chapter_clean_wave_enabled = false,
+        -- 翻页动画开关已改由 KOReader 全局 swipe_animations 控制（见 ReaderView），
+        -- 不再有 leko 自己的档位；旧的 page_transition_enabled / page_animation_speed
+        -- 配置键即使残留也不再被读取。
+        -- 全刷节奏同样交给 KOReader 的 full_refresh_count（设置里的「全刷页数」）：
+        -- leko 翻页只发不带 region 的 partial，不另设全刷开关。
     }
 end
 

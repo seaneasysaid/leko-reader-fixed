@@ -111,7 +111,7 @@ end
 function CoverBrowserView:coverDimensions()
     local height = self.dimen.h
     local header_h = math.max(54, math.floor(height * 0.075))
-    local footer_h = math.max(64, math.floor(height * 0.09))
+    local footer_h = header_h
     local body_h = height - header_h - footer_h
     local cover_h = math.min(520, math.max(180, math.floor(body_h * 0.70)))
     local cover_w = math.min(360, math.floor(self.dimen.w * 0.58), math.floor(cover_h * 0.70))
@@ -148,11 +148,11 @@ end
 function CoverBrowserView:rebuild()
     local width, height = self.dimen.w, self.dimen.h
     local header_h = math.max(54, math.floor(height * 0.075))
-    local footer_h = math.max(64, math.floor(height * 0.09))
+    local footer_h = header_h
     local result = self:current()
     local cover_w, cover_h = self:coverDimensions()
     local count_text = #self.results > 0 and string.format(" %d/%d", self.index, #self.results) or " 0/0"
-    local header = UI.header(width, header_h, {
+    local header = UI.topBar(width, header_h, {
         left_text = "‹ 返回", title = (self.title or "封面") .. count_text,
         right_text = "加载情况 ›", on_left = function() self:onClose() end,
         on_right = function() UIManager:show(InfoMessage:new{ text = self:getDiagnosticsText() }) end,
@@ -189,7 +189,7 @@ function CoverBrowserView:rebuild()
         },
     }
     local primary_text = self.onSelectCover and (self.select_text or "使用此封面") or "打开详情"
-    local footer = UI.footer(width, footer_h, {
+    local footer = UI.bottomBar(width, footer_h, {
         { text = "‹ 上一张", enabled = self.index > 1, callback = function() self:move(-1) end },
         { text = primary_text, bold = true, enabled = self:isCurrentReady(), callback = function()
             if not result then return end

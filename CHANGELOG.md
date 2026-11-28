@@ -5,6 +5,36 @@
 > `0.17.24 → 0.16.0-fixed.3`。下方其余 0.17.x 条目是本次编号变更之前的内部迭代记录，
 > 保留原号以便与提交历史对照。
 
+## [0.16.0-fixed.6.6] - 2026-11-28
+
+> **本次重点：阅读界面与设置页整体重做。** 排版、设备控制改成不遮正文的底部弹窗，排版刻度细化到连续档；顶/底菜单统一风格；翻页动画与全刷交回 KOReader 全局设置；新增横屏阅读与退出自动回竖屏。书源、书架、阅读进度和已下载章节不受影响。
+
+### ✨ 新增
+- **排版设置底部弹窗**（`Leko/LayoutSettingsView.lua`）：`covers_fullscreen = false` + `BottomContainer`，正文留在屏幕上方；六行滑块 `sliderRow()` 支持 tap 定位 / hold 拖动 / ± 微调（`StepBtn`），拖动中只走 `preview_callback` 刷新右侧数值（`value_w = W.px(56)`），松手 / 点按才 `callback` 提交，避免墨水屏每拖一格就整页重排。可存为默认排版，或一键复位 `body_font_size` / `body_weight` / `line_spacing` / `paragraph_spacing` / `paragraph_spacing_em`。
+- **设备控制底部弹窗**（`Leko/DeviceControlView.lua`）：新增屏幕方向三 `Pill`（竖屏 / 逆时针 90° / 顺时针 90°），点击用 `UIManager:broadcastEvent(Event:new("SetRotationMode", opt.mode))` 让宿主一起转；亮度、色温直接读写设备电源管理并取原生刻度（`fl_warmness_min` / `fl_warmness_max`，Kobo 上是 1–10），不再显示百分比；夜间模式、翻页动画、段评气泡各占一个 `Switch` 行。
+- **阅读状态栏细分开关**：`Storage` 默认样式新增 `show_title` / `show_time` / `show_battery` / `show_wifi` / `show_page` / `status_minute_refresh`，`showStatusMenu()` 里 `_statusToggle(key, label)` 逐项落回 `style`，页眉页脚总开关保留；`_ensureClockTimer()` 跟着 `status_minute_refresh` 启停。
+- **横屏只用于阅读**：`onSetRotationMode(mode)` 转屏后重设 `dimen`、按 `start_position` 重新 `Paginator:makePage`，再 `UIManager:setDirty(nil, "full")` + `rebuild("full")`，不必先翻一页才恢复；`closeReaderNow()` 与 `BookshelfView:onClose()` 退出前先 `UI.resetPortrait()`，`BookshelfView:rebuild()` 按 `Screen:getWidth()/getHeight()` 重排，退出到书架或 KOReader 一律回竖屏。
+
+### 🎨 排版与界面
+- 六项刻度：字号 12~72 / 0.5；字重 `FontWeight.MIN/MAX/STEP` = -3~5.5 / 0.25（`FontWeight.factor()` 映射 FreeType 仿粗强度：≤0 不变粗，0~3 沿用 `0 / 1/8 / 1/4 / 3/8` 四档并线性插值，3~5.5 升到 `1/2`，旧 0/1/2/3 存档视觉不变）；行距 80%~200% / 10%，存 `line_spacing = (pct - 100) / 100`；段距 0~2em / 0.25em，存 `paragraph_spacing_em`，`applyStyleChange()` 按 `body_font_size` 换算成 px，老存档缺这个字段时按 `paragraph_spacing / old_size` 反推；左右边距 `ReaderMargins.values` 8~48 / 2；上下边距 2~40 / 2。
+- **`ReaderMargins:columns()` 倒挂**：旧实现混用「每档至少少一列」和「直接取整」，会出现 28→30 边距变大而正文反而变宽；现从 8 逐档取实际列数并封顶，保证 8..48 单调不增；旧五档 `presets` / `legacyColumns()` 算法不动，老存档版面不变。
+- 阅读页 `UI.footer` 四项统一 `font_size = 20`：「目录 / 排版设置 / 设备控制 / 刷新本章」。
+- `UI.topBar()` / `UI.bottomBar()` 统一书架、书籍详情、封面浏览、手机导入书源页的顶/底菜单高度与字号；`CellButton` 设 `bordersize = 0` 去掉方框，`RULE_T = DIV_T = 2`、`LINE_COLOR = Blitbuffer.COLOR_GRAY` 画横线与竖分隔线；`getMenuMetrics()` 底部高度改 `max(56, h * 0.075)` 与顶部对称。
+
+### 🔁 翻页与刷新
+- 翻页动画读写 KOReader 全局单例 `G_reader_settings:isTrue("swipe_animations")` / `saveSetting("swipe_animations", v)`；翻页时 `Screen:setSwipeAnimations(true)` + `Screen:setSwipeDirection(direction == PageDirection.FORWARD)`，同章、跨章走同一条原生链路，不再用自研条带动画。此前 `require("G_reader_settings")` 必然失败、点了开关只空转，已改为直接用启动注入的全局单例。
+- 全刷交给全局 `full_refresh_count` 自动升级，`setPage()` 里翻页一律 partial；删掉跨章单独插屏的净屏逻辑，不再和全局全刷重复闪屏。
+- 夜间模式改为调 `devicelistener:onToggleNightMode()` 并 `G_reader_settings:saveSetting("night_mode", v)`，`Screen.night_mode` 是唯一真源；`ReaderView:isNightMode()` 恒 `false`，避免和全局 framebuffer 反转叠加成「看着没反」。
+
+### ♻️ 清理
+- 删掉整套已无入口的旧 ButtonDialog 排版菜单：`_layout_dialog` / `_refreshLayoutToggle` / `refreshLayoutMenu()` / `makeLayoutMenuButtons()` 约 350 行，以及 `InputDialog` / `SpinWidget` / `FontWeight` / `ReaderMargins` 的旧 import。
+- 归档三个无引用模块：`SettingSlider.lua`（从未被 require）、`SwipeRefresh.lua` / `SwipeAnimation.lua`（改用 KOReader 原生动画后失效）；方向常量 `SwipeRefresh` 改名 `PageDirection`，避免与新命名混淆。
+- 删无调用的 `UI.CellButton:setText()`、`InkStyle.S.panel()`、`DeviceControlView.onSwipeAnimationChanged` 回调；样式模块与测试脚本改为中性命名（`InkStyle.lua` / `check_reader_style.js`），产品代码与测试中已无外部插件字样。
+
+### 验证
+- 115 个 Lua 文件语法全过；`tools/lua_settings_test.js`、`check_reader_style.js`（10 项）、`check_sheet_style.js`（13 项）全过；`lua_para_test.js` 结构 10/10 过（沙箱里 `luasettings` 的报错是旧测试桩问题，与本次改动无关）。
+- `diff -rq --exclude=.sdr` 全树比对 repo == Kindle == Kobo，0 diff；Kobo SSH `sync` OK。
+
 ## [0.16.0-fixed.6.5] - 2026-11-25（小迭代·续）
 
 > **本次补两处：书山节点恢复、极扁表情图黑边，不升版本号、不新增功能。** 书源节点调整与段评配图裁边的收尾，书源、书架、阅读进度和已下载章节不受影响。

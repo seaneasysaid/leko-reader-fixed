@@ -44,7 +44,7 @@ local function setDimen(self)
     self.dimen = Geom:new{ x = 0, y = 0, w = self.width, h = self.height }
 end
 
--- ---- 封面卡片几何（比例 0.68 / 间距 6 / 阴影 3 / 圆角 5）----
+-- ---- 封面卡片几何（比例 0.68 / 间距 3 / 阴影 3 / 圆角 5）----
 
 local function shelfSizeScale()
     return Screen:scaleBySize(1000) / 1000
@@ -52,9 +52,9 @@ end
 
 local function cellCardMetrics(cell_w, cell_h)
     local size_scale = shelfSizeScale()
-    local gutter = math.max(1, math.floor(6 * size_scale))
+    local gutter = math.max(1, math.floor(3 * size_scale))
     local requested_shadow = math.max(1, math.floor(3 * size_scale))
-    local title_gap = math.max(1, math.floor(4 * size_scale))
+    local title_gap = math.max(1, math.floor(2 * size_scale))
     local title_h = math.max(1, math.floor(22 * size_scale))
     local border = Size.border.thin
     local max_cover_w = math.max(1, cell_w - 2 * gutter)
@@ -293,7 +293,8 @@ end
 -- 网格几何：子线性缩放，最多 4 列 3 行
 function BookshelfView:getMetrics()
     local header_h = math.max(54, math.floor(self.dimen.h * 0.075))
-    local footer_h = math.max(54, math.floor(self.dimen.h * 0.072))
+    -- 顶/底菜单等高，上下留白对称（Sean 2026-11-28）。
+    local footer_h = header_h
     local body_h = self.dimen.h - header_h - footer_h
     local width = self.dimen.w
     local card_scale = math.sqrt(shelfSizeScale())
@@ -402,6 +403,10 @@ function BookshelfView:buildBookCell(summary, cell_w, cell_h)
 end
 
 function BookshelfView:rebuild(no_repaint)
+    -- ⭐ 书架在后台（被阅读器盖住）时收不到转屏广播：退出阅读器走 updateBook→
+    -- rebuild，若 dimen 还是竖屏旧值，就只画左侧一部分、右侧露出阅读页残影。
+    -- rebuild 是所有重建路径的汇聚点，这里按当前 Screen 尺寸同步最稳。
+    self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
     self.books = self.books or {}
     self.page = math.max(1, self.page or 1)
 
@@ -412,7 +417,7 @@ function BookshelfView:rebuild(no_repaint)
     local total_pages = math.max(1, math.ceil(#self.books / self.page_size))
     if self.page > total_pages then self.page = total_pages end
 
-    local header = UI.header(width, header_h, {
+    local header = UI.topBar(width, header_h, {
         left_text = "‹ 退出",
         title = "Leko 书架",
         right_text = "≡ 菜单",
@@ -455,7 +460,7 @@ function BookshelfView:rebuild(no_repaint)
     end
 
     local update_text, update_callback, update_running = self:_updateButton()
-    local footer = UI.footer(width, footer_h, {
+    local footer = UI.bottomBar(width, footer_h, {
         {
             text = "‹ 上一页",
             enabled = self.page > 1,
@@ -497,6 +502,18 @@ function BookshelfView:refresh(no_repaint)
     self:rebuild(no_repaint)
 end
 
+-- 书架在前台时转屏：KOReader 的 SetRotationMode 广播会命中它（非 modal，
+-- 在 window stack 里）。同步尺寸并整屏重排，避免只画旧尺寸的一块。
+function BookshelfView:onSetRotationMode(mode)
+    local old_mode = Screen:getRotationMode()
+    if mode == nil or mode == old_mode then return false end
+    Screen:setRotationMode(mode)
+    self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
+    self:rebuild(false)
+    if UIManager.setDirty then UIManager:setDirty(self, "full") end
+    return true
+end
+
 function BookshelfView:updateBook(book, no_repaint, change)
     if not book or not book.id then return self:refresh(no_repaint) end
     if change and change.cover_changed then BookService:invalidateCoverPath(book.cover_path) end
@@ -527,6 +544,8 @@ function BookshelfView:onOpenMenu()
 end
 
 function BookshelfView:onClose()
+    -- 退出插件回 KOReader 时统一竖屏（横屏只用于阅读）。
+    UI.resetPortrait()
     UIManager:close(self, "full")
     return true
 end
